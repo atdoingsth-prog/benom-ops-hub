@@ -1,0 +1,21 @@
+# Dependencies & build output
+node_modules/
+app/node_modules/
+app/dist/
+
+# Local SQLite database & environment secrets
+app/data/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.local
+
+# Sensitive company data, ERP CSVs (126MB+), contracts & payment requests
+03_data/
+05_imported_benom/
+
+# OS & logs
+.DS_Store
+Thumbs.db
+*.log

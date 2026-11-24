@@ -1,0 +1,61 @@
+MA TRẬN PHÂN QUYỀN RACI CHUẨN HÓA THEO SOD,,,,,,,
+R: Responsible (Thực hiện) | A: Accountable (Phê duyệt) | C: Consulted (Tham vấn) | I: Informed (Thông báo),,,,,,,
+FA: final approval for sign,,,,,,,
+STT,Quy trình Vận hành Trọng điểm,Brand Director (BOD),Brand Manager,"Khối Marketing
+(MKT AM, Partner AM, Graphic)","Khối Product
+(PD AM, Design AM, Mer, QC)","Khối Sales
+(Sales AM, Store Leader/Staff)","Khối Operations
+(OPT AM)"
+1,"Phát triển & Ra mắt SP mới (Manufactured)
+(Nghiên cứu -> Bản vẽ 2D/3D -> Mẫu -> QC -> Đặt hàng PO)",Final approval - for sign,"A
+(Duyệt P&L & SP)","C
+(Tham vấn Concept/Media)","R
+(PD AM + Design AM + QC + Mer)","C
+(Góp ý phản hồi thị trường)","I
+(Chuẩn bị không gian kho)"
+2,"Ký gửi & Mở rộng Đối tác (Trading Consignment)
+(Sourcing Partner -> Ký hợp đồng -> Quảng bá Ecom/Store)",Final approval - for sign,"A
+(Duyệt Hợp đồng)","R
+(Brand & Partnership AM chủ trì)","C
+(Tham vấn đánh giá định vị & Margin SP)","I/R
+(Trưng bày/bán tại Store)","C / I
+(Đối soát kho & nhập hệ thống)"
+3,"Chiến dịch Marketing & Sản xuất Ấn phẩm
+(Lập plan Ads/Social -> Thiết kế 2D -> Chụp ảnh/Video ngắn)",I,"A
+(Duyệt Ngân sách)","R
+(MKT AM chủ trì + Graphic Design)","C
+(Cung cấp Kích thước/Thông tin SP)","C
+(Thực thi POSM tại cửa hàng)","I
+(Đảm bảo năng lực vận hành đơn hàng)"
+4,"Xử lý Đơn hàng E-Commerce & Website
+(Khách đặt Online -> Tiếp nhận -> Đóng gói -> Giao vận)",I,I,"A / R
+(Partner AM duyệt/nhận đơn)",I,"R
+(Store Senior kiểm tồn & đóng gói)","R/I
+(Sắp xếp điều phối vận chuyển đơn hàng)"
+5,"Quản lý Tồn kho & Đẩy hàng chậm luân chuyển
+(Lập báo cáo kho -> Đề xuất giá Clearance -> Xả hàng)",I,"A
+(Duyệt giá giảm/Clearance)","C
+(Lên chiến dịch MKT xả hàng)","R
+(PD AM + Mer lập danh sách tồn)","C/R
+(Góp ý mức giá giảm tại cửa hàng/ Trưng bày thúc đẩy bán tồn kho)","C / I
+(Đối soát kho & nhập hệ thống)"
+6,"Thanh toán Chi phí & Xử lí chứng từ
+(Lập đề nghị thanh toán và theo dõi công nợ của bộ phận)",Final approval - for sign,"A
+(Ký phê duyệt)",R ,R ,R ,R 
+,,,,,,,
+R (Responsible): Người trực tiếp thực hiện công việc.,,,,,,,
+A (Accountable): Người chịu trách nhiệm phê duyệt / chịu trách nhiệm cuối cùng (Chỉ có 01 chữ A cho mỗi quy trình).,,,,,,,
+C (Consulted): Người được tham vấn ý kiến trước khi thực hiện.,,,,,,,
+I (Informed): Người được thông báo kết quả sau khi thực hiện.,,,,,,,
+,,,,,,,
+,,,,,,,
+,,,,,,,
+,,,,,,,
+,,,,,,,
+,,,,,,,
+STT,Quy trình / Luồng công việc,Chairman,Brand Manager (BM),"Các Khối AM (MKT, Product, Sales, OPT)",,,
+1,Chiến lược Thương hiệu & Kế hoạch P&L Năm,A* (Final Approval),R / A (Lập & Bảo vệ P&L),C (Tham vấn chỉ tiêu),,,
+2,Ngân sách Marketing & Khuyến mãi Năm,A* (Duyệt tổng ngân sách),A (Duyệt chi tiết chiến dịch),R (Thực thi chiến dịch),,,
+3,Phát triển Sản phẩm & Mở rộng Ngành hàng mới,I / A* (Nếu mở ngành hàng mới),R/A (Đề xuất và duyệt SP trong danh mục),R (Sourcing/Thiết kế/QC),,,
+4,Đầu tư Mở Showroom / Cửa hàng mới (CAPEX),A* (Phê duyệt chi phí đầu tư),R / A (Đề xuất & Vận hành),C / I (Thực thi),,,
+5,Xử lý Đơn hàng & Vận hành Hàng ngày,I (Xem báo cáo định kỳ),A (Duyệt chính sách vận hành),R (Thực thi 100%),,,

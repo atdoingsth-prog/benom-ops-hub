@@ -1,0 +1,59 @@
+@import "tailwindcss";
+
+:root {
+  --benom-brown: #3B281A;
+  --benom-brown-light: #563C28;
+  --benom-cream: #F8F4EC;
+  --benom-sand: #D6BCA5;
+  --benom-border: #E6DDD1;
+  --benom-green: #234E36;
+  --benom-red: #9A2B26;
+  --benom-blue: #224B85;
+}
+
+body {
+  background-color: var(--benom-cream);
+  color: #2A1E15;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Custom thin scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #D6BCA5;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #B8987D;
+}
+
+/* Clean A4 print styling for BM-01, BM-05, NK, XK, BM-02 */
+@media print {
+  @page {
+    size: A4;
+    margin: 12mm;
+  }
+  body {
+    background: #FFFFFF !important;
+    color: #000000 !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+  #print-root {
+    display: block !important;
+    position: static !important;
+    width: 100% !important;
+    box-shadow: none !important;
+    border: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+}
