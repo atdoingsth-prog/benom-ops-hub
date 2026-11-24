@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Lock, Mail, ShieldCheck } from 'lucide-react';
+import { Eye, EyeOff, Lock, Mail, ShieldCheck } from 'lucide-react';
 import { apiSend, AuthUser, setAuthToken } from '../api';
 
 interface Props {
@@ -9,6 +9,7 @@ interface Props {
 export default function LoginScreen({ onSuccess }: Props) {
   const [email, setEmail] = useState('admin@benom.vn');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -67,13 +68,22 @@ export default function LoginScreen({ onSuccess }: Props) {
             <div className="relative">
               <Lock className="w-4 h-4 text-[#6e5543] absolute left-3 top-2.5" />
               <input
-                type="password"
+                type={showPassword ? 'text' : 'password'}
                 required
                 value={password}
                 onChange={e => setPassword(e.target.value)}
                 placeholder="Nhập mật khẩu..."
-                className="w-full pl-9 pr-3 py-2.5 rounded-xl border border-[#D6BCA5] text-sm focus:outline-none focus:border-[#3B281A]"
+                className="w-full pl-9 pr-10 py-2.5 rounded-xl border border-[#D6BCA5] text-sm focus:outline-none focus:border-[#3B281A]"
               />
+              <button
+                type="button"
+                onClick={() => setShowPassword(prev => !prev)}
+                title={showPassword ? 'Ẩn mật khẩu' : 'Hiện mật khẩu'}
+                aria-label={showPassword ? 'Ẩn mật khẩu' : 'Hiện mật khẩu'}
+                className="absolute right-2.5 top-2 p-1 rounded-lg text-[#6e5543] hover:text-[#3B281A] hover:bg-[#F8F4EC] cursor-pointer"
+              >
+                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
             </div>
           </div>
 
