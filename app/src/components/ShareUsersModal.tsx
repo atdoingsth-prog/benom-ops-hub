@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { KeyRound, Shield, UserPlus, Users, X } from 'lucide-react';
+import { CheckCircle2, Copy, KeyRound, Mail, Shield, UserPlus, Users, X } from 'lucide-react';
 import { apiGet, apiSend } from '../api';
 
 interface Props {
@@ -16,17 +16,26 @@ const ROLE_LABELS: Record<string, string> = {
 
 export default function ShareUsersModal({ onClose, onToast }: Props) {
   const [users, setUsers] = useState<any[]>([]);
+  const [mailerReady, setMailerReady] = useState(false);
+  const [lastInvite, setLastInvite] = useState<{ email: string; fullName: string; password: string; role: string; sent: boolean; error?: string } | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const [form, setForm] = useState({
     email: '',
     full_name: '',
     department: 'Store 3001',
     role: 'VIEWER',
     password: 'benom2026',
+    send_email: true,
   });
 
   const load = async () => {
     try {
-      setUsers(await apiGet('/api/users'));
+      const [list, ms] = await Promise.all([
+        apiGet('/api/users'),
+        apiGet<{ configured: boolean }>('/api/users/mailer-status').catch(() => ({ configured: false })),
+      ]);
+      setUsers(list);
+      setMailerReady(Boolean(ms.configured));
     } catch (e: any) {
       onToast(e.message, 'err');
     }
@@ -34,22 +43,48 @@ export default function ShareUsersModal({ onClose, onToast }: Props) {
 
   useEffect(() => { load(); }, []);
 
+  const buildInviteText = (inv: { email: string; fullName: string; password: string; role: string }) => {
+    const appUrl = window.location.origin;
+    return [
+      `Xin chào ${inv.fullName},`,
+      `Bạn đã được mời tham gia hệ thống vận hành nội bộ benom Operations Hub.`,
+      `- Đường dẫn: ${appUrl}`,
+      `- Email đăng nhập: ${inv.email}`,
+      `- Mật khẩu: ${inv.password}`,
+      `- Quyền truy cập: ${ROLE_LABELS[inv.role] || inv.role}`,
+    ].join('\n');
+  };
+
   const addUser = async (e: React.FormEvent) => {
     e.preventDefault();
+    setSubmitting(true);
     try {
-      await apiSend('/api/users', 'POST', form);
-      onToast(`Đã cấp quyền cho ${form.email} (${ROLE_LABELS[form.role]})!`);
-      setForm({ email: '', full_name: '', department: 'Store 3001', role: 'VIEWER', password: 'benom2026' });
+      const created = { email: form.email, fullName: form.full_name, password: form.password, role: form.role };
+      const res = await apiSend('/api/users', 'POST', form);
+      const sent = Boolean(res.email_result?.sent);
+      setLastInvite({ ...created, sent, error: res.email_result?.error });
+      if (sent) {
+        onToast(`Đã tạo tài khoản & gửi email mời tới ${form.email}!`);
+      } else {
+        onToast(`Đã tạo tài khoản ${form.email}! (Chưa cấu hình SMTP — bạn có thể sao chép hoặc gửi mail nhanh bên dưới)`);
+      }
+      setForm({ email: '', full_name: '', department: 'Store 3001', role: 'VIEWER', password: 'benom2026', send_email: true });
       load();
     } catch (err: any) {
       onToast(err.message, 'err');
+    } finally {
+      setSubmitting(false);
     }
   };
 
   const updateUser = async (u: any, patch: any) => {
     try {
-      await apiSend(`/api/users/${u.id}`, 'PUT', { ...u, ...patch });
-      onToast(`Đã cập nhật quyền cho ${u.email}`);
+      const res = await apiSend(`/api/users/${u.id}`, 'PUT', { ...u, ...patch });
+      if (res.email_result?.sent) {
+        onToast(`Đã cập nhật & gửi email mật khẩu mới tới ${u.email}!`);
+      } else {
+        onToast(`Đã cập nhật quyền cho ${u.email}`);
+      }
       load();
     } catch (err: any) {
       onToast(err.message, 'err');
@@ -62,6 +97,12 @@ export default function ShareUsersModal({ onClose, onToast }: Props) {
     await updateUser(u, { new_password: pwd.trim() });
   };
 
+  const copyInvite = async () => {
+    if (!lastInvite) return;
+    await navigator.clipboard.writeText(buildInviteText(lastInvite));
+    onToast('Đã sao chép lời mời + mật khẩu! Bạn có thể dán gửi qua Zalo/Email.');
+  };
+
   return (
     <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-3 overflow-y-auto">
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden border border-[#E6DDD1]">
@@ -70,7 +111,9 @@ export default function ShareUsersModal({ onClose, onToast }: Props) {
             <Users className="w-5 h-5 text-[#D6BCA5]" />
             <div>
               <div className="font-bold text-sm">Chia Sẻ & Phân Quyền Truy Cập (Như Google Sheets)</div>
-              <div className="text-[11px] text-[#D6BCA5]">Thêm thành viên team benom và chọn quyền Xem / Chỉnh sửa / KTV</div>
+              <div className="text-[11px] text-[#D6BCA5]">
+                Thêm thành viên team benom • {mailerReady ? 'Email mời tự động: ĐÃ BẬT ✓' : 'Email tự động: Chưa cấu hình SMTP (Có sẵn nút gửi nhanh)'}
+              </div>
             </div>
           </div>
           <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-white/15 cursor-pointer"><X className="w-5 h-5" /></button>
@@ -93,12 +136,44 @@ export default function ShareUsersModal({ onClose, onToast }: Props) {
               </select>
               <input value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} placeholder="Mật khẩu khởi tạo" className="px-3 py-2 rounded-lg border border-[#D6BCA5] bg-white" />
             </div>
-            <div className="flex justify-end">
-              <button type="submit" className="px-4 py-2 rounded-lg bg-[#234E36] text-white font-semibold hover:bg-[#1b3d2a] cursor-pointer">
-                + Cấp quyền truy cập
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+              <label className="flex items-center gap-2 text-[#3B281A] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.send_email}
+                  onChange={e => setForm({ ...form, send_email: e.target.checked })}
+                  className="accent-[#234E36]"
+                />
+                <span>Tự động gửi Email mời kèm mật khẩu tới thành viên này</span>
+              </label>
+              <button disabled={submitting} type="submit" className="px-4 py-2 rounded-lg bg-[#234E36] text-white font-semibold hover:bg-[#1b3d2a] cursor-pointer disabled:opacity-60">
+                {submitting ? 'Đang tạo & gửi mail...' : '+ Cấp quyền truy cập'}
               </button>
             </div>
           </form>
+
+          {/* Invite Result Banner */}
+          {lastInvite && (
+            <div className={`p-3.5 rounded-xl border text-xs space-y-2 ${lastInvite.sent ? 'bg-emerald-50 border-[#234E36] text-[#234E36]' : 'bg-amber-50 border-amber-400 text-amber-950'}`}>
+              <div className="font-bold flex items-center gap-1.5">
+                {lastInvite.sent ? <CheckCircle2 className="w-4 h-4" /> : <Mail className="w-4 h-4" />}
+                {lastInvite.sent
+                  ? `Đã gửi email mời kèm mật khẩu tới ${lastInvite.email}!`
+                  : `Đã tạo tài khoản ${lastInvite.email} (Email tự động chưa gửi được: ${lastInvite.error || 'Chưa cấu hình SMTP'})`}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button type="button" onClick={copyInvite} className="px-3 py-1.5 rounded-lg bg-white border border-[#D6BCA5] text-[#3B281A] font-semibold flex items-center gap-1 hover:bg-[#F8F4EC] cursor-pointer">
+                  <Copy className="w-3.5 h-3.5" /> Sao chép tin nhắn mời (Zalo)
+                </button>
+                <a
+                  href={`mailto:${encodeURIComponent(lastInvite.email)}?subject=${encodeURIComponent('[benom Operations Hub] Lời mời tham gia hệ thống')}&body=${encodeURIComponent(buildInviteText(lastInvite))}`}
+                  className="px-3 py-1.5 rounded-lg bg-[#3B281A] text-white font-semibold flex items-center gap-1 hover:bg-[#563C28]"
+                >
+                  <Mail className="w-3.5 h-3.5" /> Mở Gmail / Outlook gửi ngay
+                </a>
+              </div>
+            </div>
+          )}
 
           {/* Members List */}
           <div className="space-y-2">
@@ -126,7 +201,7 @@ export default function ShareUsersModal({ onClose, onToast }: Props) {
                     <button
                       onClick={() => resetPassword(u)}
                       className="p-1.5 rounded-lg border border-[#D6BCA5] text-[#3B281A] hover:bg-[#F8F4EC] cursor-pointer"
-                      title="Đổi mật khẩu"
+                      title="Đổi mật khẩu (tự gửi mail nếu đã bật SMTP)"
                     >
                       <KeyRound className="w-3.5 h-3.5" />
                     </button>

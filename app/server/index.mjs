@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import * as XLSX from 'xlsx';
 import { initDb, dbAll, dbGet, dbRun, dbBatch, isCloudDb } from './db.mjs';
 import { hashPassword, verifyPassword, signToken, requireAuth, requireRoles } from './auth.mjs';
+import { isMailerConfigured, sendInviteEmail } from './mailer.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.resolve(__dirname, '../dist');
@@ -228,6 +229,10 @@ app.get('/api/users', requireRoles('ADMIN'), wrap(async (req, res) => {
   res.json(users);
 }));
 
+app.get('/api/users/mailer-status', requireRoles('ADMIN'), (req, res) => {
+  res.json({ configured: isMailerConfigured() });
+});
+
 app.post('/api/users', requireRoles('ADMIN'), wrap(async (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   const fullName = String(req.body.full_name || '').trim();
@@ -243,25 +248,63 @@ app.post('/api/users', requireRoles('ADMIN'), wrap(async (req, res) => {
     `INSERT INTO users (email, full_name, password_hash, role, department, active) VALUES (?,?,?,?,?,1)`,
     [email, fullName, hashPassword(password), role, department]
   );
-  res.json({ id: r.lastInsertRowid, ok: true });
+
+  const origin = process.env.APP_URL || `${req.headers['x-forwarded-proto'] || req.protocol}://${req.get('host')}`;
+  let emailResult = { sent: false, configured: isMailerConfigured() };
+  if (req.body.send_email !== false) {
+    try {
+      emailResult = await sendInviteEmail({
+        to: email,
+        fullName,
+        password,
+        role,
+        appUrl: origin,
+        invitedBy: req.user.full_name,
+        isReset: false,
+      });
+    } catch (err) {
+      emailResult = { sent: false, configured: true, error: err.message };
+    }
+  }
+
+  res.json({ id: r.lastInsertRowid, ok: true, email_result: emailResult });
 }));
 
 app.put('/api/users/:id', requireRoles('ADMIN'), wrap(async (req, res) => {
   const { id } = req.params;
   const b = req.body;
   const role = ['ADMIN', 'EDITOR', 'KTV', 'VIEWER'].includes(b.role) ? b.role : 'VIEWER';
+  let emailResult = null;
   if (b.new_password && String(b.new_password).trim().length >= 4) {
+    const newPwd = String(b.new_password).trim();
     await dbRun(
       `UPDATE users SET full_name=?, role=?, department=?, active=?, password_hash=? WHERE id=?`,
-      [b.full_name, role, b.department || 'benom', b.active ? 1 : 0, hashPassword(b.new_password), id]
+      [b.full_name, role, b.department || 'benom', b.active ? 1 : 0, hashPassword(newPwd), id]
     );
+    const u = await dbGet('SELECT email, full_name, role FROM users WHERE id = ?', [id]);
+    if (u && isMailerConfigured()) {
+      const origin = process.env.APP_URL || `${req.headers['x-forwarded-proto'] || req.protocol}://${req.get('host')}`;
+      try {
+        emailResult = await sendInviteEmail({
+          to: u.email,
+          fullName: u.full_name,
+          password: newPwd,
+          role: u.role,
+          appUrl: origin,
+          invitedBy: req.user.full_name,
+          isReset: true,
+        });
+      } catch (err) {
+        emailResult = { sent: false, configured: true, error: err.message };
+      }
+    }
   } else {
     await dbRun(
       `UPDATE users SET full_name=?, role=?, department=?, active=? WHERE id=?`,
       [b.full_name, role, b.department || 'benom', b.active ? 1 : 0, id]
     );
   }
-  res.json({ ok: true });
+  res.json({ ok: true, email_result: emailResult });
 }));
 
 // ─── 1. DASHBOARD & ERP ANALYTICS ─────────────────────────────
