@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { CheckCircle2, Copy, KeyRound, Mail, Shield, UserPlus, Users, X } from 'lucide-react';
+import { CheckCircle2, Copy, KeyRound, Mail, Shield, Trash2, UserPlus, Users, X } from 'lucide-react';
 import { apiGet, apiSend } from '../api';
 
 interface Props {
@@ -95,6 +95,17 @@ export default function ShareUsersModal({ onClose, onToast }: Props) {
     const pwd = prompt(`Nhập mật khẩu mới cho ${u.email} (tối thiểu 4 ký tự):`);
     if (!pwd || pwd.trim().length < 4) return;
     await updateUser(u, { new_password: pwd.trim() });
+  };
+
+  const deleteUser = async (u: any) => {
+    if (!confirm(`Bạn chắc chắn muốn xóa vĩnh viễn tài khoản ${u.email} (${u.full_name})?`)) return;
+    try {
+      await apiSend(`/api/users/${u.id}`, 'DELETE');
+      onToast(`Đã xóa tài khoản ${u.email}`);
+      load();
+    } catch (err: any) {
+      onToast(err.message, 'err');
+    }
   };
 
   const copyInvite = async () => {
@@ -208,10 +219,17 @@ export default function ShareUsersModal({ onClose, onToast }: Props) {
                     <button
                       onClick={() => updateUser(u, { active: u.active ? 0 : 1 })}
                       className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold cursor-pointer ${
-                        u.active ? 'bg-red-50 text-[#9A2B26] hover:bg-red-100' : 'bg-emerald-50 text-[#234E36]'
+                        u.active ? 'bg-amber-50 text-amber-800 hover:bg-amber-100' : 'bg-emerald-50 text-[#234E36]'
                       }`}
                     >
                       {u.active ? 'Khóa' : 'Mở lại'}
+                    </button>
+                    <button
+                      onClick={() => deleteUser(u)}
+                      className="p-1.5 rounded-lg bg-red-50 text-[#9A2B26] hover:bg-red-100 cursor-pointer"
+                      title="Xóa vĩnh viễn tài khoản"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
                     </button>
                   </div>
                 </div>

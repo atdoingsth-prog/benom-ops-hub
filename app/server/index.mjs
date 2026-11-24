@@ -307,6 +307,15 @@ app.put('/api/users/:id', requireRoles('ADMIN'), wrap(async (req, res) => {
   res.json({ ok: true, email_result: emailResult });
 }));
 
+app.delete('/api/users/:id', requireRoles('ADMIN'), wrap(async (req, res) => {
+  const targetId = Number(req.params.id);
+  if (targetId === Number(req.user.id)) {
+    return res.status(400).json({ error: 'Không thể tự xóa tài khoản Admin đang đăng nhập!' });
+  }
+  await dbRun('DELETE FROM users WHERE id = ?', [targetId]);
+  res.json({ ok: true });
+}));
+
 // ─── 1. DASHBOARD & ERP ANALYTICS ─────────────────────────────
 app.get('/api/dashboard', wrap(async (req, res) => {
   const orderStats = await dbGet(`
