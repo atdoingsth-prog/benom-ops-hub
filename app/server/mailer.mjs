@@ -8,7 +8,12 @@ const ROLE_LABELS = {
 };
 
 export function isMailerConfigured() {
-  return Boolean(process.env.RESEND_API_KEY || (process.env.SMTP_USER && process.env.SMTP_PASS));
+  return Boolean(
+    process.env.BREVO_API_KEY ||
+    process.env.GAS_MAIL_WEBHOOK_URL ||
+    process.env.RESEND_API_KEY ||
+    (process.env.SMTP_USER && process.env.SMTP_PASS)
+  );
 }
 
 function buildInviteHtml({ fullName, email, password, role, appUrl, invitedBy, isReset = false }) {
@@ -59,7 +64,45 @@ export async function sendInviteEmail({ to, fullName, password, role, appUrl, in
     : '[benom Operations Hub] Lời mời tham gia hệ thống vận hành benom';
   const html = buildInviteHtml({ fullName, email: to, password, role, appUrl, invitedBy, isReset });
 
-  // Option 1: Resend HTTPS API (100% reliable on Render Free)
+  // Option 1: Brevo HTTPS API (300 emails/day free, works on Render Free port 443, sends to ANY email!)
+  if (process.env.BREVO_API_KEY) {
+    const senderEmail = process.env.SMTP_USER || process.env.MAIL_FROM_EMAIL || 'at.doing.sth@gmail.com';
+    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'api-key': process.env.BREVO_API_KEY,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        sender: { name: 'benom Operations Hub', email: senderEmail },
+        to: [{ email: to, name: fullName }],
+        subject,
+        htmlContent: html,
+      }),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      return { sent: false, configured: true, error: `Brevo lỗi (${res.status}): ${errText}` };
+    }
+    return { sent: true, configured: true, provider: 'brevo' };
+  }
+
+  // Option 2: Google Apps Script Gmail Bridge (100% free, sends via your Gmail over HTTPS port 443!)
+  if (process.env.GAS_MAIL_WEBHOOK_URL) {
+    const res = await fetch(process.env.GAS_MAIL_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to, subject, html, secret: process.env.GAS_MAIL_SECRET || 'benom2026' }),
+      redirect: 'follow',
+    });
+    if (!res.ok) {
+      return { sent: false, configured: true, error: `Gmail Webhook lỗi (${res.status})` };
+    }
+    return { sent: true, configured: true, provider: 'gmail-apps-script' };
+  }
+
+  // Option 3: Resend HTTPS API
   if (process.env.RESEND_API_KEY) {
     const from = process.env.MAIL_FROM || 'benom Operations Hub <onboarding@resend.dev>';
     const res = await fetch('https://api.resend.com/emails', {
@@ -77,12 +120,15 @@ export async function sendInviteEmail({ to, fullName, password, role, appUrl, in
     return { sent: true, configured: true, provider: 'resend' };
   }
 
-  // Option 2: Gmail / SMTP via Nodemailer (SMTP_USER + SMTP_PASS App Password)
+  // Option 4: Direct SMTP (works locally & on paid Render plans; blocked on Render Free)
   if (process.env.SMTP_USER && process.env.SMTP_PASS) {
     const transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST || 'smtp.gmail.com',
       port: Number(process.env.SMTP_PORT || 465),
       secure: String(process.env.SMTP_SECURE || 'true') === 'true',
+      connectionTimeout: 8000,
+      greetingTimeout: 8000,
+      socketTimeout: 10000,
       auth: {
         user: process.env.SMTP_USER,
         pass: process.env.SMTP_PASS,
@@ -96,6 +142,6 @@ export async function sendInviteEmail({ to, fullName, password, role, appUrl, in
   return {
     sent: false,
     configured: false,
-    error: 'Chưa cấu hình SMTP_USER/SMTP_PASS (Gmail App Password) hoặc RESEND_API_KEY trên Render.',
+    error: 'Chưa cấu hình BREVO_API_KEY hoặc GAS_MAIL_WEBHOOK_URL trên Render.',
   };
 }
