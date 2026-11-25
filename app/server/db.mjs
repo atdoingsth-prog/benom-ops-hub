@@ -323,6 +323,35 @@ const SCHEMA_STATEMENTS = [
     guide_type TEXT DEFAULT 'HDLR',
     content_md TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS pos_slips (
+    slip_no TEXT PRIMARY KEY,
+    sales_month TEXT NOT NULL,
+    sales_day TEXT DEFAULT '',
+    store_code TEXT DEFAULT '3001',
+    delivery_cust_pay REAL DEFAULT 0,
+    install_cust_pay REAL DEFAULT 0,
+    net_sales_excl_tax REAL DEFAULT 0,
+    gross_sales_incl_tax REAL DEFAULT 0,
+    has_furniture INTEGER DEFAULT 0,
+    items_summary TEXT DEFAULT ''
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_pos_slips_month ON pos_slips(sales_month)`,
+  `CREATE TABLE IF NOT EXISTS delivery_tracking (
+    slip_no TEXT PRIMARY KEY,
+    sales_month TEXT NOT NULL,
+    sales_day TEXT DEFAULT '',
+    store_code TEXT DEFAULT '3001',
+    delivery_cust_pay REAL DEFAULT 0,
+    install_cust_pay REAL DEFAULT 0,
+    fee_3pl REAL DEFAULT 0,
+    net_sales_excl_tax REAL DEFAULT 0,
+    carrier_3pl TEXT DEFAULT '',
+    area TEXT DEFAULT 'HCM',
+    note TEXT DEFAULT '',
+    items_summary TEXT DEFAULT '',
+    updated_at TEXT DEFAULT (datetime('now', '+7 hours'))
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_delivery_tracking_month ON delivery_tracking(sales_month)`,
 ];
 
 export async function initDb() {

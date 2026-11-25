@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
-  BookOpen, Calculator, LayoutDashboard, LogOut, ShieldCheck, Truck, Users, Warehouse
+  BarChart3, BookOpen, Calculator, LayoutDashboard, LogOut, ShieldCheck, Truck, Users, Warehouse
 } from 'lucide-react';
 import { apiGet, AuthUser, clearAuthToken, getAuthToken, PrintDoc } from './api';
 import PrintModal from './components/PrintModal';
@@ -8,6 +8,7 @@ import LoginScreen from './components/LoginScreen';
 import ShareUsersModal from './components/ShareUsersModal';
 import DashboardView from './views/DashboardView';
 import OrdersDispatchView from './views/OrdersDispatchView';
+import DeliveryTrackingView from './views/DeliveryTrackingView';
 import AllowanceView from './views/AllowanceView';
 import WarehouseErpView from './views/WarehouseErpView';
 import WarrantyQcView from './views/WarrantyQcView';
@@ -15,6 +16,7 @@ import MasterDataView from './views/MasterDataView';
 
 const NAV_ITEMS = [
   { id: 'dashboard', label: 'Tổng quan', icon: LayoutDashboard },
+  { id: 'delivery3pl', label: 'Báo cáo 3PL (POS)', icon: BarChart3 },
   { id: 'orders', label: 'Điều phối & BM-01', icon: Truck },
   { id: 'allowance', label: 'Phụ cấp KTV', icon: Calculator },
   { id: 'warehouse', label: 'Kho 9005 & ERP', icon: Warehouse },
@@ -152,6 +154,7 @@ export default function App() {
 
         <div className="max-w-7xl mx-auto p-4 sm:p-6 lg:p-8">
           {tab === 'dashboard' && <DashboardView onToast={showToast} onNavigate={setTab} />}
+          {tab === 'delivery3pl' && <DeliveryTrackingView onToast={showToast} />}
           {tab === 'orders' && <OrdersDispatchView onToast={showToast} onPrint={setPrintDoc} />}
           {tab === 'allowance' && <AllowanceView onToast={showToast} />}
           {tab === 'warehouse' && <WarehouseErpView onToast={showToast} onPrint={setPrintDoc} />}
@@ -161,7 +164,7 @@ export default function App() {
       </main>
 
       {/* Mobile Bottom Navigation */}
-      <nav className="no-print md:hidden fixed bottom-0 inset-x-0 z-30 bg-[#3B281A] text-[#E6D5C3] border-t border-[#563C28] grid grid-cols-6">
+      <nav className="no-print md:hidden fixed bottom-0 inset-x-0 z-30 bg-[#3B281A] text-[#E6D5C3] border-t border-[#563C28] grid grid-cols-7">
         {NAV_ITEMS.map(item => {
           const Icon = item.icon;
           const active = tab === item.id;

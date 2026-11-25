@@ -1070,6 +1070,317 @@ app.post('/api/support-logs', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
   res.json({ id: r.lastInsertRowid, ok: true });
 }));
 
+// ─── 9. 3PL DELIVERY TRACKING FROM POS TRANSACTION_DETAIL ─────
+function parseSalesDayToIso(rawDay) {
+  const s = String(rawDay || '').trim();
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  return '';
+}
+
+function parseTransactionDetailCsv(rawText) {
+  const lines = rawText.replace(/^\uFEFF/, '').split(/\r?\n/);
+  if (lines.length < 2) throw new Error('File transaction_detail CSV trống');
+  const headers = fastCsvLine(lines[0]).map(h => h.trim());
+  const iSlip = headers.indexOf('Slip No.');
+  const iDay = headers.indexOf('Sales Day');
+  const iStore = headers.indexOf('Store');
+  const iDiv = headers.indexOf('Slip Div');
+  const iL1 = headers.indexOf('Layer1');
+  const iName = headers.indexOf('Item Name');
+  const iQty = headers.indexOf('QTY');
+  const iExcl = headers.indexOf('Amount(Tax excl.)');
+  const iIncl = headers.indexOf('Amount(Tax incl.)');
+  if (iSlip < 0 || iExcl < 0 || iIncl < 0) {
+    throw new Error('File không đúng chuẩn transaction_detail ERP Kohnan (thiếu Slip No. / Amount)');
+  }
+
+  const slipMap = new Map();
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line || !line.trim()) continue;
+    const cols = fastCsvLine(line);
+    const slipNo = (cols[iSlip] || '').trim();
+    const div = (cols[iDiv] || '').trim();
+    if (!slipNo || div === 'Delete') continue;
+
+    const isoDay = parseSalesDayToIso(cols[iDay]);
+    const month = isoDay ? isoDay.slice(0, 7) : '';
+    const store = (cols[iStore] || '3001').trim();
+    const l1 = (cols[iL1] || '').trim();
+    const name = (cols[iName] || '').trim();
+    const qty = num(cols[iQty]);
+    const amtExcl = num(cols[iExcl]);
+    const amtIncl = num(cols[iIncl]);
+
+    let cur = slipMap.get(slipNo);
+    if (!cur) {
+      cur = {
+        slip_no: slipNo,
+        sales_month: month,
+        sales_day: isoDay,
+        store_code: store,
+        delivery_cust_pay: 0,
+        install_cust_pay: 0,
+        net_sales_excl_tax: 0,
+        gross_sales_incl_tax: 0,
+        has_furniture: 0,
+        items: [],
+      };
+      slipMap.set(slipNo, cur);
+    }
+
+    cur.net_sales_excl_tax += amtExcl;
+    cur.gross_sales_incl_tax += amtIncl;
+    if (l1 === 'FURNITURE/STORAGE') cur.has_furniture = 1;
+
+    if (l1 === 'SERVICES') {
+      if (/phí vận chuyển|vận chuyển|giao hàng/i.test(name)) {
+        cur.delivery_cust_pay += amtIncl;
+      } else if (/phí lắp đặt|lắp đặt/i.test(name)) {
+        cur.install_cust_pay += amtIncl;
+      }
+    } else if (name && qty !== 0) {
+      cur.items.push(`${name} (x${qty})`);
+    }
+  }
+
+  return Array.from(slipMap.values()).map(s => ({
+    ...s,
+    items_summary: s.items.slice(0, 4).join(', ') + (s.items.length > 4 ? ` (+${s.items.length - 4})` : ''),
+  }));
+}
+
+async function buildDeliveryReport(monthFilter) {
+  const monthsRows = await dbAll(`SELECT DISTINCT sales_month FROM delivery_tracking WHERE sales_month != '' ORDER BY sales_month DESC`);
+  const available_months = monthsRows.map(r => r.sales_month);
+
+  let rows;
+  if (monthFilter && monthFilter !== 'ALL') {
+    rows = await dbAll(`SELECT * FROM delivery_tracking WHERE sales_month = ? ORDER BY sales_day DESC, slip_no DESC`, [monthFilter]);
+  } else {
+    rows = await dbAll(`SELECT * FROM delivery_tracking ORDER BY sales_month DESC, sales_day DESC, slip_no DESC`);
+  }
+
+  const pivotMap = new Map();
+  let gCount = 0, gFee = 0, gDel = 0, gInst = 0, gSales = 0;
+
+  for (const r of rows) {
+    const key = (r.carrier_3pl || '').trim() || 'Chưa phân bổ 3PL';
+    const p = pivotMap.get(key) || {
+      carrier_3pl: key,
+      slip_count: 0,
+      sum_fee: 0,
+      sum_delivery_cust: 0,
+      sum_install_cust: 0,
+      sum_net_sales: 0,
+    };
+    p.slip_count += 1;
+    p.sum_fee += num(r.fee_3pl);
+    p.sum_delivery_cust += num(r.delivery_cust_pay);
+    p.sum_install_cust += num(r.install_cust_pay);
+    p.sum_net_sales += num(r.net_sales_excl_tax);
+    pivotMap.set(key, p);
+
+    gCount += 1;
+    gFee += num(r.fee_3pl);
+    gDel += num(r.delivery_cust_pay);
+    gInst += num(r.install_cust_pay);
+    gSales += num(r.net_sales_excl_tax);
+  }
+
+  const pivot = Array.from(pivotMap.values())
+    .sort((a, b) => b.sum_fee - a.sum_fee || b.slip_count - a.slip_count)
+    .map(p => ({
+      ...p,
+      fee_to_sales_pct: p.sum_net_sales > 0 ? Number(((p.sum_fee / p.sum_net_sales) * 100).toFixed(2)) : 0,
+      net_ship_gap: p.sum_delivery_cust - p.sum_fee,
+    }));
+
+  const grand_total = {
+    slip_count: gCount,
+    sum_fee: gFee,
+    sum_delivery_cust: gDel,
+    sum_install_cust: gInst,
+    sum_net_sales: gSales,
+    fee_to_sales_pct: gSales > 0 ? Number(((gFee / gSales) * 100).toFixed(2)) : 0,
+    net_ship_gap: gDel - gFee,
+  };
+
+  return { month: monthFilter || 'ALL', available_months, pivot, grand_total, rows };
+}
+
+app.get('/api/delivery-tracking', wrap(async (req, res) => {
+  const month = String(req.query.month || '2026-10').trim();
+  res.json(await buildDeliveryReport(month));
+}));
+
+app.get('/api/delivery-tracking/lookup-pos', wrap(async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.json([]);
+  const rows = await dbAll(
+    `SELECT * FROM pos_slips WHERE slip_no LIKE ? OR items_summary LIKE ? ORDER BY sales_day DESC LIMIT 20`,
+    [`%${q}%`, `%${q}%`]
+  );
+  res.json(rows);
+}));
+
+app.post('/api/delivery-tracking/upload-pos', requireRoles('ADMIN', 'EDITOR'), upload.single('file'), wrap(async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Chưa chọn file transaction_detail CSV' });
+  const slips = parseTransactionDetailCsv(req.file.buffer.toString('utf8'));
+  const monthsFound = new Set();
+  const posSql = `INSERT OR REPLACE INTO pos_slips (slip_no,sales_month,sales_day,store_code,delivery_cust_pay,install_cust_pay,net_sales_excl_tax,gross_sales_incl_tax,has_furniture,items_summary) VALUES (?,?,?,?,?,?,?,?,?,?)`;
+
+  for (let i = 0; i < slips.length; i += 100) {
+    const chunk = slips.slice(i, i + 100).map(s => {
+      if (s.sales_month) monthsFound.add(s.sales_month);
+      return {
+        sql: posSql,
+        args: [s.slip_no, s.sales_month, s.sales_day, s.store_code, s.delivery_cust_pay, s.install_cust_pay, s.net_sales_excl_tax, s.gross_sales_incl_tax, s.has_furniture, s.items_summary],
+      };
+    });
+    await dbBatch(chunk);
+  }
+
+  // Upsert slips that have delivery or installation customer payment into delivery_tracking (preserving manual 3PL/Fee/Area/Note!)
+  const deliverySlips = slips.filter(s => s.delivery_cust_pay !== 0 || s.install_cust_pay !== 0);
+  const trackSql = `
+    INSERT INTO delivery_tracking (slip_no,sales_month,sales_day,store_code,delivery_cust_pay,install_cust_pay,net_sales_excl_tax,items_summary)
+    VALUES (?,?,?,?,?,?,?,?)
+    ON CONFLICT(slip_no) DO UPDATE SET
+      sales_month=excluded.sales_month,
+      sales_day=excluded.sales_day,
+      delivery_cust_pay=excluded.delivery_cust_pay,
+      install_cust_pay=excluded.install_cust_pay,
+      net_sales_excl_tax=excluded.net_sales_excl_tax,
+      items_summary=excluded.items_summary,
+      updated_at=datetime('now', '+7 hours')
+  `;
+  for (let i = 0; i < deliverySlips.length; i += 100) {
+    const chunk = deliverySlips.slice(i, i + 100).map(s => ({
+      sql: trackSql,
+      args: [s.slip_no, s.sales_month, s.sales_day, s.store_code, s.delivery_cust_pay, s.install_cust_pay, s.net_sales_excl_tax, s.items_summary],
+    }));
+    await dbBatch(chunk);
+  }
+
+  res.json({
+    ok: true,
+    months: Array.from(monthsFound).sort(),
+    total_pos_slips: slips.length,
+    auto_tracked_delivery_slips: deliverySlips.length,
+  });
+}));
+
+app.post('/api/delivery-tracking', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const b = req.body;
+  const slipNo = String(b.slip_no || '').trim();
+  if (!slipNo) return res.status(400).json({ error: 'Vui lòng nhập Số hóa đơn (No Slip.)' });
+
+  const pos = await dbGet(`SELECT * FROM pos_slips WHERE slip_no = ?`, [slipNo]);
+  const salesMonth = b.sales_month || pos?.sales_month || new Date().toISOString().slice(0, 7);
+  const salesDay = b.sales_day || pos?.sales_day || new Date().toISOString().slice(0, 10);
+
+  await dbRun(`
+    INSERT INTO delivery_tracking (slip_no,sales_month,sales_day,store_code,delivery_cust_pay,install_cust_pay,fee_3pl,net_sales_excl_tax,carrier_3pl,area,note,items_summary)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(slip_no) DO UPDATE SET
+      carrier_3pl=excluded.carrier_3pl,
+      fee_3pl=excluded.fee_3pl,
+      area=excluded.area,
+      note=excluded.note,
+      updated_at=datetime('now', '+7 hours')
+  `, [
+    slipNo,
+    salesMonth,
+    salesDay,
+    b.store_code || pos?.store_code || '3001',
+    b.delivery_cust_pay !== undefined ? num(b.delivery_cust_pay) : (pos?.delivery_cust_pay || 0),
+    b.install_cust_pay !== undefined ? num(b.install_cust_pay) : (pos?.install_cust_pay || 0),
+    num(b.fee_3pl),
+    b.net_sales_excl_tax !== undefined ? num(b.net_sales_excl_tax) : (pos?.net_sales_excl_tax || 0),
+    b.carrier_3pl || '',
+    b.area || 'HCM',
+    b.note || '',
+    pos?.items_summary || b.items_summary || '',
+  ]);
+  res.json({ ok: true, matched_pos: Boolean(pos) });
+}));
+
+app.put('/api/delivery-tracking/:slipNo', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const slipNo = req.params.slipNo;
+  const b = req.body;
+  await dbRun(`
+    UPDATE delivery_tracking SET
+      carrier_3pl=?, fee_3pl=?, area=?, note=?,
+      delivery_cust_pay=COALESCE(?, delivery_cust_pay),
+      install_cust_pay=COALESCE(?, install_cust_pay),
+      net_sales_excl_tax=COALESCE(?, net_sales_excl_tax),
+      updated_at=datetime('now', '+7 hours')
+    WHERE slip_no=?
+  `, [
+    b.carrier_3pl ?? '',
+    num(b.fee_3pl),
+    b.area ?? 'HCM',
+    b.note ?? '',
+    b.delivery_cust_pay !== undefined ? num(b.delivery_cust_pay) : null,
+    b.install_cust_pay !== undefined ? num(b.install_cust_pay) : null,
+    b.net_sales_excl_tax !== undefined ? num(b.net_sales_excl_tax) : null,
+    slipNo,
+  ]);
+  res.json({ ok: true });
+}));
+
+app.delete('/api/delivery-tracking/:slipNo', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  await dbRun(`DELETE FROM delivery_tracking WHERE slip_no = ?`, [req.params.slipNo]);
+  res.json({ ok: true });
+}));
+
+app.get('/api/delivery-tracking/export', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const month = String(req.query.month || '2026-10').trim();
+  const report = await buildDeliveryReport(month);
+  const wb = XLSX.utils.book_new();
+  const wsPivot = XLSX.utils.json_to_sheet([
+    ...report.pivot.map(p => ({
+      '3PL': p.carrier_3pl,
+      'COUNTA of No Slip.': p.slip_count,
+      'SUM of Fee': p.sum_fee,
+      'SUM of Delivery Customer Payment': p.sum_delivery_cust,
+      'SUM of Installation Customer Payment': p.sum_install_cust,
+      'SUM of Net Sales (Tax excl.)': p.sum_net_sales,
+      'Fee / Net Sales (%)': p.fee_to_sales_pct,
+    })),
+    {
+      '3PL': 'Grand Total',
+      'COUNTA of No Slip.': report.grand_total.slip_count,
+      'SUM of Fee': report.grand_total.sum_fee,
+      'SUM of Delivery Customer Payment': report.grand_total.sum_delivery_cust,
+      'SUM of Installation Customer Payment': report.grand_total.sum_install_cust,
+      'SUM of Net Sales (Tax excl.)': report.grand_total.sum_net_sales,
+      'Fee / Net Sales (%)': report.grand_total.fee_to_sales_pct,
+    },
+  ]);
+  const wsDet = XLSX.utils.json_to_sheet(report.rows.map(r => ({
+    'No Slip.': r.slip_no,
+    'Sales Day': r.sales_day,
+    'Delivery Customer Payment': r.delivery_cust_pay,
+    'Installation Customer Payment': r.install_cust_pay,
+    'Fee': r.fee_3pl,
+    'Net Sales (Tax excl.)': r.net_sales_excl_tax,
+    '3PL': r.carrier_3pl,
+    'Area': r.area,
+    'Note': r.note,
+    'Items': r.items_summary,
+  })));
+  XLSX.utils.book_append_sheet(wb, wsPivot, 'Pivot_3PL');
+  XLSX.utils.book_append_sheet(wb, wsDet, 'Chi_Tiet_Giao_Hang');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Disposition', `attachment; filename="Benom_3PL_Delivery_Report_${month}.xlsx"`);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.send(buf);
+}));
+
 // Global API error handler
 app.use((err, req, res, next) => {
   console.error('[API Error]', err);
