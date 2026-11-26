@@ -658,6 +658,12 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
   const h = await dbGet('SELECT * FROM handovers WHERE id = ?', [id]);
   if (!h) return res.status(404).json({ error: 'Không tìm thấy biên bản' });
 
+  const newDate = b.handover_date || h.handover_date || '';
+  const newKtv1 = (b.ktv1_name ?? h.ktv1_name ?? '').trim();
+  const newKtv2 = (b.ktv2_name ?? h.ktv2_name ?? '').trim();
+  const newInstallMode = b.install_mode ?? h.install_mode ?? '';
+  const newStatus = b.status || h.status;
+
   await dbRun(`
     UPDATE handovers SET
       handover_date=?, ktv1_name=?, ktv2_name=?, driver_name=?, driver_phone=?, vehicle_plate=?,
@@ -665,32 +671,59 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
       signature_data=?, photos_json=?, csat_rating=?, csat_comment=?, status=?
     WHERE id=?
   `, [
-    b.handover_date || h.handover_date, b.ktv1_name ?? h.ktv1_name, b.ktv2_name ?? h.ktv2_name,
+    newDate, newKtv1, newKtv2,
     b.driver_name ?? h.driver_name, b.driver_phone ?? h.driver_phone, b.vehicle_plate ?? h.vehicle_plate,
-    b.install_mode ?? h.install_mode,
+    newInstallMode,
     b.check_1 ? 1 : 0, b.check_2 ? 1 : 0, b.check_3 ? 1 : 0, b.check_4 ? 1 : 0,
     b.issue_note ?? h.issue_note, b.due_date ?? h.due_date,
     b.signature_data ?? h.signature_data, b.photos_json ?? h.photos_json,
-    num(b.csat_rating), b.csat_comment ?? h.csat_comment, b.status || h.status, id
+    num(b.csat_rating), b.csat_comment ?? h.csat_comment, newStatus, id
   ]);
 
-  if (b.status === 'Completed' && h.order_id) {
-    if (h.doc_type === 'BM-01') {
-      await dbRun(`UPDATE orders SET status='Done', install_status='Đã lắp & Nghiệm thu', delivery_date=COALESCE(NULLIF(delivery_date,''), ?) WHERE id=?`,
-        [b.handover_date || new Date().toISOString().slice(0, 10), h.order_id]);
-    } else if (h.doc_type === 'BM-05') {
-      if ((b.install_mode || h.install_mode) === 'Hẹn kỹ thuật Benom lắp sau') {
-        const dup = await dbGet(`SELECT id FROM handovers WHERE invoice_no=? AND doc_type='BM-01'`, [h.invoice_no]);
-        if (!dup) {
-          const bm01No = await nextHandoverNo('BM-01');
-          await dbRun(`
-            INSERT INTO handovers (doc_no, doc_type, order_id, invoice_no, handover_date, warehouse_code, customer_name, customer_phone, address, carrier, install_mode, status)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-          `, [bm01No, 'BM-01', h.order_id, h.invoice_no, '', h.warehouse_code, h.customer_name, h.customer_phone, h.address, h.carrier, 'Kỹ thuật Benom lắp đặt (tách từ BM-05)', 'Pending']);
+  // Resolve linked Order by order_id or fallback by invoice_no
+  let targetOrderId = h.order_id;
+  if (!targetOrderId && h.invoice_no) {
+    const matchedOrder = await dbGet('SELECT id FROM orders WHERE invoice_no = ? ORDER BY id DESC LIMIT 1', [h.invoice_no]);
+    if (matchedOrder) {
+      targetOrderId = matchedOrder.id;
+      await dbRun('UPDATE handovers SET order_id = ? WHERE id = ?', [targetOrderId, id]);
+    }
+  }
+
+  // Always sync KTV 1, KTV 2, delivery_date & require_install back to the linked Order!
+  if (targetOrderId) {
+    const isBenomInstall = h.doc_type === 'BM-01' || /benom lắp/i.test(newInstallMode);
+    await dbRun(`
+      UPDATE orders SET
+        ktv1_name = CASE WHEN ? != '' THEN ? ELSE ktv1_name END,
+        ktv2_name = CASE WHEN ? != '' THEN ? ELSE ktv2_name END,
+        delivery_date = CASE WHEN ? != '' THEN ? ELSE delivery_date END,
+        require_install = CASE WHEN ? = 1 THEN 1 ELSE require_install END
+      WHERE id = ?
+    `, [newKtv1, newKtv1, newKtv2, newKtv2, newDate, newDate, isBenomInstall ? 1 : 0, targetOrderId]);
+
+    if (newStatus === 'Completed') {
+      if (h.doc_type === 'BM-01') {
+        await dbRun(
+          `UPDATE orders SET status='Done', install_status='Đã lắp & Nghiệm thu', delivery_date=COALESCE(NULLIF(?,''), NULLIF(delivery_date,''), ?) WHERE id=?`,
+          [newDate, new Date().toISOString().slice(0, 10), targetOrderId]
+        );
+      } else if (h.doc_type === 'BM-05') {
+        if (newInstallMode === 'Hẹn kỹ thuật Benom lắp sau') {
+          const dup = await dbGet(`SELECT id FROM handovers WHERE invoice_no=? AND doc_type='BM-01'`, [h.invoice_no]);
+          if (!dup) {
+            const bm01No = await nextHandoverNo('BM-01');
+            await dbRun(`
+              INSERT INTO handovers (doc_no, doc_type, order_id, invoice_no, handover_date, warehouse_code, customer_name, customer_phone, address, carrier, install_mode, status)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            `, [bm01No, 'BM-01', targetOrderId, h.invoice_no, '', h.warehouse_code, h.customer_name, h.customer_phone, h.address, h.carrier, 'Kỹ thuật Benom lắp đặt (tách từ BM-05)', 'Pending']);
+          }
+        } else {
+          await dbRun(
+            `UPDATE orders SET status='Done', delivery_date=COALESCE(NULLIF(?,''), NULLIF(delivery_date,''), ?) WHERE id=?`,
+            [newDate, new Date().toISOString().slice(0, 10), targetOrderId]
+          );
         }
-      } else {
-        await dbRun(`UPDATE orders SET status='Done', delivery_date=COALESCE(NULLIF(delivery_date,''), ?) WHERE id=?`,
-          [b.handover_date || new Date().toISOString().slice(0, 10), h.order_id]);
       }
     }
   }
