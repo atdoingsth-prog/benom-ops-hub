@@ -710,6 +710,119 @@ app.get('/api/guides', wrap(async (req, res) => {
   res.json(await dbAll(`SELECT * FROM product_guides ORDER BY product_line, title`));
 }));
 
+// Quick HDLR/HDBQ matcher for KTV on-site inside BM-01 HandoverModal (TASK-14)
+app.get('/api/guides/match', wrap(async (req, res) => {
+  const names = String(req.query.names || '').trim().toLowerCase();
+  const all = await dbAll(`SELECT id, title, product_line, guide_type, content_md FROM product_guides ORDER BY product_line, id`);
+
+  const normalizeGuide = (g) => {
+    let title = String(g.title || '').trim();
+    if (!title) {
+      const firstLine = String(g.content_md || '')
+        .split(/\r?\n/)
+        .map(l => l.replace(/[#*_\\!]|\[.*?\]/g, '').trim())
+        .find(l => l.length > 2);
+      title = firstLine ? firstLine.slice(0, 90) : `Tài liệu ${g.guide_type || 'HDLR'} #${g.id}`;
+    }
+    return { ...g, title };
+  };
+
+  const normalized = all.map(normalizeGuide);
+  if (!names) return res.json(normalized.slice(0, 6));
+
+  const stopWords = new Set(['benom', 'màu', 'trắng', 'nâu', 'đen', 'xám', 'nhiên', 'kích', 'thước', 'loại', 'chiếc', 'thùng']);
+  const tokens = Array.from(
+    new Set(
+      names
+        .split(/[\s\-_/(),.+]+/)
+        .map(w => w.trim())
+        .filter(w => w.length >= 3 && !stopWords.has(w) && !/^\d/.test(w))
+    )
+  );
+
+  const scored = normalized
+    .map(g => {
+      let score = 0;
+      const line = String(g.product_line || '').toLowerCase();
+      const titleLow = String(g.title || '').toLowerCase();
+      const contentLow = String(g.content_md || '').toLowerCase();
+
+      if (line && line !== 'chung' && names.includes(line)) score += 20;
+      for (const tok of tokens) {
+        if (titleLow.includes(tok)) score += tok.length >= 4 ? 8 : 4;
+        if (contentLow.includes(tok)) score += tok.length >= 4 ? 5 : 2;
+      }
+      return { guide: g, score };
+    })
+    .filter(x => x.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  const seenContent = new Set();
+  const deduped = [];
+  for (const x of scored) {
+    const key = String(x.guide.content_md || '').trim().slice(0, 120);
+    if (seenContent.has(key)) continue;
+    seenContent.add(key);
+    deduped.push(x.guide);
+    if (deduped.length >= 6) break;
+  }
+
+  res.json(deduped.length > 0 ? deduped : normalized.slice(0, 4));
+}));
+
+// ─── 2B. SPARE PARTS / KHO NGŨ KIM KTV (TASK-15) ──────────────
+app.get('/api/spare-parts', wrap(async (req, res) => {
+  const [parts, logs] = await Promise.all([
+    dbAll('SELECT * FROM spare_parts ORDER BY (stock_qty <= min_stock) DESC, category ASC, name ASC'),
+    dbAll('SELECT * FROM spare_part_logs ORDER BY id DESC LIMIT 40'),
+  ]);
+  res.json({
+    parts: parts.map(p => ({ ...p, is_low_stock: Number(p.stock_qty) <= Number(p.min_stock) })),
+    logs,
+  });
+}));
+
+app.post('/api/spare-parts', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const b = req.body;
+  const code = String(b.code || '').trim().toUpperCase();
+  const name = String(b.name || '').trim();
+  if (!code || !name) return res.status(400).json({ error: 'Vui lòng nhập Mã ngũ kim và Tên vật tư.' });
+  const r = await dbRun(
+    `INSERT INTO spare_parts (code, name, category, unit, stock_qty, min_stock, location, notes, updated_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+    [code, name, b.category || 'Ốc vít & Liên kết', b.unit || 'Cái', num(b.stock_qty), num(b.min_stock) || 10, b.location || 'Store 3001 / Túi đồ KTV', b.notes || '', getVnDateTime()]
+  );
+  await logAudit(req, 'CREATE_SPARE_PART', 'SPARE_PART', code, `Thêm vật tư ngũ kim ${code} — ${name} (tồn đầu: ${num(b.stock_qty)})`);
+  res.json({ id: r.lastInsertRowid, ok: true });
+}));
+
+app.post('/api/spare-parts/:id/tx', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
+  const part = await dbGet('SELECT * FROM spare_parts WHERE id = ?', [req.params.id]);
+  if (!part) return res.status(404).json({ error: 'Không tìm thấy vật tư ngũ kim' });
+  const txType = req.body.tx_type === 'IN' ? 'IN' : 'OUT';
+  const qty = Math.abs(num(req.body.qty));
+  if (qty <= 0) return res.status(400).json({ error: 'Số lượng phải lớn hơn 0.' });
+
+  const nextStock = txType === 'IN' ? Number(part.stock_qty) + qty : Math.max(0, Number(part.stock_qty) - qty);
+  const nowVn = getVnDateTime();
+  const staffName = String(req.body.staff_name || req.user.full_name || '').trim();
+  const refDoc = String(req.body.ref_doc || '').trim();
+  const notes = String(req.body.notes || '').trim();
+
+  await dbRun(`UPDATE spare_parts SET stock_qty = ?, updated_at = ? WHERE id = ?`, [nextStock, nowVn, part.id]);
+  await dbRun(
+    `INSERT INTO spare_part_logs (part_id, part_code, part_name, tx_type, qty, staff_name, ref_doc, notes, created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+    [part.id, part.code, part.name, txType, qty, staffName, refDoc, notes, nowVn]
+  );
+  await logAudit(
+    req,
+    txType === 'IN' ? 'SPARE_PART_IN' : 'SPARE_PART_OUT',
+    'SPARE_PART',
+    part.code,
+    `${txType === 'IN' ? 'Nhập' : 'Xuất KTV'} ${qty} ${part.unit} ${part.name} (tồn: ${part.stock_qty} → ${nextStock})${refDoc ? ` • ${refDoc}` : ''}`
+  );
+  res.json({ ok: true, stock_qty: nextStock });
+}));
+
 // ─── 3. ORDERS & DISPATCH ─────────────────────────────────────
 async function batchQueryByIds(sqlPrefix, ids) {
   if (!ids || ids.length === 0) return [];

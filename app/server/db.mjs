@@ -441,6 +441,30 @@ const SCHEMA_STATEMENTS = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_logs(entity_type)`,
+  `CREATE TABLE IF NOT EXISTS spare_parts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    category TEXT DEFAULT 'Ngũ kim liên kết',
+    unit TEXT DEFAULT 'Bộ',
+    stock_qty REAL DEFAULT 0,
+    min_stock REAL DEFAULT 10,
+    location TEXT DEFAULT 'Kho Store 3001 / Túi đồ KTV',
+    notes TEXT DEFAULT '',
+    updated_at TEXT DEFAULT (datetime('now', '+7 hours'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS spare_part_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    part_id INTEGER NOT NULL,
+    part_code TEXT DEFAULT '',
+    part_name TEXT DEFAULT '',
+    tx_type TEXT NOT NULL,
+    qty REAL NOT NULL,
+    staff_name TEXT DEFAULT '',
+    ref_doc TEXT DEFAULT '',
+    notes TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now', '+7 hours'))
+  )`,
 ];
 
 export async function initDb() {
@@ -497,6 +521,26 @@ export async function initDb() {
     ];
     for (const s of staffRows) {
       await dbRun(`INSERT OR IGNORE INTO staff (emp_code, full_name, role, department, active) VALUES (?,?,?,?,1)`, s);
+    }
+  }
+  // Seed default furniture hardware / spare parts kit if empty (TASK-15)
+  const spCount = await dbGet('SELECT COUNT(*) as c FROM spare_parts');
+  if (!spCount || spCount.c === 0) {
+    const defaultsSp = [
+      ['NK-OC-M6', 'Bulông lục giác M6 + Long đền (Bàn/Ghế/Kệ)', 'Ốc vít & Liên kết', 'Cái', 100, 30, 'Túi đồ KTV / Store 3001', 'Dùng cho ghế Cheri, kệ Keepsake, bàn trà'],
+      ['NK-OC-M8', 'Bulông lục giác M8 chịu lực (Bàn ăn/Giường)', 'Ốc vít & Liên kết', 'Cái', 80, 20, 'Túi đồ KTV / Store 3001', 'Dùng cho bàn ăn Noma, khung giường Kito'],
+      ['NK-CAM-15', 'Ốc cam liên kết + Chốt gỗ ø8 (Tủ/Kệ)', 'Ốc vít & Liên kết', 'Bộ', 60, 20, 'Store 3001', 'Khắc phục hở mối nối tủ/kệ lắp ráp'],
+      ['NK-BL-GM', 'Bản lề giảm chấn cánh tủ (Thẳng/Cong)', 'Bản lề & Ray trượt', 'Cái', 24, 10, 'Store 3001', 'Bảo hành Cấp 1–2 cân chỉnh cánh tủ'],
+      ['NK-BAS-GUONG', 'Bộ bas treo tường + Tắc kê ø8 & Vít khoan', 'Phụ kiện treo tường', 'Bộ', 30, 10, 'Túi đồ KTV', 'Treo gương Be-there, kệ treo tường Nolyn'],
+      ['NK-NUT-CHAN', 'Nút đệm nỉ / cao su chống trầy sàn gỗ', 'Bảo vệ & Hoàn thiện', 'Cái', 120, 40, 'Túi đồ KTV', 'Chống trầy sàn khi bàn giao bàn/ghế'],
+      ['NK-SAP-GO', 'Sáp / Dầu dưỡng gỗ tự nhiên & Dầu bôi trơn bi', 'Bảo dưỡng đồ gỗ', 'Chai', 6, 2, 'Store 3001', 'Bảo dưỡng bàn xoay Noma & mặt gỗ định kỳ'],
+      ['NK-BUT-DAM', 'Bút dặm màu sơn gỗ (Tự nhiên / Óc chó / Đen)', 'Xử lý bề mặt gỗ', 'Cây', 9, 3, 'Túi đồ KTV', 'Chấm dặm vết xước nhẹ tại nhà khách (Cấp 1)'],
+    ];
+    for (const sp of defaultsSp) {
+      await dbRun(
+        `INSERT OR IGNORE INTO spare_parts (code, name, category, unit, stock_qty, min_stock, location, notes) VALUES (?,?,?,?,?,?,?,?)`,
+        sp
+      );
     }
   }
   _initialized = true;

@@ -4,6 +4,7 @@ import {
   Plus, Printer, UploadCloud, Warehouse, X
 } from 'lucide-react';
 import { apiDownload, apiGet, apiSend, apiUpload, AuthUser, PrintDoc } from '../api';
+import SparePartsPanel from '../components/SparePartsPanel';
 
 interface Props {
   user: AuthUser;
@@ -15,11 +16,11 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
   const canEditSlips = user.role === 'ADMIN' || user.role === 'EDITOR';
   const canUploadErp = user.role === 'ADMIN';
 
-  const [subTab, setSubTabState] = useState<'slips' | 'erp' | 'reconcile'>(() => {
+  const [subTab, setSubTabState] = useState<'slips' | 'erp' | 'reconcile' | 'spare_parts'>(() => {
     const s = localStorage.getItem('benom_wh_subtab');
-    return s === 'erp' || s === 'reconcile' ? s : 'slips';
+    return s === 'erp' || s === 'reconcile' || s === 'spare_parts' ? s : 'slips';
   });
-  const setSubTab = (v: 'slips' | 'erp' | 'reconcile') => {
+  const setSubTab = (v: 'slips' | 'erp' | 'reconcile' | 'spare_parts') => {
     setSubTabState(v);
     localStorage.setItem('benom_wh_subtab', v);
   };
@@ -237,14 +238,15 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
     <div className="space-y-5">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-[#3B281A]">Kho 9005 Toàn Nhất & Dữ Liệu ERP Sidecar</h1>
-          <p className="text-xs text-[#6e5543]">Quản lý Phiếu NK/XK (SKU tồn 9005, số lượng thực tế, Cut-off HĐ 019-2026), nạp ERP CSV & xuất Biên bản Đối soát Toàn Nhất.</p>
+          <h1 className="text-2xl font-bold text-[#3B281A]">Kho 9005 Toàn Nhất, ERP Sidecar & Ngũ Kim KTV</h1>
+          <p className="text-xs text-[#6e5543]">Quản lý Phiếu NK/XK (SKU tồn 9005, SL thực tế, Cut-off HĐ 019-2026), nạp ERP CSV, đối soát Toàn Nhất & Kho Ngũ Kim KTV.</p>
         </div>
-        <div className="flex bg-[#EFE7DC] p-1 rounded-lg self-start">
+        <div className="flex flex-wrap bg-[#EFE7DC] p-1 rounded-lg self-start gap-0.5">
           {[
             ['slips', 'Phiếu NK / XK'],
             ['erp', 'Nạp ERP CSV'],
             ['reconcile', 'Đối soát Toàn Nhất'],
+            ['spare_parts', 'Kho Ngũ Kim (KTV)'],
           ].map(([id, label]) => (
             <button
               key={id}
@@ -501,6 +503,11 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
             </div>
           )}
         </div>
+      )}
+
+      {/* TAB 4: SPARE PARTS / HARDWARE MINI WAREHOUSE (TASK-15) */}
+      {subTab === 'spare_parts' && (
+        <SparePartsPanel user={user} onToast={onToast} />
       )}
 
       {/* Actual Qty & Status Modal (TASK-09) */}

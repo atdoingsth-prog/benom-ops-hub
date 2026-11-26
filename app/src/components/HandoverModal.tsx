@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Camera, CheckCircle2, Eraser, Printer, Star, Trash2, X } from 'lucide-react';
+import { BookOpen, Camera, CheckCircle2, Eraser, MapPin, Phone, Printer, Star, Trash2, X } from 'lucide-react';
 import { apiGet, apiSend } from '../api';
+import { compressImageFile } from '../utils/imageCompress';
 import KtvListPicker, { KtvEntry, StaffItem } from './KtvListPicker';
 
 interface Props {
@@ -21,41 +22,6 @@ function initKtvsFromHandover(h: any): KtvEntry[] {
   if (h.ktv1_name || h.ktv1_code) out.push({ code: h.ktv1_code || '', name: h.ktv1_name || '' });
   if (h.ktv2_name || h.ktv2_code) out.push({ code: h.ktv2_code || '', name: h.ktv2_name || '' });
   return out;
-}
-
-// Client-side Canvas JPEG compression (max 1280px, quality 0.72 -> ~100KB instead of 5-8MB)
-function compressImageFile(file: File, maxDim = 1280, quality = 0.72): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error('Không đọc được file ảnh'));
-    reader.onload = () => {
-      const img = new Image();
-      img.onerror = () => reject(new Error('File không phải ảnh hợp lệ'));
-      img.onload = () => {
-        let { width, height } = img;
-        if (width > maxDim || height > maxDim) {
-          if (width >= height) {
-            height = Math.round((height * maxDim) / width);
-            width = maxDim;
-          } else {
-            width = Math.round((width * maxDim) / height);
-            height = maxDim;
-          }
-        }
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return resolve(String(reader.result));
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(0, 0, width, height);
-        ctx.drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL('image/jpeg', quality));
-      };
-      img.src = String(reader.result);
-    };
-    reader.readAsDataURL(file);
-  });
 }
 
 export default function HandoverModal({ handover, staffList, readOnly = false, onStaffAdded, onClose, onSaved, onPrint }: Props) {
@@ -83,6 +49,23 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
   const [loadingMedia, setLoadingMedia] = useState(false);
   const [compressing, setCompressing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [showGuides, setShowGuides] = useState(false);
+  const [matchedGuides, setMatchedGuides] = useState<any[]>([]);
+  const [loadingGuides, setLoadingGuides] = useState(false);
+
+  const toggleGuides = async () => {
+    const next = !showGuides;
+    setShowGuides(next);
+    if (next && matchedGuides.length === 0) {
+      setLoadingGuides(true);
+      try {
+        const names = (handover.items || []).map((it: any) => it.product_name || '').join(' ');
+        setMatchedGuides(await apiGet(`/api/guides/match?names=${encodeURIComponent(names)}`));
+      } catch { /* ignore */ } finally {
+        setLoadingGuides(false);
+      }
+    }
+  };
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const drawing = useRef(false);
@@ -256,12 +239,37 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
             </div>
           )}
 
-          {/* Customer summary */}
-          <div className="bg-[#F8F4EC] p-3.5 rounded-xl border border-[#E6DDD1]">
-            <div className="font-semibold text-[#3B281A]">{handover.customer_name} — {handover.customer_phone}</div>
-            <div className="text-xs text-[#6e5543] mt-0.5">{handover.address}</div>
+          {/* Customer summary + 1-tap Call/Maps & Quick HDLR/HDBQ (TASK-14) */}
+          <div className="bg-[#F8F4EC] p-3.5 rounded-xl border border-[#E6DDD1] space-y-2.5">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0 flex-1">
+                <div className="font-semibold text-[#3B281A]">{handover.customer_name} — {handover.customer_phone}</div>
+                <div className="text-xs text-[#6e5543] mt-0.5">{handover.address}</div>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                {handover.customer_phone && (
+                  <a
+                    href={`tel:${String(handover.customer_phone).replace(/\s+/g, '')}`}
+                    className="px-2.5 py-1.5 rounded-lg bg-[#234E36] text-white text-[11px] font-semibold flex items-center gap-1 hover:bg-[#1b3d2a]"
+                  >
+                    <Phone className="w-3 h-3" /> Gọi khách
+                  </a>
+                )}
+                {handover.address && (
+                  <a
+                    href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(handover.address)}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="px-2.5 py-1.5 rounded-lg bg-white border border-[#D6BCA5] text-[#224B85] text-[11px] font-semibold flex items-center gap-1 hover:bg-blue-50"
+                  >
+                    <MapPin className="w-3 h-3" /> Bản đồ
+                  </a>
+                )}
+              </div>
+            </div>
+
             {handover.items?.length > 0 && (
-              <div className="mt-2 pt-2 border-t border-[#E6DDD1] space-y-1 text-xs">
+              <div className="pt-2 border-t border-[#E6DDD1] space-y-1 text-xs">
                 {handover.items.map((it: any, i: number) => (
                   <div key={i} className="flex justify-between items-center gap-2">
                     <span>
@@ -274,6 +282,44 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
                 ))}
               </div>
             )}
+
+            <div className="pt-2 border-t border-[#E6DDD1]">
+              <button
+                type="button"
+                onClick={toggleGuides}
+                className="w-full px-3 py-1.5 rounded-lg bg-white border border-[#D6BCA5] text-xs font-semibold text-[#3B281A] flex items-center justify-between hover:bg-[#FAF7F2] cursor-pointer"
+              >
+                <span className="flex items-center gap-1.5">
+                  <BookOpen className="w-3.5 h-3.5 text-[#224B85]" />
+                  Xem nhanh HDLR / HDBQ sản phẩm trong đơn
+                </span>
+                <span className="text-[11px] text-[#6e5543]">{showGuides ? 'Thu gọn ▲' : 'Mở tài liệu ▼'}</span>
+              </button>
+
+              {showGuides && (
+                <div className="mt-2 space-y-2 max-h-60 overflow-y-auto pr-1">
+                  {loadingGuides ? (
+                    <div className="text-xs text-[#6e5543] py-2 text-center">Đang tìm tài liệu HDLR / HDBQ khớp sản phẩm...</div>
+                  ) : matchedGuides.length === 0 ? (
+                    <div className="text-xs text-[#6e5543] py-2 text-center">Chưa có tài liệu hướng dẫn khớp với sản phẩm trong đơn.</div>
+                  ) : (
+                    matchedGuides.map((g: any, idx: number) => (
+                      <details key={g.id || idx} open={idx === 0} className="bg-white rounded-lg border border-[#E6DDD1] p-2.5">
+                        <summary className="cursor-pointer font-semibold text-xs text-[#3B281A] flex items-center justify-between gap-2">
+                          <span className="truncate">{g.title}</span>
+                          <span className="shrink-0 px-1.5 py-0.5 rounded bg-[#F8F4EC] text-[10px] font-bold text-[#224B85]">
+                            {g.guide_type || 'HDLR'} {g.product_line ? `• ${g.product_line}` : ''}
+                          </span>
+                        </summary>
+                        <pre className="mt-2 pt-2 border-t border-[#F0E9DF] whitespace-pre-wrap font-sans text-[11px] text-[#3B281A] leading-relaxed max-h-44 overflow-y-auto">
+                          {g.content_md}
+                        </pre>
+                      </details>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Date & Install Mode */}

@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { AlertTriangle, Calculator, CheckCircle2, Download, ShieldCheck, Users } from 'lucide-react';
-import { apiDownload, apiGet, AuthUser, fmtMonth, fmtVnd } from '../api';
+import { AlertTriangle, Calculator, CheckCircle2, Download, Lock, ShieldCheck, Unlock, Users } from 'lucide-react';
+import { apiDownload, apiGet, apiSend, AuthUser, fmtMonth, fmtVnd } from '../api';
 
 interface Props {
   user: AuthUser;
@@ -9,6 +9,7 @@ interface Props {
 
 export default function AllowanceView({ user, onToast }: Props) {
   const canExport = user.role === 'ADMIN' || user.role === 'EDITOR';
+  const isAdmin = user.role === 'ADMIN';
   const [month, setMonthState] = useState(() => localStorage.getItem('benom_allow_month') || 'LATEST');
   const [scope, setScopeState] = useState<'completed' | 'bm01_only' | 'all'>(() => {
     const saved = localStorage.getItem('benom_allow_scope');
@@ -17,6 +18,7 @@ export default function AllowanceView({ user, onToast }: Props) {
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
+  const [locking, setLocking] = useState(false);
 
   const setMonth = (m: string) => {
     setMonthState(m);
@@ -62,7 +64,42 @@ export default function AllowanceView({ user, onToast }: Props) {
     }
   };
 
+  const handleLockPeriod = async () => {
+    const m = data?.month;
+    if (!m || m === 'ALL') return;
+    const notes = prompt(`Xác nhận CHỐT & KHÓA kỳ phụ cấp ${fmtMonth(m)} (${fmtVnd(data.grand_total)}) trình Kế toán (ACC)?\nNhập ghi chú chốt kỳ (tùy chọn):`, 'Đã đối soát BM-01, trình ACC & GM phê duyệt');
+    if (notes === null) return;
+    setLocking(true);
+    try {
+      await apiSend('/api/allowance/lock', 'POST', { month: m, scope, notes });
+      onToast(`Đã KHÓA kỳ phụ cấp ${fmtMonth(m)}! Các đơn trong kỳ đã được bảo vệ chống sửa đổi.`);
+      await load(m, scope);
+    } catch (e: any) {
+      onToast(e.message, 'err');
+    } finally {
+      setLocking(false);
+    }
+  };
+
+  const handleUnlockPeriod = async () => {
+    const m = data?.month;
+    if (!m || m === 'ALL') return;
+    const reason = prompt(`Nhập lý do MỞ KHÓA kỳ phụ cấp ${fmtMonth(m)} (sẽ ghi vào Nhật ký kiểm toán):`);
+    if (!reason || !reason.trim()) return;
+    setLocking(true);
+    try {
+      await apiSend(`/api/allowance/lock/${encodeURIComponent(m)}?reason=${encodeURIComponent(reason.trim())}`, 'DELETE');
+      onToast(`Đã mở khóa kỳ ${fmtMonth(m)} (đã ghi Audit Trail).`);
+      await load(m, scope);
+    } catch (e: any) {
+      onToast(e.message, 'err');
+    } finally {
+      setLocking(false);
+    }
+  };
+
   const availableMonths: string[] = data?.available_months || [];
+  const lockedMonths: string[] = data?.locked_months || [];
   const selectedMonthValue = month === 'LATEST' ? (data?.month || '') : month;
 
   return (
@@ -83,7 +120,9 @@ export default function AllowanceView({ user, onToast }: Props) {
           >
             <option value="ALL">Tất cả các tháng</option>
             {availableMonths.map(m => (
-              <option key={m} value={m}>{fmtMonth(m)}</option>
+              <option key={m} value={m}>
+                {fmtMonth(m)}{lockedMonths.includes(m) ? ' 🔒 (Đã khóa)' : ''}
+              </option>
             ))}
           </select>
 
@@ -114,6 +153,48 @@ export default function AllowanceView({ user, onToast }: Props) {
         <div className="p-8 text-center text-[#6e5543]">Đang tính bảng phụ cấp...</div>
       ) : (
         <>
+          {/* Period Lock Banner (TASK-13) */}
+          {data.month && data.month !== 'ALL' && (
+            <div className={`p-3.5 rounded-xl border text-xs flex flex-wrap items-center justify-between gap-3 ${
+              data.lock_info
+                ? 'bg-emerald-50 border-[#234E36] text-[#234E36]'
+                : 'bg-[#FAF7F2] border-[#D6BCA5] text-[#3B281A]'
+            }`}>
+              <div className="flex items-center gap-2">
+                {data.lock_info ? <Lock className="w-4 h-4 shrink-0" /> : <Unlock className="w-4 h-4 shrink-0 text-[#6e5543]" />}
+                {data.lock_info ? (
+                  <span>
+                    <strong>Kỳ {fmtMonth(data.month)} ĐÃ CHỐT & KHÓA</strong> bởi <strong>{data.lock_info.locked_by}</strong> lúc {data.lock_info.locked_at} ({fmtVnd(data.lock_info.grand_total)})
+                    {data.lock_info.notes ? ` — "${data.lock_info.notes}"` : ''}
+                  </span>
+                ) : (
+                  <span>
+                    Kỳ <strong>{fmtMonth(data.month)}</strong> đang mở (có thể cập nhật km, thang bộ, KTV). Admin chốt & khóa kỳ sau khi hoàn tất đối soát để bảo vệ số liệu trình Kế toán.
+                  </span>
+                )}
+              </div>
+              {isAdmin && (
+                data.lock_info ? (
+                  <button
+                    disabled={locking}
+                    onClick={handleUnlockPeriod}
+                    className="px-3 py-1.5 rounded-lg border border-[#9A2B26] text-[#9A2B26] bg-white font-semibold hover:bg-red-50 cursor-pointer flex items-center gap-1"
+                  >
+                    <Unlock className="w-3.5 h-3.5" /> Mở khóa kỳ
+                  </button>
+                ) : (
+                  <button
+                    disabled={locking}
+                    onClick={handleLockPeriod}
+                    className="px-3 py-1.5 rounded-lg bg-[#3B281A] text-white font-semibold hover:bg-[#563C28] cursor-pointer flex items-center gap-1"
+                  >
+                    <Lock className="w-3.5 h-3.5" /> Chốt & Khóa kỳ (ACC)
+                  </button>
+                )
+              )}
+            </div>
+          )}
+
           {/* SOP Compliance Banners */}
           {(data.excluded_pending_count > 0 || data.unverified_bm01_count > 0) && (
             <div className="flex flex-col sm:flex-row gap-2.5 text-xs">

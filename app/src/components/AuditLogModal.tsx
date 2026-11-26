@@ -17,6 +17,7 @@ const ENTITY_OPTIONS = [
   ['BM03', 'BM-03 Thu hồi Cấp 3'],
   ['BM04', 'BM-04 Sự cố / Claim 3PL'],
   ['QC_RETURN', 'QC Trả xưởng NCC'],
+  ['SPARE_PART', 'Kho Ngũ Kim KTV'],
   ['USER', 'Tài khoản & Phân quyền'],
 ];
 

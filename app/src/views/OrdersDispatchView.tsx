@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import {
-  AlertTriangle, CheckCircle2, ClipboardCheck, Edit3, FileOutput,
-  Plus, Printer, Search, Star, Trash2, Truck, X
+  AlertTriangle, Calendar, CheckCircle2, ClipboardCheck, Edit3, FileOutput,
+  Plus, Printer, Search, Smartphone, Star, Trash2, Truck, X
 } from 'lucide-react';
 import { apiGet, apiSend, AuthUser, fmtVnd, PrintDoc } from '../api';
 import HandoverModal from '../components/HandoverModal';
+import KtvFieldBoard from '../components/KtvFieldBoard';
 import KtvListPicker, { KtvEntry } from '../components/KtvListPicker';
 
 function formatKtvList(row: any): string {
@@ -39,12 +40,18 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
   const canManageOrders = user.role === 'ADMIN' || user.role === 'EDITOR';
   const canHandover = user.role === 'ADMIN' || user.role === 'EDITOR' || user.role === 'KTV';
 
-  const [subTab, setSubTabState] = useState<'orders' | 'handovers'>(() =>
-    (localStorage.getItem('benom_orders_subtab') === 'handovers' ? 'handovers' : 'orders')
-  );
-  const setSubTab = (v: 'orders' | 'handovers') => {
+  type OrdersSubTab = 'ktv_today' | 'schedule' | 'orders' | 'handovers';
+  const subTabStorageKey = `benom_orders_subtab_${user.role}`;
+  const [subTab, setSubTabState] = useState<OrdersSubTab>(() => {
+    const saved = localStorage.getItem(subTabStorageKey);
+    if (saved === 'ktv_today' || saved === 'schedule' || saved === 'orders' || saved === 'handovers') {
+      return saved;
+    }
+    return user.role === 'KTV' ? 'ktv_today' : 'orders';
+  });
+  const setSubTab = (v: OrdersSubTab) => {
     setSubTabState(v);
-    localStorage.setItem('benom_orders_subtab', v);
+    localStorage.setItem(subTabStorageKey, v);
   };
   const [orders, setOrders] = useState<any[]>([]);
   const [handovers, setHandovers] = useState<any[]>([]);
@@ -298,27 +305,68 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
     }
   };
 
+  // 1-tap open or auto-create BM-01/BM-05 from KtvFieldBoard (TASK-14 & TASK-15)
+  const openOrCreateHandoverForOrder = async (o: any) => {
+    try {
+      const existingId = o.handovers?.[0]?.id;
+      if (existingId) {
+        const found = handovers.find(h => h.id === existingId);
+        if (found) {
+          setActiveHandover(found);
+          return;
+        }
+        const full = await apiGet(`/api/handovers/${existingId}`);
+        setActiveHandover(full);
+        return;
+      }
+      if (!canHandover) {
+        onToast('Đơn hàng này chưa có biên bản bàn giao.', 'err');
+        return;
+      }
+      const docType = o.require_install ? 'BM-01' : 'BM-05';
+      const res = await apiSend(`/api/orders/${o.id}/generate-handover`, 'POST', { doc_type: docType });
+      onToast(`Đã tạo ${res.doc_type} số ${res.doc_no}!`);
+      const full = await apiGet(`/api/handovers/${res.id}`);
+      await loadData();
+      setActiveHandover(full);
+    } catch (e: any) {
+      onToast(e.message, 'err');
+    }
+  };
+
   return (
     <div className="space-y-5">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-[#3B281A]">Điều Phối Đơn Hàng & Bàn Giao (BM-01 / BM-05)</h1>
-          <p className="text-xs text-[#6e5543]">Tích hợp khóa an toàn hàng ≥ 25 kg (2 KTV), tự điền từ POS, tạo nhanh XK 9005 & biên bản ký điện tử + CSAT.</p>
+          <h1 className="text-2xl font-bold text-[#3B281A]">Điều Phối Đơn Hàng, Lịch KTV & Bàn Giao (BM-01/05)</h1>
+          <p className="text-xs text-[#6e5543]">Chế độ KTV 4G Hiện trường, Lịch Điều phối gom tuyến theo quận, khóa an toàn ≥ 25 kg (2 KTV) & ký BM-01/05 + CSAT.</p>
         </div>
-        <div className="flex items-center gap-2">
-          <div className="flex bg-[#EFE7DC] p-1 rounded-lg">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex flex-wrap bg-[#EFE7DC] p-1 rounded-lg gap-0.5">
+            <button
+              onClick={() => setSubTab('ktv_today')}
+              className={`px-2.5 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer ${subTab === 'ktv_today' ? 'bg-[#234E36] text-white' : 'text-[#3B281A]'}`}
+            >
+              <Smartphone className="w-3.5 h-3.5" /> KTV Hiện trường
+            </button>
+            <button
+              onClick={() => setSubTab('schedule')}
+              className={`px-2.5 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer ${subTab === 'schedule' ? 'bg-[#224B85] text-white' : 'text-[#3B281A]'}`}
+            >
+              <Calendar className="w-3.5 h-3.5" /> Lịch ĐP
+            </button>
             <button
               onClick={() => setSubTab('orders')}
-              className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer ${subTab === 'orders' ? 'bg-[#3B281A] text-white' : 'text-[#3B281A]'}`}
+              className={`px-2.5 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer ${subTab === 'orders' ? 'bg-[#3B281A] text-white' : 'text-[#3B281A]'}`}
             >
               <Truck className="w-3.5 h-3.5" /> Đơn hàng ({orders.length})
             </button>
             <button
               onClick={() => setSubTab('handovers')}
-              className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer ${subTab === 'handovers' ? 'bg-[#3B281A] text-white' : 'text-[#3B281A]'}`}
+              className={`px-2.5 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer ${subTab === 'handovers' ? 'bg-[#3B281A] text-white' : 'text-[#3B281A]'}`}
             >
-              <ClipboardCheck className="w-3.5 h-3.5" /> Biên bản BM-01/05 ({handovers.length})
+              <ClipboardCheck className="w-3.5 h-3.5" /> Biên bản ({handovers.length})
             </button>
           </div>
           {canManageOrders && (
@@ -332,7 +380,18 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
         </div>
       </div>
 
-      {subTab === 'orders' ? (
+      {(subTab === 'ktv_today' || subTab === 'schedule') ? (
+        <KtvFieldBoard
+          mode={subTab}
+          user={user}
+          orders={orders}
+          handovers={handovers}
+          canManageOrders={canManageOrders}
+          canHandover={canHandover}
+          onEditOrder={openEditOrder}
+          onOpenHandover={openOrCreateHandoverForOrder}
+        />
+      ) : subTab === 'orders' ? (
         <>
           {/* Filter Bar */}
           <form onSubmit={e => { e.preventDefault(); loadData(); }} className="flex flex-wrap gap-2">

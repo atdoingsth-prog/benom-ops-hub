@@ -108,7 +108,16 @@ export default function App() {
   }
 
   if (!user) {
-    return <LoginScreen onSuccess={u => setUser(u)} />;
+    return (
+      <LoginScreen
+        onSuccess={u => {
+          setUser(u);
+          if (u.role === 'KTV' && !window.location.hash.replace(/^#/, '').trim()) {
+            setTab('orders');
+          }
+        }}
+      />
+    );
   }
 
   return (
