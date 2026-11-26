@@ -472,12 +472,66 @@ app.put('/api/master/products/:barcode', requireRoles('ADMIN'), wrap(async (req,
 
 app.get('/api/master/lookups', wrap(async (req, res) => {
   const [staff, warehouses, partners] = await Promise.all([
-    dbAll('SELECT * FROM staff WHERE active = 1 ORDER BY full_name'),
+    dbAll('SELECT * FROM staff WHERE active = 1 ORDER BY emp_code, full_name'),
     dbAll('SELECT * FROM warehouses ORDER BY code'),
     dbAll('SELECT * FROM partners ORDER BY partner_type, name'),
   ]);
   res.json({ staff, warehouses, partners });
 }));
+
+app.post('/api/master/staff', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
+  const empCode = String(req.body.emp_code || '').trim();
+  const fullName = String(req.body.full_name || '').trim();
+  const role = String(req.body.role || 'Hỗ trợ lắp đặt').trim();
+  const department = String(req.body.department || 'Operations').trim();
+  if (!empCode || !fullName) {
+    return res.status(400).json({ error: 'Vui lòng nhập đầy đủ Mã NV (ID) và Họ tên Kỹ thuật viên.' });
+  }
+  await dbRun(
+    `INSERT OR REPLACE INTO staff (emp_code, full_name, role, department, active) VALUES (?,?,?,?,1)`,
+    [empCode, fullName, role, department]
+  );
+  res.json({ ok: true, staff: { emp_code: empCode, full_name: fullName, role, department, active: 1 } });
+}));
+
+function parseKtvs(row) {
+  if (row?.ktvs_json) {
+    try {
+      const arr = JSON.parse(row.ktvs_json);
+      if (Array.isArray(arr) && arr.length > 0) {
+        return arr
+          .map(x => ({ code: String(x?.code || '').trim(), name: String(x?.name || '').trim() }))
+          .filter(x => x.name || x.code);
+      }
+    } catch { /* fallback below */ }
+  }
+  const out = [];
+  if (row?.ktv1_name || row?.ktv1_code) out.push({ code: String(row.ktv1_code || '').trim(), name: String(row.ktv1_name || '').trim() });
+  if (row?.ktv2_name || row?.ktv2_code) out.push({ code: String(row.ktv2_code || '').trim(), name: String(row.ktv2_name || '').trim() });
+  return out;
+}
+
+function normalizeKtvInput(b, fallbackRow = null) {
+  let list = [];
+  if (Array.isArray(b.ktvs)) {
+    list = b.ktvs
+      .map(x => ({ code: String(x?.code || '').trim(), name: String(x?.name || '').trim() }))
+      .filter(x => x.name || x.code);
+  } else if (b.ktv1_name !== undefined || b.ktv2_name !== undefined) {
+    if (String(b.ktv1_name || '').trim()) list.push({ code: String(b.ktv1_code || '').trim(), name: String(b.ktv1_name || '').trim() });
+    if (String(b.ktv2_name || '').trim()) list.push({ code: String(b.ktv2_code || '').trim(), name: String(b.ktv2_name || '').trim() });
+  } else if (fallbackRow) {
+    list = parseKtvs(fallbackRow);
+  }
+  return {
+    list,
+    json: JSON.stringify(list),
+    ktv1_code: list[0]?.code || '',
+    ktv1_name: list[0]?.name || '',
+    ktv2_code: list[1]?.code || '',
+    ktv2_name: list[1]?.name || '',
+  };
+}
 
 app.get('/api/guides', wrap(async (req, res) => {
   const q = (req.query.q || '').trim();
@@ -524,6 +578,7 @@ app.get('/api/orders', wrap(async (req, res) => {
     const maxWeightG = items.reduce((m, it) => Math.max(m, it.net_weight_g || 0), 0);
     return {
       ...o,
+      ktvs: parseKtvs(o),
       items,
       handovers: hoMap.get(o.invoice_no) || [],
       requires_two_ktv: maxWeightG >= 25000,
@@ -535,14 +590,15 @@ app.get('/api/orders', wrap(async (req, res) => {
 app.post('/api/orders', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
   const b = req.body;
   const items = Array.isArray(b.items) ? b.items : [];
+  const ktvNorm = normalizeKtvInput(b);
   let requiresTwo = false;
   for (const it of items) {
     const prod = await dbGet('SELECT net_weight_g FROM products WHERE barcode = ?', [it.barcode || '']);
     if ((prod?.net_weight_g || num(it.net_weight_g)) >= 25000) requiresTwo = true;
   }
-  if (b.require_install && requiresTwo && (!b.ktv1_name || !b.ktv2_name)) {
+  if (b.require_install && requiresTwo && ktvNorm.list.length < 2) {
     return res.status(400).json({
-      error: 'Quy tắc an toàn Benom: Đơn có sản phẩm ≥ 25 kg bắt buộc phân công đủ 2 KTV (KTV 1 & KTV 2)!',
+      error: 'Quy tắc an toàn Benom: Đơn có sản phẩm ≥ 25 kg bắt buộc phân công tối thiểu 2 KTV!',
     });
   }
 
@@ -551,8 +607,8 @@ app.post('/api/orders', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) =
       invoice_no, order_date, delivery_date, customer_name, customer_phone, address, region,
       distance_km, carrier, tracking_no, source_warehouse, moving_no, pic_sales, channel,
       shipping_fee_3pl, customer_paid_fee, is_promo_free_ship, require_install, is_stairs,
-      ktv1_name, ktv1_code, ktv2_name, ktv2_code, status, install_status, notes
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ktv1_name, ktv1_code, ktv2_name, ktv2_code, ktvs_json, status, install_status, notes
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `, [
     b.invoice_no, b.order_date || new Date().toISOString().slice(0, 10), b.delivery_date || '',
     b.customer_name || '', String(b.customer_phone || '').trim(), b.address || '', b.region || 'HCM',
@@ -560,7 +616,7 @@ app.post('/api/orders', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) =
     b.moving_no || '', b.pic_sales || '', b.channel || '',
     num(b.shipping_fee_3pl), num(b.customer_paid_fee), b.is_promo_free_ship ? 1 : 0,
     b.require_install ? 1 : 0, b.is_stairs ? 1 : 0,
-    b.ktv1_name || '', b.ktv1_code || '', b.ktv2_name || '', b.ktv2_code || '',
+    ktvNorm.ktv1_name, ktvNorm.ktv1_code, ktvNorm.ktv2_name, ktvNorm.ktv2_code, ktvNorm.json,
     b.status || 'New', b.require_install ? 'Chờ lắp đặt' : '', b.notes || ''
   ]);
   const oid = r.lastInsertRowid;
@@ -583,15 +639,17 @@ app.post('/api/orders', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) =
 app.put('/api/orders/:id', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
   const { id } = req.params;
   const b = req.body;
+  const existing = await dbGet('SELECT * FROM orders WHERE id = ?', [id]);
+  const ktvNorm = normalizeKtvInput(b, existing);
   await dbRun(`
     UPDATE orders SET status=?, carrier=?, tracking_no=?, distance_km=?, shipping_fee_3pl=?,
       customer_paid_fee=?, is_promo_free_ship=?, is_stairs=?, require_install=?,
-      ktv1_name=?, ktv1_code=?, ktv2_name=?, ktv2_code=?, install_status=?, delivery_date=?, notes=?
+      ktv1_name=?, ktv1_code=?, ktv2_name=?, ktv2_code=?, ktvs_json=?, install_status=?, delivery_date=?, notes=?
     WHERE id=?
   `, [
     b.status, b.carrier, b.tracking_no, num(b.distance_km), num(b.shipping_fee_3pl),
     num(b.customer_paid_fee), b.is_promo_free_ship ? 1 : 0, b.is_stairs ? 1 : 0,
-    b.require_install ? 1 : 0, b.ktv1_name || '', b.ktv1_code || '', b.ktv2_name || '', b.ktv2_code || '',
+    b.require_install ? 1 : 0, ktvNorm.ktv1_name, ktvNorm.ktv1_code, ktvNorm.ktv2_name, ktvNorm.ktv2_code, ktvNorm.json,
     b.install_status || '', b.delivery_date || '', b.notes || '', id
   ]);
   res.json({ ok: true });
@@ -627,14 +685,15 @@ app.post('/api/orders/:id/generate-handover', requireRoles('ADMIN', 'EDITOR', 'K
     return res.status(409).json({ error: `Đơn ${o.invoice_no} đã có phiếu ${existing.doc_no}!` });
   }
   const docNo = await nextHandoverNo(docType);
+  const ktvsJson = JSON.stringify(parseKtvs(o));
   const r = await dbRun(`
-    INSERT INTO handovers (doc_no, doc_type, order_id, invoice_no, handover_date, warehouse_code, customer_name, customer_phone, address, carrier, install_mode, ktv1_name, ktv1_code, ktv2_name, ktv2_code, status)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    INSERT INTO handovers (doc_no, doc_type, order_id, invoice_no, handover_date, warehouse_code, customer_name, customer_phone, address, carrier, install_mode, ktv1_name, ktv1_code, ktv2_name, ktv2_code, ktvs_json, status)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `, [
     docNo, docType, o.id, o.invoice_no, o.delivery_date || new Date().toISOString().slice(0, 10),
     o.source_warehouse || '9005', o.customer_name, o.customer_phone, o.address, o.carrier,
     req.body.install_mode || (docType === 'BM-01' ? 'Kỹ thuật Benom lắp đặt' : 'Khách hàng tự lắp đặt'),
-    o.ktv1_name, o.ktv1_code, o.ktv2_name, o.ktv2_code, 'Pending'
+    o.ktv1_name, o.ktv1_code, o.ktv2_name, o.ktv2_code, ktvsJson, 'Pending'
   ]);
   res.json({ id: r.lastInsertRowid, doc_no: docNo, doc_type: docType });
 }));
@@ -649,7 +708,7 @@ app.get('/api/handovers', wrap(async (req, res) => {
     arr.push(it);
     itemMap.set(it.order_id, arr);
   }
-  res.json(list.map(h => ({ ...h, items: h.order_id ? (itemMap.get(h.order_id) || []) : [] })));
+  res.json(list.map(h => ({ ...h, ktvs: parseKtvs(h), items: h.order_id ? (itemMap.get(h.order_id) || []) : [] })));
 }));
 
 app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
@@ -659,19 +718,19 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
   if (!h) return res.status(404).json({ error: 'Không tìm thấy biên bản' });
 
   const newDate = b.handover_date || h.handover_date || '';
-  const newKtv1 = (b.ktv1_name ?? h.ktv1_name ?? '').trim();
-  const newKtv2 = (b.ktv2_name ?? h.ktv2_name ?? '').trim();
+  const ktvNorm = normalizeKtvInput(b, h);
   const newInstallMode = b.install_mode ?? h.install_mode ?? '';
   const newStatus = b.status || h.status;
 
   await dbRun(`
     UPDATE handovers SET
-      handover_date=?, ktv1_name=?, ktv2_name=?, driver_name=?, driver_phone=?, vehicle_plate=?,
+      handover_date=?, ktv1_name=?, ktv1_code=?, ktv2_name=?, ktv2_code=?, ktvs_json=?,
+      driver_name=?, driver_phone=?, vehicle_plate=?,
       install_mode=?, check_1=?, check_2=?, check_3=?, check_4=?, issue_note=?, due_date=?,
       signature_data=?, photos_json=?, csat_rating=?, csat_comment=?, status=?
     WHERE id=?
   `, [
-    newDate, newKtv1, newKtv2,
+    newDate, ktvNorm.ktv1_name, ktvNorm.ktv1_code, ktvNorm.ktv2_name, ktvNorm.ktv2_code, ktvNorm.json,
     b.driver_name ?? h.driver_name, b.driver_phone ?? h.driver_phone, b.vehicle_plate ?? h.vehicle_plate,
     newInstallMode,
     b.check_1 ? 1 : 0, b.check_2 ? 1 : 0, b.check_3 ? 1 : 0, b.check_4 ? 1 : 0,
@@ -690,17 +749,23 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
     }
   }
 
-  // Always sync KTV 1, KTV 2, delivery_date & require_install back to the linked Order!
+  // Always sync ALL KTVs (1..N), delivery_date & require_install back to the linked Order!
   if (targetOrderId) {
     const isBenomInstall = h.doc_type === 'BM-01' || /benom lắp/i.test(newInstallMode);
     await dbRun(`
       UPDATE orders SET
-        ktv1_name = CASE WHEN ? != '' THEN ? ELSE ktv1_name END,
-        ktv2_name = CASE WHEN ? != '' THEN ? ELSE ktv2_name END,
+        ktv1_name = ?,
+        ktv1_code = ?,
+        ktv2_name = ?,
+        ktv2_code = ?,
+        ktvs_json = ?,
         delivery_date = CASE WHEN ? != '' THEN ? ELSE delivery_date END,
         require_install = CASE WHEN ? = 1 THEN 1 ELSE require_install END
       WHERE id = ?
-    `, [newKtv1, newKtv1, newKtv2, newKtv2, newDate, newDate, isBenomInstall ? 1 : 0, targetOrderId]);
+    `, [
+      ktvNorm.ktv1_name, ktvNorm.ktv1_code, ktvNorm.ktv2_name, ktvNorm.ktv2_code, ktvNorm.json,
+      newDate, newDate, isBenomInstall ? 1 : 0, targetOrderId
+    ]);
 
     if (newStatus === 'Completed') {
       if (h.doc_type === 'BM-01') {
@@ -730,12 +795,12 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
   res.json({ ok: true });
 }));
 
-// ─── 5. TECHNICIAN ALLOWANCE ENGINE (0% #REF!) ────────────────
+// ─── 5. TECHNICIAN ALLOWANCE ENGINE (0% #REF!, SUPPORTS N KTVs) ──
 async function computeAllowance(monthYm) {
   const orders = await dbAll(`
     SELECT * FROM orders
     WHERE require_install = 1
-      AND (ktv1_name != '' OR ktv2_name != '')
+      AND (ktv1_name != '' OR ktv2_name != '' OR (ktvs_json IS NOT NULL AND ktvs_json != '' AND ktvs_json != '[]'))
       AND (? = '' OR COALESCE(NULLIF(delivery_date,''), order_date) LIKE ?)
     ORDER BY COALESCE(NULLIF(delivery_date,''), order_date) ASC, id ASC
   `, [monthYm, `${monthYm}%`]);
@@ -752,10 +817,11 @@ async function computeAllowance(monthYm) {
   const ktvTotals = new Map();
 
   for (const o of orders) {
+    const ktvs = parseKtvs(o);
+    if (ktvs.length === 0) continue;
     const items = itemMap.get(o.id) || [];
     const kFloor = o.is_stairs ? 1.2 : 1.0;
     const pDistOrder = calcDistanceAllowance(o.distance_km);
-    const hasTwo = Boolean(o.ktv1_name && o.ktv2_name);
     const dateStr = o.delivery_date || o.order_date;
 
     items.forEach((it, idx) => {
@@ -763,30 +829,36 @@ async function computeAllowance(monthYm) {
       const pInstall = (it.p_installation_unit || 0) * (it.qty || 1);
       const pDistLine = idx === 0 ? pDistOrder : 0;
       const totalLine = Math.round(pHandling * kFloor + pInstall + pDistLine);
-      const pay1 = o.ktv1_name ? (hasTwo ? totalLine / 2 : totalLine) : 0;
-      const pay2 = o.ktv2_name ? (hasTwo ? totalLine / 2 : totalLine) : 0;
+      const sharePerKtv = totalLine / ktvs.length;
 
       lines.push({
         order_id: o.id, date: dateStr, invoice_no: o.invoice_no, customer_name: o.customer_name,
         barcode: it.barcode, product_name: it.product_name, qty: it.qty, distance_km: o.distance_km,
-        is_stairs: o.is_stairs, k_floor: kFloor, ktv1: o.ktv1_name, ktv2: o.ktv2_name,
+        is_stairs: o.is_stairs, k_floor: kFloor,
+        ktv_count: ktvs.length,
+        ktvs: ktvs.map(k => ({ ...k, pay: Math.round(sharePerKtv) })),
+        ktv1: ktvs[0]?.name || '',
+        ktv2: ktvs[1]?.name || '',
         p_handling: pHandling, p_installation: pInstall, p_distance: pDistLine,
-        total: totalLine, pay_ktv1: pay1, pay_ktv2: pay2,
+        total: totalLine,
+        share_per_ktv: Math.round(sharePerKtv),
+        pay_ktv1: ktvs[0] ? Math.round(sharePerKtv) : 0,
+        pay_ktv2: ktvs[1] ? Math.round(sharePerKtv) : 0,
       });
 
-      if (o.ktv1_name) {
-        const c = ktvTotals.get(o.ktv1_name) || { name: o.ktv1_name, orders: new Set(), total: 0 };
-        c.orders.add(o.invoice_no); c.total += pay1; ktvTotals.set(o.ktv1_name, c);
-      }
-      if (o.ktv2_name) {
-        const c = ktvTotals.get(o.ktv2_name) || { name: o.ktv2_name, orders: new Set(), total: 0 };
-        c.orders.add(o.invoice_no); c.total += pay2; ktvTotals.set(o.ktv2_name, c);
+      for (const k of ktvs) {
+        const key = k.name || k.code;
+        const c = ktvTotals.get(key) || { code: k.code, name: k.name || k.code, orders: new Set(), total: 0 };
+        if (k.code && !c.code) c.code = k.code;
+        c.orders.add(o.invoice_no);
+        c.total += sharePerKtv;
+        ktvTotals.set(key, c);
       }
     });
   }
 
   const summary = Array.from(ktvTotals.values())
-    .map(x => ({ ktv_name: x.name, order_count: x.orders.size, total_allowance: Math.round(x.total) }))
+    .map(x => ({ ktv_code: x.code, ktv_name: x.name, order_count: x.orders.size, total_allowance: Math.round(x.total) }))
     .sort((a, b) => b.total_allowance - a.total_allowance);
 
   return {
@@ -807,14 +879,19 @@ app.get('/api/allowance/export', requireRoles('ADMIN', 'EDITOR'), wrap(async (re
   const data = await computeAllowance(month);
   const wb = XLSX.utils.book_new();
   const wsSum = XLSX.utils.json_to_sheet(data.summary.map(s => ({
-    'Kỹ Thuật Viên': s.ktv_name, 'Số đơn hàng': s.order_count, 'Tổng Phụ Cấp (VND)': s.total_allowance,
+    'Mã NV (ID)': s.ktv_code || '',
+    'Kỹ Thuật Viên': s.ktv_name,
+    'Số đơn hàng': s.order_count,
+    'Tổng Phụ Cấp (VND)': s.total_allowance,
   })));
   const wsDet = XLSX.utils.json_to_sheet(data.lines.map(l => ({
     'Ngày': l.date, 'Mã hóa đơn': l.invoice_no, 'Khách hàng': l.customer_name,
     'Barcode': l.barcode, 'Sản phẩm': l.product_name, 'SL': l.qty, 'Km': l.distance_km,
     'K_Floor': l.k_floor, 'P_Handling': l.p_handling, 'P_Installation': l.p_installation,
     'P_Distance': l.p_distance, 'Tổng Dòng': l.total,
-    'KTV 1': l.ktv1, 'Thù lao KTV 1': l.pay_ktv1, 'KTV 2': l.ktv2, 'Thù lao KTV 2': l.pay_ktv2,
+    'Số KTV': l.ktv_count,
+    'Thù lao mỗi KTV': l.share_per_ktv,
+    'Danh sách KTV (ID - Tên)': (l.ktvs || []).map(k => k.code ? `${k.code} - ${k.name}` : k.name).join('; '),
   })));
   XLSX.utils.book_append_sheet(wb, wsSum, 'Tong_Hop_KTV');
   XLSX.utils.book_append_sheet(wb, wsDet, 'Chi_Tiet_Phu_Cap');

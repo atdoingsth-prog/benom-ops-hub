@@ -5,6 +5,18 @@ import {
 } from 'lucide-react';
 import { apiGet, apiSend, fmtVnd, PrintDoc } from '../api';
 import HandoverModal from '../components/HandoverModal';
+import KtvListPicker, { KtvEntry } from '../components/KtvListPicker';
+
+function formatKtvList(row: any): string {
+  const arr: KtvEntry[] = Array.isArray(row.ktvs) && row.ktvs.length > 0
+    ? row.ktvs
+    : [
+        ...(row.ktv1_name ? [{ code: row.ktv1_code || '', name: row.ktv1_name }] : []),
+        ...(row.ktv2_name ? [{ code: row.ktv2_code || '', name: row.ktv2_name }] : []),
+      ];
+  if (arr.length === 0) return 'Chưa gán';
+  return arr.map(k => (k.code ? `[${k.code}] ${k.name}` : k.name)).join(', ');
+}
 
 interface Props {
   onToast: (msg: string, tone?: 'ok' | 'err') => void;
@@ -38,8 +50,7 @@ export default function OrdersDispatchView({ onToast, onPrint }: Props) {
     is_promo_free_ship: false,
     require_install: true,
     is_stairs: false,
-    ktv1_name: 'Trần Anh Tuyến',
-    ktv2_name: '',
+    ktvs: [{ code: '260135', name: 'Trần Anh Tuyến' }] as KtvEntry[],
     notes: '',
     items: [] as any[],
   });
@@ -214,10 +225,12 @@ export default function OrdersDispatchView({ onToast, onPrint }: Props) {
                           </span>
                         )}
                       </td>
-                      <td className="py-2.5 px-3 whitespace-nowrap">
+                      <td className="py-2.5 px-3 max-w-[230px]">
                         <div className="font-medium text-[#224B85]">{o.carrier || '—'} {o.shipping_fee_3pl ? `(${fmtVnd(o.shipping_fee_3pl)})` : ''}</div>
-                        <div className="text-[11px] text-[#6e5543]">
-                          {o.require_install ? `KTV: ${[o.ktv1_name, o.ktv2_name].filter(Boolean).join(' + ') || 'Chưa gán'}` : 'Giao không lắp'}
+                        <div className="text-[11px] text-[#6e5543] leading-snug">
+                          {o.require_install || (o.ktvs?.length > 0)
+                            ? `KTV (${o.ktvs?.length || 0}): ${formatKtvList(o)}`
+                            : 'Giao không lắp'}
                         </div>
                       </td>
                       <td className="py-2.5 px-2 text-center">
@@ -285,8 +298,8 @@ export default function OrdersDispatchView({ onToast, onPrint }: Props) {
                 <div className="font-bold text-[#3B281A] mt-2">{h.customer_name}</div>
                 <div className="text-xs text-[#6e5543]">{h.customer_phone} • ĐH {h.invoice_no}</div>
                 <div className="text-xs text-[#6e5543] mt-1 line-clamp-2">{h.address}</div>
-                <div className="text-[11px] text-[#3B281A] mt-2">
-                  <strong>KTV:</strong> {[h.ktv1_name, h.ktv2_name].filter(Boolean).join(' & ') || 'Chưa phân công'}
+                <div className="text-[11px] text-[#3B281A] mt-2 leading-snug">
+                  <strong>KTV ({h.ktvs?.length || 0}):</strong> {formatKtvList(h)}
                 </div>
                 {h.csat_rating > 0 && (
                   <div className="mt-1.5 flex items-center gap-1 text-xs text-amber-600 font-semibold">
@@ -318,8 +331,10 @@ export default function OrdersDispatchView({ onToast, onPrint }: Props) {
       {activeHandover && (
         <HandoverModal
           handover={activeHandover}
+          staffList={staff}
+          onStaffAdded={s => setStaff(prev => [...prev.filter(x => x.emp_code !== s.emp_code), s])}
           onClose={() => setActiveHandover(null)}
-          onSaved={() => { onToast('Đã lưu biên bản & tự động đồng bộ trạng thái đơn hàng!'); loadData(); }}
+          onSaved={() => { onToast('Đã lưu biên bản & tự động đồng bộ KTV + trạng thái đơn hàng!'); loadData(); }}
           onPrint={h => onPrint({ type: 'HANDOVER', data: h })}
         />
       )}
@@ -436,31 +451,26 @@ export default function OrdersDispatchView({ onToast, onPrint }: Props) {
               )}
 
               {/* Dispatch & KTV */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="space-y-3">
                 <div>
                   <label className="font-semibold text-[#6e5543]">Đơn vị vận chuyển</label>
                   <select value={newOrder.carrier} onChange={e => setNewOrder({ ...newOrder, carrier: e.target.value })} className="w-full mt-1 px-2.5 py-2 border border-[#D6BCA5] rounded-lg bg-white">
                     <option value="Ahamove">Ahamove</option>
+                    <option value="Xanh SM">Xanh SM</option>
+                    <option value="247 Express">247 Express</option>
                     <option value="Lalamove">Lalamove</option>
                     <option value="Viettel Post">Viettel Post</option>
                     <option value="Toàn Nhất">Toàn Nhất</option>
                     <option value="Khách tự nhận">Khách tự nhận</option>
                   </select>
                 </div>
-                <div>
-                  <label className="font-semibold text-[#6e5543]">KTV 1</label>
-                  <select value={newOrder.ktv1_name} onChange={e => setNewOrder({ ...newOrder, ktv1_name: e.target.value })} className="w-full mt-1 px-2.5 py-2 border border-[#D6BCA5] rounded-lg bg-white">
-                    <option value="">— Chọn KTV 1 —</option>
-                    {staff.map(s => <option key={s.staff_code} value={s.full_name}>{s.full_name}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className="font-semibold text-[#6e5543]">KTV 2 {requiresTwoKtv ? '*' : ''}</label>
-                  <select value={newOrder.ktv2_name} onChange={e => setNewOrder({ ...newOrder, ktv2_name: e.target.value })} className="w-full mt-1 px-2.5 py-2 border border-[#D6BCA5] rounded-lg bg-white">
-                    <option value="">— Chọn KTV 2 —</option>
-                    {staff.map(s => <option key={s.staff_code} value={s.full_name}>{s.full_name}</option>)}
-                  </select>
-                </div>
+                <KtvListPicker
+                  staff={staff}
+                  value={newOrder.ktvs || []}
+                  onChange={ktvs => setNewOrder({ ...newOrder, ktvs })}
+                  onStaffAdded={s => setStaff(prev => [...prev.filter(x => x.emp_code !== s.emp_code), s])}
+                  label={`Phân công Kỹ thuật viên ${requiresTwoKtv ? '(Tối thiểu 2 KTV)' : ''}`}
+                />
               </div>
 
               <div className="flex flex-wrap gap-4 pt-1">

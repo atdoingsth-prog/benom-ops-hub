@@ -31,7 +31,7 @@ export default function AllowanceView({ onToast }: Props) {
         <div>
           <h1 className="text-2xl font-bold text-[#3B281A]">Phụ Cấp Kỹ Thuật Viên (BEN-PRO-TechnicianAllowance)</h1>
           <p className="text-xs text-[#6e5543] mt-0.5">
-            Tự động hóa 7 cột: <code className="bg-[#EFE7DC] px-1 rounded">(P_Handling × SL × K_Floor) + (P_Install × SL) + P_Distance</code> • Chia 50/50 khi đi 2 KTV • 0% lỗi #REF!
+            Tự động hóa 7 cột: <code className="bg-[#EFE7DC] px-1 rounded">(P_Handling × SL × K_Floor) + (P_Install × SL) + P_Distance</code> • Tự chia đều cho 1, 2, 3, 4... KTV tham gia • 0% lỗi #REF!
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -74,7 +74,10 @@ export default function AllowanceView({ onToast }: Props) {
             {data.summary.map((s: any) => (
               <div key={s.ktv_name} className="bg-white rounded-xl p-4 border border-[#E6DDD1] shadow-xs">
                 <div className="flex items-center justify-between text-xs text-[#6e5543]">
-                  <span className="font-semibold text-[#3B281A]">{s.ktv_name}</span>
+                  <span className="font-semibold text-[#3B281A]">
+                    {s.ktv_code ? <span className="font-mono text-[10px] px-1.5 py-0.5 mr-1 rounded bg-[#F8F4EC] border border-[#D6BCA5]">{s.ktv_code}</span> : null}
+                    {s.ktv_name}
+                  </span>
                   <Users className="w-4 h-4 text-[#224B85]" />
                 </div>
                 <div className="text-2xl font-bold text-[#234E36] mt-2">{fmtVnd(s.total_allowance)}</div>
@@ -101,13 +104,12 @@ export default function AllowanceView({ onToast }: Props) {
                     <th className="py-2.5 px-2 text-right">P_Install</th>
                     <th className="py-2.5 px-2 text-right">P_Dist (km)</th>
                     <th className="py-2.5 px-3 text-right font-bold">Tổng Dòng</th>
-                    <th className="py-2.5 px-3">KTV 1</th>
-                    <th className="py-2.5 px-3">KTV 2</th>
+                    <th className="py-2.5 px-3">Danh sách KTV & Thù lao chia đều</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#F0E9DF]">
                   {data.lines.length === 0 ? (
-                    <tr><td colSpan={10} className="py-8 text-center text-[#6e5543]">Không có đơn lắp đặt nào trong kỳ này.</td></tr>
+                    <tr><td colSpan={9} className="py-8 text-center text-[#6e5543]">Không có đơn lắp đặt nào trong kỳ này.</td></tr>
                   ) : data.lines.map((l: any, idx: number) => (
                     <tr key={idx} className="hover:bg-[#FAF7F2]">
                       <td className="py-2.5 px-3 whitespace-nowrap">
@@ -132,13 +134,16 @@ export default function AllowanceView({ onToast }: Props) {
                         ) : '—'}
                       </td>
                       <td className="py-2.5 px-3 text-right font-bold text-[#3B281A]">{fmtVnd(l.total)}</td>
-                      <td className="py-2.5 px-3 whitespace-nowrap">
-                        <div className="font-medium">{l.ktv1 || '—'}</div>
-                        {l.pay_ktv1 > 0 && <div className="text-[11px] text-[#234E36] font-semibold">{fmtVnd(l.pay_ktv1)}</div>}
-                      </td>
-                      <td className="py-2.5 px-3 whitespace-nowrap">
-                        <div className="font-medium">{l.ktv2 || '—'}</div>
-                        {l.pay_ktv2 > 0 && <div className="text-[11px] text-[#234E36] font-semibold">{fmtVnd(l.pay_ktv2)}</div>}
+                      <td className="py-2.5 px-3">
+                        <div className="flex flex-wrap gap-1.5">
+                          {(l.ktvs || []).map((k: any, ki: number) => (
+                            <span key={ki} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-[#F8F4EC] border border-[#D6BCA5] text-[11px]">
+                              {k.code ? <strong className="font-mono text-[#3B281A]">{k.code}</strong> : null}
+                              <span>{k.name}</span>
+                              <strong className="text-[#234E36]">({fmtVnd(k.pay)})</strong>
+                            </span>
+                          ))}
+                        </div>
                       </td>
                     </tr>
                   ))}

@@ -1,19 +1,32 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Camera, CheckCircle2, Eraser, Printer, Star, X } from 'lucide-react';
-import { apiSend } from '../api';
+import { apiGet, apiSend } from '../api';
+import KtvListPicker, { KtvEntry, StaffItem } from './KtvListPicker';
 
 interface Props {
   handover: any;
+  staffList?: StaffItem[];
+  onStaffAdded?: (s: StaffItem) => void;
   onClose: () => void;
   onSaved: () => void;
   onPrint: (h: any) => void;
 }
 
-export default function HandoverModal({ handover, onClose, onSaved, onPrint }: Props) {
+function initKtvsFromHandover(h: any): KtvEntry[] {
+  if (Array.isArray(h.ktvs) && h.ktvs.length > 0) {
+    return h.ktvs.map((k: any) => ({ code: k.code || '', name: k.name || '' })).filter((k: KtvEntry) => k.name || k.code);
+  }
+  const out: KtvEntry[] = [];
+  if (h.ktv1_name || h.ktv1_code) out.push({ code: h.ktv1_code || '', name: h.ktv1_name || '' });
+  if (h.ktv2_name || h.ktv2_code) out.push({ code: h.ktv2_code || '', name: h.ktv2_name || '' });
+  return out;
+}
+
+export default function HandoverModal({ handover, staffList, onStaffAdded, onClose, onSaved, onPrint }: Props) {
+  const [staff, setStaff] = useState<StaffItem[]>(staffList || []);
+  const [ktvs, setKtvs] = useState<KtvEntry[]>(() => initKtvsFromHandover(handover));
   const [form, setForm] = useState({
     handover_date: handover.handover_date || new Date().toISOString().slice(0, 10),
-    ktv1_name: handover.ktv1_name || '',
-    ktv2_name: handover.ktv2_name || '',
     driver_name: handover.driver_name || '',
     driver_phone: handover.driver_phone || '',
     vehicle_plate: handover.vehicle_plate || '',
@@ -35,6 +48,14 @@ export default function HandoverModal({ handover, onClose, onSaved, onPrint }: P
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const drawing = useRef(false);
   const [hasSig, setHasSig] = useState(Boolean(handover.signature_data));
+
+  useEffect(() => {
+    if (!staffList || staffList.length === 0) {
+      apiGet('/api/master/lookups').then(res => setStaff(res.staff || [])).catch(() => {});
+    } else {
+      setStaff(staffList);
+    }
+  }, [staffList]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -113,6 +134,11 @@ export default function HandoverModal({ handover, onClose, onSaved, onPrint }: P
       const sigData = hasSig && canvasRef.current ? canvasRef.current.toDataURL('image/png') : '';
       const payload = {
         ...form,
+        ktvs,
+        ktv1_code: ktvs[0]?.code || '',
+        ktv1_name: ktvs[0]?.name || '',
+        ktv2_code: ktvs[1]?.code || '',
+        ktv2_name: ktvs[1]?.name || '',
         status: markCompleted ? 'Completed' : form.status,
         signature_data: sigData,
         photos_json: JSON.stringify(photos),
@@ -140,7 +166,16 @@ export default function HandoverModal({ handover, onClose, onSaved, onPrint }: P
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => onPrint({ ...handover, ...form, signature_data: hasSig && canvasRef.current ? canvasRef.current.toDataURL('image/png') : handover.signature_data })}
+              onClick={() => onPrint({
+                ...handover,
+                ...form,
+                ktvs,
+                ktv1_code: ktvs[0]?.code || '',
+                ktv1_name: ktvs[0]?.name || '',
+                ktv2_code: ktvs[1]?.code || '',
+                ktv2_name: ktvs[1]?.name || '',
+                signature_data: hasSig && canvasRef.current ? canvasRef.current.toDataURL('image/png') : handover.signature_data,
+              })}
               className="px-3 py-1.5 rounded-lg bg-[#563C28] text-xs font-medium flex items-center gap-1 hover:bg-[#6a4b33] cursor-pointer"
             >
               <Printer className="w-3.5 h-3.5" /> In PDF
@@ -169,7 +204,7 @@ export default function HandoverModal({ handover, onClose, onSaved, onPrint }: P
             )}
           </div>
 
-          {/* Mode & Staff */}
+          {/* Date & Install Mode */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label className="block text-xs font-semibold text-[#6e5543] mb-1">Ngày bàn giao</label>
@@ -192,25 +227,18 @@ export default function HandoverModal({ handover, onClose, onSaved, onPrint }: P
                 <option value="Hẹn kỹ thuật Benom lắp sau">Hẹn kỹ thuật Benom lắp sau (Tự tạo BM-01)</option>
               </select>
             </div>
-            <div>
-              <label className="block text-xs font-semibold text-[#6e5543] mb-1">KTV 1 / Tài xế</label>
-              <input
-                value={form.ktv1_name}
-                onChange={e => setForm({ ...form, ktv1_name: e.target.value })}
-                placeholder="VD: Trần Anh Tuyến"
-                className="w-full px-3 py-2 rounded-lg border border-[#D6BCA5] text-sm"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-semibold text-[#6e5543] mb-1">KTV 2 (nếu hàng ≥ 25kg)</label>
-              <input
-                value={form.ktv2_name}
-                onChange={e => setForm({ ...form, ktv2_name: e.target.value })}
-                placeholder="VD: Nguyễn Huy Hoàng Tuấn"
-                className="w-full px-3 py-2 rounded-lg border border-[#D6BCA5] text-sm"
-              />
-            </div>
           </div>
+
+          {/* Auto-expanding KTV Dropdown Picker (ID + Name, unlimited KTVs) */}
+          <KtvListPicker
+            staff={staff}
+            value={ktvs}
+            onChange={setKtvs}
+            onStaffAdded={s => {
+              setStaff(prev => [...prev.filter(x => x.emp_code !== s.emp_code), s].sort((a, b) => a.emp_code.localeCompare(b.emp_code)));
+              if (onStaffAdded) onStaffAdded(s);
+            }}
+          />
 
           {/* 4-point checklist */}
           <div className="space-y-2">

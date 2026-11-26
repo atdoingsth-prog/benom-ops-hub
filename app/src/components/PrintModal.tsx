@@ -81,7 +81,12 @@ export default function PrintModal({ doc, onClose }: Props) {
                 <div className="col-span-2"><strong>Địa chỉ giao hàng:</strong> {doc.data.address}</div>
                 <div><strong>Mã hóa đơn (POS):</strong> {doc.data.invoice_no}</div>
                 <div><strong>Hình thức:</strong> {doc.data.install_mode}</div>
-                <div><strong>KTV / Tài xế:</strong> {[doc.data.ktv1_name, doc.data.ktv2_name, doc.data.driver_name].filter(Boolean).join(', ') || '—'}</div>
+                <div>
+                  <strong>KTV / Tài xế:</strong>{' '}
+                  {Array.isArray(doc.data.ktvs) && doc.data.ktvs.length > 0
+                    ? doc.data.ktvs.map((k: any) => (k.code ? `[${k.code}] ${k.name}` : k.name)).join(', ')
+                    : ([doc.data.ktv1_name, doc.data.ktv2_name, doc.data.driver_name].filter(Boolean).join(', ') || '—')}
+                </div>
                 <div><strong>Đơn vị vận chuyển:</strong> {doc.data.carrier || 'benom'}</div>
               </div>
 
@@ -134,7 +139,11 @@ export default function PrintModal({ doc, onClose }: Props) {
                 <div>
                   <div className="font-bold text-[#3B281A]">ĐẠI DIỆN BENOM (GIAO / LẮP)</div>
                   <div className="text-[11px] text-gray-500 mb-14">(Ký và ghi rõ họ tên)</div>
-                  <div className="font-semibold">{[doc.data.ktv1_name, doc.data.ktv2_name].filter(Boolean).join(' & ') || doc.data.driver_name || '___________________'}</div>
+                  <div className="font-semibold">
+                    {Array.isArray(doc.data.ktvs) && doc.data.ktvs.length > 0
+                      ? doc.data.ktvs.map((k: any) => (k.code ? `${k.name} (${k.code})` : k.name)).join(' & ')
+                      : ([doc.data.ktv1_name, doc.data.ktv2_name].filter(Boolean).join(' & ') || doc.data.driver_name || '___________________')}
+                  </div>
                 </div>
                 <div>
                   <div className="font-bold text-[#3B281A]">KHÁCH HÀNG XÁC NHẬN NGHIỆM THU</div>

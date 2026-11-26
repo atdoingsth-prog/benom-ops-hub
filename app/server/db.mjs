@@ -156,6 +156,7 @@ const SCHEMA_STATEMENTS = [
     ktv1_code TEXT DEFAULT '',
     ktv2_name TEXT DEFAULT '',
     ktv2_code TEXT DEFAULT '',
+    ktvs_json TEXT DEFAULT '[]',
     status TEXT DEFAULT 'New',
     install_status TEXT DEFAULT '',
     notes TEXT DEFAULT '',
@@ -226,6 +227,7 @@ const SCHEMA_STATEMENTS = [
     ktv1_code TEXT DEFAULT '',
     ktv2_name TEXT DEFAULT '',
     ktv2_code TEXT DEFAULT '',
+    ktvs_json TEXT DEFAULT '[]',
     check_1 INTEGER DEFAULT 1,
     check_2 INTEGER DEFAULT 1,
     check_3 INTEGER DEFAULT 1,
@@ -358,6 +360,13 @@ export async function initDb() {
   if (_initialized) return;
   for (const sql of SCHEMA_STATEMENTS) {
     await dbRun(sql);
+  }
+  // Safe migrations for existing Local/Turso databases
+  for (const alterSql of [
+    `ALTER TABLE orders ADD COLUMN ktvs_json TEXT DEFAULT '[]'`,
+    `ALTER TABLE handovers ADD COLUMN ktvs_json TEXT DEFAULT '[]'`,
+  ]) {
+    try { await dbRun(alterSql); } catch { /* column already exists */ }
   }
   // Seed default team accounts if empty
   const userCount = await dbGet('SELECT COUNT(*) as c FROM users');
