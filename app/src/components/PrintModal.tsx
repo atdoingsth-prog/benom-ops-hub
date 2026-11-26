@@ -39,8 +39,8 @@ export default function PrintModal({ doc, onClose }: Props) {
           <div className="flex items-start justify-between border-b-2 border-[#3B281A] pb-4 mb-5">
             <div>
               <div className="text-3xl font-bold tracking-tight text-[#3B281A]">benom</div>
-              <div className="text-[11px] uppercase tracking-wider text-[#6e5543] mt-0.5">
-                Minimalist Furniture • Công ty TNHH Kohnan Việt Nam
+              <div className="text-[11px] tracking-wider text-[#6e5543] mt-0.5">
+                beautifully normal • <span className="uppercase">Công ty TNHH Kohnan Việt Nam</span>
               </div>
             </div>
             <div className="text-right text-xs">
