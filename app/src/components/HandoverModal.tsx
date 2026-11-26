@@ -1,11 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Camera, CheckCircle2, Eraser, Printer, Star, X } from 'lucide-react';
+import { Camera, CheckCircle2, Eraser, Printer, Star, Trash2, X } from 'lucide-react';
 import { apiGet, apiSend } from '../api';
 import KtvListPicker, { KtvEntry, StaffItem } from './KtvListPicker';
 
 interface Props {
   handover: any;
   staffList?: StaffItem[];
+  readOnly?: boolean;
   onStaffAdded?: (s: StaffItem) => void;
   onClose: () => void;
   onSaved: () => void;
@@ -22,7 +23,42 @@ function initKtvsFromHandover(h: any): KtvEntry[] {
   return out;
 }
 
-export default function HandoverModal({ handover, staffList, onStaffAdded, onClose, onSaved, onPrint }: Props) {
+// Client-side Canvas JPEG compression (max 1280px, quality 0.72 -> ~100KB instead of 5-8MB)
+function compressImageFile(file: File, maxDim = 1280, quality = 0.72): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Không đọc được file ảnh'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('File không phải ảnh hợp lệ'));
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          if (width >= height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return resolve(String(reader.result));
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, width, height);
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.src = String(reader.result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+export default function HandoverModal({ handover, staffList, readOnly = false, onStaffAdded, onClose, onSaved, onPrint }: Props) {
   const [staff, setStaff] = useState<StaffItem[]>(staffList || []);
   const [ktvs, setKtvs] = useState<KtvEntry[]>(() => initKtvsFromHandover(handover));
   const [form, setForm] = useState({
@@ -43,11 +79,32 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
   const [photos, setPhotos] = useState<string[]>(() => {
     try { return JSON.parse(handover.photos_json || '[]'); } catch { return []; }
   });
+  const [sigUrl, setSigUrl] = useState<string>(handover.signature_data || '');
+  const [loadingMedia, setLoadingMedia] = useState(false);
+  const [compressing, setCompressing] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const drawing = useRef(false);
-  const [hasSig, setHasSig] = useState(Boolean(handover.signature_data));
+  const [hasSig, setHasSig] = useState(Boolean(handover.signature_data || handover.has_signature));
+
+  // Lazy-load full signature_data & photos_json from GET /api/handovers/:id (TASK-10)
+  useEffect(() => {
+    if (handover.id && handover.signature_data === undefined) {
+      setLoadingMedia(true);
+      apiGet(`/api/handovers/${handover.id}`)
+        .then(full => {
+          setSigUrl(full.signature_data || '');
+          setHasSig(Boolean(full.signature_data));
+          try {
+            const parsed = JSON.parse(full.photos_json || '[]');
+            if (Array.isArray(parsed)) setPhotos(parsed);
+          } catch { /* ignore */ }
+        })
+        .catch(() => {})
+        .finally(() => setLoadingMedia(false));
+    }
+  }, [handover.id]);
 
   useEffect(() => {
     if (!staffList || staffList.length === 0) {
@@ -64,12 +121,12 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
     if (!ctx) return;
     ctx.fillStyle = '#FFFFFF';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    if (handover.signature_data) {
+    if (sigUrl) {
       const img = new Image();
       img.onload = () => ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      img.src = handover.signature_data;
+      img.src = sigUrl;
     }
-  }, [handover.signature_data]);
+  }, [sigUrl]);
 
   const getPos = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -80,6 +137,7 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
   };
 
   const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (readOnly) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     canvas.setPointerCapture(e.pointerId);
@@ -95,7 +153,7 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
   };
 
   const onPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!drawing.current || !canvasRef.current) return;
+    if (readOnly || !drawing.current || !canvasRef.current) return;
     const ctx = canvasRef.current.getContext('2d')!;
     const p = getPos(e);
     ctx.lineTo(p.x, p.y);
@@ -107,25 +165,29 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
   };
 
   const clearSignature = () => {
+    if (readOnly) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d')!;
     ctx.fillStyle = '#FFFFFF';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     setHasSig(false);
+    setSigUrl('');
   };
 
-  const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []).slice(0, 4);
-    files.forEach(file => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        if (typeof reader.result === 'string') {
-          setPhotos(prev => [...prev.slice(-3), reader.result as string]);
-        }
-      };
-      reader.readAsDataURL(file);
-    });
+    e.target.value = '';
+    if (files.length === 0) return;
+    setCompressing(true);
+    try {
+      const compressed = await Promise.all(files.map(f => compressImageFile(f, 1280, 0.72)));
+      setPhotos(prev => [...prev, ...compressed].slice(-4));
+    } catch (err: any) {
+      alert(err.message || 'Lỗi xử lý ảnh');
+    } finally {
+      setCompressing(false);
+    }
   };
 
   const handleSave = async (markCompleted: boolean) => {
@@ -174,7 +236,7 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
                 ktv1_name: ktvs[0]?.name || '',
                 ktv2_code: ktvs[1]?.code || '',
                 ktv2_name: ktvs[1]?.name || '',
-                signature_data: hasSig && canvasRef.current ? canvasRef.current.toDataURL('image/png') : handover.signature_data,
+                signature_data: hasSig && canvasRef.current ? canvasRef.current.toDataURL('image/png') : sigUrl,
               })}
               className="px-3 py-1.5 rounded-lg bg-[#563C28] text-xs font-medium flex items-center gap-1 hover:bg-[#6a4b33] cursor-pointer"
             >
@@ -188,6 +250,12 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
 
         {/* Body */}
         <div className="p-5 overflow-y-auto space-y-5 text-sm">
+          {loadingMedia && (
+            <div className="px-3 py-2 rounded-lg bg-[#F8F4EC] border border-[#D6BCA5] text-xs text-[#6e5543]">
+              Đang tải chữ ký & ảnh nghiệm thu từ Cloud...
+            </div>
+          )}
+
           {/* Customer summary */}
           <div className="bg-[#F8F4EC] p-3.5 rounded-xl border border-[#E6DDD1]">
             <div className="font-semibold text-[#3B281A]">{handover.customer_name} — {handover.customer_phone}</div>
@@ -195,9 +263,13 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
             {handover.items?.length > 0 && (
               <div className="mt-2 pt-2 border-t border-[#E6DDD1] space-y-1 text-xs">
                 {handover.items.map((it: any, i: number) => (
-                  <div key={i} className="flex justify-between">
-                    <span>• {it.product_name}</span>
-                    <span className="font-semibold">SL: {it.qty}</span>
+                  <div key={i} className="flex justify-between items-center gap-2">
+                    <span>
+                      {it.source_warehouse ? <strong className="font-mono text-[10px] px-1 py-0.5 mr-1 rounded bg-white border border-[#D6BCA5]">{it.source_warehouse}</strong> : '• '}
+                      {it.product_name}
+                      {it.moving_no ? <span className="text-[10px] text-[#6e5543] ml-1">(Moving {it.moving_no})</span> : null}
+                    </span>
+                    <span className="font-semibold shrink-0">SL: {it.qty}</span>
                   </div>
                 ))}
               </div>
@@ -210,17 +282,19 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
               <label className="block text-xs font-semibold text-[#6e5543] mb-1">Ngày bàn giao</label>
               <input
                 type="date"
+                disabled={readOnly}
                 value={form.handover_date}
                 onChange={e => setForm({ ...form, handover_date: e.target.value })}
-                className="w-full px-3 py-2 rounded-lg border border-[#D6BCA5] text-sm"
+                className="w-full px-3 py-2 rounded-lg border border-[#D6BCA5] text-sm disabled:bg-gray-50"
               />
             </div>
             <div>
               <label className="block text-xs font-semibold text-[#6e5543] mb-1">Hình thức lắp đặt</label>
               <select
+                disabled={readOnly}
                 value={form.install_mode}
                 onChange={e => setForm({ ...form, install_mode: e.target.value })}
-                className="w-full px-3 py-2 rounded-lg border border-[#D6BCA5] text-sm bg-white"
+                className="w-full px-3 py-2 rounded-lg border border-[#D6BCA5] text-sm bg-white disabled:bg-gray-50"
               >
                 <option value="Kỹ thuật Benom lắp đặt">Kỹ thuật Benom lắp đặt</option>
                 <option value="Khách hàng tự lắp đặt">Khách hàng tự lắp đặt</option>
@@ -229,11 +303,11 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
             </div>
           </div>
 
-          {/* Auto-expanding KTV Dropdown Picker (ID + Name, unlimited KTVs) */}
+          {/* Auto-expanding KTV Dropdown Picker */}
           <KtvListPicker
             staff={staff}
             value={ktvs}
-            onChange={setKtvs}
+            onChange={v => !readOnly && setKtvs(v)}
             onStaffAdded={s => {
               setStaff(prev => [...prev.filter(x => x.emp_code !== s.emp_code), s].sort((a, b) => a.emp_code.localeCompare(b.emp_code)));
               if (onStaffAdded) onStaffAdded(s);
@@ -252,6 +326,7 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
               <label key={key} className="flex items-start gap-2.5 p-2.5 rounded-lg border border-[#E6DDD1] hover:bg-[#F8F4EC] cursor-pointer">
                 <input
                   type="checkbox"
+                  disabled={readOnly}
                   checked={(form as any)[key]}
                   onChange={e => setForm({ ...form, [key]: e.target.checked })}
                   className="mt-0.5 w-4 h-4 accent-[#234E36]"
@@ -261,19 +336,36 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
             ))}
           </div>
 
-          {/* Photos */}
+          {/* Photos (Compressed JPEG <= 1280px) */}
           <div>
             <div className="flex items-center justify-between mb-2">
-              <span className="font-semibold text-[#3B281A]">Ảnh nghiệm thu hiện trường</span>
-              <label className="px-3 py-1.5 rounded-lg bg-[#F8F4EC] border border-[#D6BCA5] text-xs font-semibold text-[#3B281A] flex items-center gap-1.5 cursor-pointer hover:bg-[#efe6d8]">
-                <Camera className="w-3.5 h-3.5" /> Chụp / Tải ảnh
-                <input type="file" accept="image/*" capture="environment" multiple className="hidden" onChange={handlePhotoUpload} />
-              </label>
+              <div>
+                <span className="font-semibold text-[#3B281A]">Ảnh nghiệm thu hiện trường ({photos.length}/4)</span>
+                <div className="text-[10px] text-[#6e5543]">Tự động nén nhẹ JPEG 1280px để gửi siêu nhanh qua 4G & tiết kiệm Cloud</div>
+              </div>
+              {!readOnly && (
+                <label className="px-3 py-1.5 rounded-lg bg-[#F8F4EC] border border-[#D6BCA5] text-xs font-semibold text-[#3B281A] flex items-center gap-1.5 cursor-pointer hover:bg-[#efe6d8]">
+                  <Camera className="w-3.5 h-3.5" /> {compressing ? 'Đang nén ảnh...' : 'Chụp / Tải ảnh'}
+                  <input type="file" accept="image/*" capture="environment" multiple className="hidden" onChange={handlePhotoUpload} />
+                </label>
+              )}
             </div>
             {photos.length > 0 && (
               <div className="grid grid-cols-4 gap-2">
                 {photos.map((src, i) => (
-                  <img key={i} src={src} alt="Nghiệm thu" className="w-full h-20 object-cover rounded-lg border border-[#D6BCA5]" />
+                  <div key={i} className="relative group">
+                    <img src={src} alt={`Nghiệm thu ${i + 1}`} className="w-full h-20 object-cover rounded-lg border border-[#D6BCA5]" />
+                    {!readOnly && (
+                      <button
+                        type="button"
+                        onClick={() => setPhotos(prev => prev.filter((_, idx) => idx !== i))}
+                        title="Xóa ảnh này"
+                        className="absolute top-1 right-1 p-1 rounded-full bg-black/65 text-white hover:bg-[#9A2B26] cursor-pointer"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
                 ))}
               </div>
             )}
@@ -287,8 +379,9 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
                 <button
                   key={star}
                   type="button"
+                  disabled={readOnly}
                   onClick={() => setForm({ ...form, csat_rating: star })}
-                  className="p-1 cursor-pointer transition-transform hover:scale-110"
+                  className="p-1 cursor-pointer transition-transform hover:scale-110 disabled:cursor-default"
                 >
                   <Star className={`w-7 h-7 ${star <= form.csat_rating ? 'fill-amber-500 text-amber-500' : 'text-gray-300'}`} />
                 </button>
@@ -296,10 +389,11 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
               <span className="text-xs font-semibold text-[#3B281A] ml-2">{form.csat_rating}/5 sao</span>
             </div>
             <input
+              disabled={readOnly}
               value={form.csat_comment}
               onChange={e => setForm({ ...form, csat_comment: e.target.value })}
               placeholder="Góp ý nhanh của khách hàng (tùy chọn)..."
-              className="w-full px-3 py-2 rounded-lg border border-[#D6BCA5] bg-white text-xs"
+              className="w-full px-3 py-2 rounded-lg border border-[#D6BCA5] bg-white text-xs disabled:bg-gray-50"
             />
           </div>
 
@@ -307,9 +401,11 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
           <div>
             <div className="flex items-center justify-between mb-1.5">
               <span className="font-semibold text-[#3B281A]">Chữ ký điện tử khách hàng</span>
-              <button type="button" onClick={clearSignature} className="text-xs text-[#9A2B26] flex items-center gap-1 hover:underline cursor-pointer">
-                <Eraser className="w-3.5 h-3.5" /> Ký lại
-              </button>
+              {!readOnly && (
+                <button type="button" onClick={clearSignature} className="text-xs text-[#9A2B26] flex items-center gap-1 hover:underline cursor-pointer">
+                  <Eraser className="w-3.5 h-3.5" /> Ký lại
+                </button>
+              )}
             </div>
             <canvas
               ref={canvasRef}
@@ -319,7 +415,7 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
               onPointerMove={onPointerMove}
               onPointerUp={onPointerUp}
               onPointerLeave={onPointerUp}
-              className="w-full h-36 border-2 border-dashed border-[#D6BCA5] rounded-xl bg-white touch-none cursor-crosshair"
+              className={`w-full h-36 border-2 border-dashed border-[#D6BCA5] rounded-xl bg-white touch-none ${readOnly ? 'cursor-default' : 'cursor-crosshair'}`}
             />
             <div className="text-[11px] text-[#6e5543] mt-1">Ký trực tiếp bằng tay (trên điện thoại/tablet) hoặc chuột.</div>
           </div>
@@ -328,30 +424,42 @@ export default function HandoverModal({ handover, staffList, onStaffAdded, onClo
           <div>
             <label className="block text-xs font-semibold text-[#6e5543] mb-1">Ghi chú phát sinh / tồn đọng (nếu có)</label>
             <input
+              disabled={readOnly}
               value={form.issue_note}
               onChange={e => setForm({ ...form, issue_note: e.target.value })}
               placeholder="VD: Thiếu 1 nút bọc chân ghế, hẹn bổ sung..."
-              className="w-full px-3 py-2 rounded-lg border border-[#D6BCA5] text-sm"
+              className="w-full px-3 py-2 rounded-lg border border-[#D6BCA5] text-sm disabled:bg-gray-50"
             />
           </div>
         </div>
 
         {/* Footer Actions */}
         <div className="px-5 py-3.5 bg-[#F8F4EC] border-t border-[#E6DDD1] flex items-center justify-end gap-2.5">
-          <button
-            disabled={saving}
-            onClick={() => handleSave(false)}
-            className="px-4 py-2 rounded-lg border border-[#3B281A] text-[#3B281A] font-semibold text-xs hover:bg-[#efe6d8] cursor-pointer"
-          >
-            Lưu nháp
-          </button>
-          <button
-            disabled={saving}
-            onClick={() => handleSave(true)}
-            className="px-4 py-2 rounded-lg bg-[#234E36] text-white font-semibold text-xs flex items-center gap-1.5 hover:bg-[#1c3e2b] cursor-pointer"
-          >
-            <CheckCircle2 className="w-4 h-4" /> Hoàn tất & Tự động đồng bộ ĐH
-          </button>
+          {readOnly ? (
+            <button
+              onClick={onClose}
+              className="px-4 py-2 rounded-lg bg-[#3B281A] text-white font-semibold text-xs hover:bg-[#563C28] cursor-pointer"
+            >
+              Đóng (Chế độ chỉ xem)
+            </button>
+          ) : (
+            <>
+              <button
+                disabled={saving || compressing}
+                onClick={() => handleSave(false)}
+                className="px-4 py-2 rounded-lg border border-[#3B281A] text-[#3B281A] font-semibold text-xs hover:bg-[#efe6d8] cursor-pointer"
+              >
+                Lưu nháp
+              </button>
+              <button
+                disabled={saving || compressing}
+                onClick={() => handleSave(true)}
+                className="px-4 py-2 rounded-lg bg-[#234E36] text-white font-semibold text-xs flex items-center gap-1.5 hover:bg-[#1c3e2b] cursor-pointer"
+              >
+                <CheckCircle2 className="w-4 h-4" /> Hoàn tất & Tự động đồng bộ ĐH
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>

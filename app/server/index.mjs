@@ -6,8 +6,15 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import * as XLSX from 'xlsx';
 import { initDb, dbAll, dbGet, dbRun, dbBatch, isCloudDb } from './db.mjs';
-import { hashPassword, verifyPassword, signToken, requireAuth, requireRoles } from './auth.mjs';
+import {
+  hashPassword, verifyPassword, signToken, requireAuth, requireRoles,
+  setAuthUserLoader, invalidateAuthCache
+} from './auth.mjs';
 import { isMailerConfigured, sendInviteEmail } from './mailer.mjs';
+
+setAuthUserLoader(id =>
+  dbGet('SELECT id, email, full_name, role, department, active, password_hash FROM users WHERE id = ?', [id])
+);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.resolve(__dirname, '../dist');
@@ -39,29 +46,68 @@ function calcDistanceAllowance(km) {
   return 100000 + Math.ceil(d - 20) * 5000;
 }
 
+const VN_OFFSET_MS = 7 * 60 * 60 * 1000;
+
+function getVnShiftedDate(baseMs = Date.now()) {
+  return new Date(baseMs + VN_OFFSET_MS);
+}
+
+function getVnIsoDate(offsetDays = 0) {
+  const d = getVnShiftedDate(Date.now() + offsetDays * 86400000);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function getVnYearMonth() {
+  return getVnIsoDate().slice(0, 7);
+}
+
+function getVnDateTime(offsetHours = 0) {
+  const d = getVnShiftedDate(Date.now() + offsetHours * 3600000);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mm = String(d.getUTCMinutes()).padStart(2, '0');
+  return `${y}-${m}-${day} ${hh}:${mm}`;
+}
+
+function getIsoDateDow(isoDateStr) {
+  const m = String(isoDateStr || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return -1;
+  return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))).getUTCDay();
+}
+
 function evaluateToanNhatCutoff(expectedDate, expectedTime) {
   const warnings = [];
-  const now = new Date();
-  const hourNow = now.getHours();
+  const vnNow = getVnShiftedDate();
+  const hourNow = vnNow.getUTCHours();
+  const todayIso = getVnIsoDate();
+  const parsedHour = expectedTime
+    ? parseInt(String(expectedTime).replace(/[^\d]/g, '').slice(0, 2), 10)
+    : NaN;
+
   if (expectedDate) {
-    const exp = new Date(expectedDate + 'T00:00:00');
-    const dow = exp.getDay();
+    const dow = getIsoDateDow(expectedDate);
     if (dow === 0) warnings.push('Chủ nhật: phụ phí xếp dỡ 200%–250% + 100.000đ/giờ giám sát (PLHĐ 01).');
-    if (dow === 6 && expectedTime && parseInt(expectedTime, 10) >= 13) {
+    if (dow === 6 && !Number.isNaN(parsedHour) && parsedHour >= 13) {
       warnings.push('Chiều Thứ 7: phụ phí xếp dỡ 150%–200% + 100.000đ/giờ giám sát.');
     }
-    const todayIso = now.toISOString().slice(0, 10);
     if (expectedDate === todayIso) {
       warnings.push('Đơn gấp trong ngày (< 4 giờ): Hợp đồng 019-2026 tính phí bốc xếp 200%.');
-    } else if (hourNow >= 16 && hourNow < 18) {
-      warnings.push('Gửi lệnh 16h00–18h00: Toàn Nhất giao chiều ngày N+1 (Đ5.2).');
-    } else if (hourNow >= 18) {
-      warnings.push('Gửi sau 18h00: tính sang chu kỳ ngày làm việc kế tiếp.');
+    } else if (expectedDate > todayIso) {
+      const tomorrowIso = getVnIsoDate(1);
+      if (expectedDate === tomorrowIso && hourNow >= 16 && hourNow < 18) {
+        warnings.push('Gửi lệnh 16h00–18h00 (GMT+7): Toàn Nhất giao chiều ngày N+1 (Đ5.2).');
+      } else if (expectedDate === tomorrowIso && hourNow >= 18) {
+        warnings.push('Gửi sau 18h00 (GMT+7): tính sang chu kỳ ngày làm việc kế tiếp.');
+      }
     }
   }
-  if (expectedTime) {
-    const h = parseInt(String(expectedTime).replace(/[^\d]/g, '').slice(0, 2), 10);
-    if (h >= 17) warnings.push('Ngoài giờ 17h–21h: phí 150% + 100.000đ/giờ giám sát.');
+  if (!Number.isNaN(parsedHour) && parsedHour >= 17) {
+    warnings.push('Ngoài giờ 17h–21h: phí 150% + 100.000đ/giờ giám sát.');
   }
   return warnings.join(' | ');
 }
@@ -86,7 +132,7 @@ function fastCsvLine(line) {
 }
 
 async function nextSlipNo(type) {
-  const year = new Date().getFullYear();
+  const year = getVnShiftedDate().getUTCFullYear();
   const prefix = `${type}-${year}-`;
   const rows = await dbAll(`SELECT slip_no FROM warehouse_slips WHERE slip_no LIKE ?`, [`${prefix}%`]);
   let max = 0;
@@ -98,9 +144,9 @@ async function nextSlipNo(type) {
 }
 
 async function nextHandoverNo(docType) {
-  const now = new Date();
-  const mm = String(now.getMonth() + 1).padStart(2, '0');
-  const yy = String(now.getFullYear()).slice(-2);
+  const now = getVnShiftedDate();
+  const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const yy = String(now.getUTCFullYear()).slice(-2);
   const prefix = docType === 'BM-05' ? `PGH-${mm}${yy}-` : `BB-${mm}${yy}-`;
   const rows = await dbAll(`SELECT doc_no FROM handovers WHERE doc_no LIKE ?`, [`${prefix}%`]);
   let max = 0;
@@ -112,9 +158,9 @@ async function nextHandoverNo(docType) {
 }
 
 async function nextTicketNo() {
-  const now = new Date();
-  const mm = String(now.getMonth() + 1).padStart(2, '0');
-  const yy = String(now.getFullYear()).slice(-2);
+  const now = getVnShiftedDate();
+  const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const yy = String(now.getUTCFullYear()).slice(-2);
   const prefix = `TK-${mm}${yy}-`;
   const rows = await dbAll(`SELECT ticket_no FROM warranty_tickets WHERE ticket_no LIKE ?`, [`${prefix}%`]);
   let max = 0;
@@ -123,6 +169,65 @@ async function nextTicketNo() {
     if (!Number.isNaN(n) && n > max) max = n;
   }
   return prefix + String(max + 1).padStart(3, '0');
+}
+
+async function nextBm03No() {
+  const now = getVnShiftedDate();
+  const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const yy = String(now.getUTCFullYear()).slice(-2);
+  const prefix = `BBTH-${mm}${yy}-`;
+  const rows = await dbAll(`SELECT doc_no FROM bm03_inspections WHERE doc_no LIKE ?`, [`${prefix}%`]);
+  let max = 0;
+  for (const r of rows) {
+    const n = parseInt(r.doc_no.slice(prefix.length), 10);
+    if (!Number.isNaN(n) && n > max) max = n;
+  }
+  return prefix + String(max + 1).padStart(3, '0');
+}
+
+async function nextBm04No() {
+  const now = getVnShiftedDate();
+  const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const yy = String(now.getUTCFullYear()).slice(-2);
+  const prefix = `SC-${mm}${yy}-`;
+  const rows = await dbAll(`SELECT doc_no FROM bm04_incidents WHERE doc_no LIKE ?`, [`${prefix}%`]);
+  let max = 0;
+  for (const r of rows) {
+    const n = parseInt(r.doc_no.slice(prefix.length), 10);
+    if (!Number.isNaN(n) && n > max) max = n;
+  }
+  return prefix + String(max + 1).padStart(3, '0');
+}
+
+async function logAudit(req, action, entityType, entityId, summary, beforeObj = null, afterObj = null) {
+  try {
+    const u = req?.user || {};
+    await dbRun(
+      `INSERT INTO audit_logs (created_at, user_id, user_email, user_name, user_role, action, entity_type, entity_id, summary, before_json, after_json)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        getVnDateTime(),
+        u.id || null,
+        u.email || '',
+        u.full_name || 'System',
+        u.role || '',
+        action,
+        entityType,
+        String(entityId || ''),
+        String(summary || ''),
+        beforeObj ? JSON.stringify(beforeObj).slice(0, 2000) : '',
+        afterObj ? JSON.stringify(afterObj).slice(0, 2000) : '',
+      ]
+    );
+  } catch (err) {
+    console.warn('[Audit] Failed to write audit log:', err.message);
+  }
+}
+
+async function getLockedAllowanceMonth(dateStr) {
+  const ym = String(dateStr || '').slice(0, 7);
+  if (!/^\d{4}-\d{2}$/.test(ym)) return null;
+  return dbGet('SELECT * FROM allowance_locks WHERE month_ym = ?', [ym]);
 }
 
 async function calcWarehouse9005Footprint() {
@@ -223,6 +328,23 @@ app.get('/api/auth/me', (req, res) => {
   res.json({ user: req.user, mode: isCloudDb() ? 'turso-cloud' : 'local-sqlite' });
 });
 
+app.post('/api/auth/change-password', wrap(async (req, res) => {
+  const currentPwd = String(req.body.current_password || '');
+  const newPwd = String(req.body.new_password || '').trim();
+  if (!currentPwd || newPwd.length < 6) {
+    return res.status(400).json({ error: 'Vui lòng nhập mật khẩu hiện tại và mật khẩu mới tối thiểu 6 ký tự.' });
+  }
+  const user = await dbGet('SELECT * FROM users WHERE id = ?', [req.user.id]);
+  if (!user || !verifyPassword(currentPwd, user.password_hash)) {
+    return res.status(400).json({ error: 'Mật khẩu hiện tại không chính xác.' });
+  }
+  const newHash = hashPassword(newPwd);
+  await dbRun('UPDATE users SET password_hash = ? WHERE id = ?', [newHash, req.user.id]);
+  invalidateAuthCache(req.user.id);
+  const freshToken = signToken({ ...user, password_hash: newHash });
+  res.json({ ok: true, token: freshToken });
+}));
+
 // ─── USER SHARING & RBAC (ADMIN ONLY - Google Sheets Style) ───
 app.get('/api/users', requireRoles('ADMIN'), wrap(async (req, res) => {
   const users = await dbAll('SELECT id, email, full_name, role, department, active, created_at FROM users ORDER BY id ASC');
@@ -248,6 +370,7 @@ app.post('/api/users', requireRoles('ADMIN'), wrap(async (req, res) => {
     `INSERT INTO users (email, full_name, password_hash, role, department, active) VALUES (?,?,?,?,?,1)`,
     [email, fullName, hashPassword(password), role, department]
   );
+  await logAudit(req, 'CREATE_USER', 'USER', email, `Tạo tài khoản ${email} (${role} - ${department})`);
 
   const origin = process.env.APP_URL || `${req.headers['x-forwarded-proto'] || req.protocol}://${req.get('host')}`;
   let emailResult = { sent: false, configured: isMailerConfigured() };
@@ -304,6 +427,8 @@ app.put('/api/users/:id', requireRoles('ADMIN'), wrap(async (req, res) => {
       [b.full_name, role, b.department || 'benom', b.active ? 1 : 0, id]
     );
   }
+  invalidateAuthCache(id);
+  await logAudit(req, 'UPDATE_USER', 'USER', id, `Cập nhật user #${id} (${b.full_name}): role=${role}, active=${b.active ? 1 : 0}${b.new_password ? ', reset mật khẩu' : ''}`);
   res.json({ ok: true, email_result: emailResult });
 }));
 
@@ -312,7 +437,10 @@ app.delete('/api/users/:id', requireRoles('ADMIN'), wrap(async (req, res) => {
   if (targetId === Number(req.user.id)) {
     return res.status(400).json({ error: 'Không thể tự xóa tài khoản Admin đang đăng nhập!' });
   }
+  const targetUser = await dbGet('SELECT email, full_name, role FROM users WHERE id = ?', [targetId]);
   await dbRun('DELETE FROM users WHERE id = ?', [targetId]);
+  invalidateAuthCache(targetId);
+  await logAudit(req, 'DELETE_USER', 'USER', targetUser?.email || targetId, `Xóa tài khoản ${targetUser?.email || targetId}`, targetUser, null);
   res.json({ ok: true });
 }));
 
@@ -439,23 +567,61 @@ app.get('/api/dashboard', wrap(async (req, res) => {
 app.get('/api/master/products', wrap(async (req, res) => {
   const q = (req.query.q || '').trim();
   const type = (req.query.type || '').trim();
-  let sql = `SELECT * FROM products WHERE 1=1`;
-  const params = [];
+  const includeStock = req.query.include_stock_9005 === '1';
+  const includeAllStock = req.query.include_all_stock === '1';
+
+  let latest9005 = '';
+  if (includeStock) {
+    latest9005 = (await dbGet(`SELECT MAX(target_month) as m FROM erp_snapshots WHERE store_code = '9005'`))?.m || '202611';
+  }
+
+  let sql = includeStock
+    ? `SELECT p.*, COALESCE(e.close_qty, 0) as stock_9005
+       FROM products p
+       LEFT JOIN erp_snapshots e ON e.barcode = p.barcode AND e.store_code = '9005' AND e.target_month = ?
+       WHERE 1=1`
+    : `SELECT * FROM products p WHERE 1=1`;
+  const params = includeStock ? [latest9005] : [];
   if (q) {
-    sql += ` AND (barcode LIKE ? OR name_vn LIKE ? OR supplier_name LIKE ? OR product_family LIKE ?)`;
+    sql += ` AND (p.barcode LIKE ? OR p.name_vn LIKE ? OR p.supplier_name LIKE ? OR p.product_family LIKE ?)`;
     params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
   if (type) {
-    sql += ` AND item_type = ?`;
+    sql += ` AND p.item_type = ?`;
     params.push(type);
   }
-  sql += ` ORDER BY is_top_50 DESC, net_weight_g DESC, name_vn ASC LIMIT 300`;
-  res.json(await dbAll(sql, params));
+  sql += ` ORDER BY p.is_top_50 DESC, p.net_weight_g DESC, p.name_vn ASC LIMIT 300`;
+  const prods = await dbAll(sql, params);
+  if (!includeAllStock || prods.length === 0) return res.json(prods);
+
+  const latestByStore = await dbAll(`SELECT store_code, MAX(target_month) as m FROM erp_snapshots WHERE store_code IN ('9005','3001','1001') GROUP BY store_code`);
+  const stockMap = new Map();
+  const barcodes = prods.map(p => p.barcode);
+  const ph = barcodes.map(() => '?').join(',');
+  for (const row of latestByStore) {
+    if (!row.store_code || !row.m) continue;
+    const snaps = await dbAll(
+      `SELECT barcode, close_qty FROM erp_snapshots WHERE store_code = ? AND target_month = ? AND barcode IN (${ph})`,
+      [row.store_code, row.m, ...barcodes]
+    );
+    for (const s of snaps) {
+      const cur = stockMap.get(s.barcode) || { s9005: 0, s3001: 0, s1001: 0 };
+      if (row.store_code === '9005') cur.s9005 = s.close_qty || 0;
+      else if (row.store_code === '3001') cur.s3001 = s.close_qty || 0;
+      else if (row.store_code === '1001') cur.s1001 = s.close_qty || 0;
+      stockMap.set(s.barcode, cur);
+    }
+  }
+  res.json(prods.map(p => {
+    const st = stockMap.get(p.barcode) || { s9005: 0, s3001: 0, s1001: 0 };
+    return { ...p, stock_9005: st.s9005, stock_3001: st.s3001, stock_1001: st.s1001 };
+  }));
 }));
 
 app.put('/api/master/products/:barcode', requireRoles('ADMIN'), wrap(async (req, res) => {
   const { barcode } = req.params;
   const b = req.body;
+  const before = await dbGet('SELECT name_vn, retail_price, cost_price, net_weight_g, p_handling, p_installation, min_stock_3001 FROM products WHERE barcode = ?', [barcode]);
   await dbRun(`
     UPDATE products SET name_vn=?, item_type=?, retail_price=?, cost_price=?, net_weight_g=?,
       p_handling=?, install_level=?, p_installation=?, warranty_policy=?, warranty_months=?,
@@ -467,6 +633,9 @@ app.put('/api/master/products/:barcode', requireRoles('ADMIN'), wrap(async (req,
     b.warranty_policy || 'Không bảo hành', num(b.warranty_months),
     num(b.min_stock_3001), b.is_top_50 ? 1 : 0, barcode
   ]);
+  await logAudit(req, 'UPDATE_SKU_MASTER', 'PRODUCT', barcode, `Cập nhật định mức SKU ${barcode} (${b.name_vn})`, before, {
+    p_handling: num(b.p_handling), p_installation: num(b.p_installation), net_weight_g: num(b.net_weight_g), min_stock_3001: num(b.min_stock_3001)
+  });
   res.json({ ok: true });
 }));
 
@@ -542,6 +711,18 @@ app.get('/api/guides', wrap(async (req, res) => {
 }));
 
 // ─── 3. ORDERS & DISPATCH ─────────────────────────────────────
+async function batchQueryByIds(sqlPrefix, ids) {
+  if (!ids || ids.length === 0) return [];
+  const out = [];
+  for (let i = 0; i < ids.length; i += 200) {
+    const slice = ids.slice(i, i + 200);
+    const ph = slice.map(() => '?').join(',');
+    const rows = await dbAll(`${sqlPrefix} (${ph})`, slice);
+    out.push(...rows);
+  }
+  return out;
+}
+
 app.get('/api/orders', wrap(async (req, res) => {
   const q = (req.query.q || '').trim();
   const status = (req.query.status || '').trim();
@@ -557,8 +738,13 @@ app.get('/api/orders', wrap(async (req, res) => {
   }
   sql += ` ORDER BY order_date DESC, id DESC LIMIT 200`;
   const orders = await dbAll(sql, params);
-  const allItems = await dbAll(`SELECT * FROM order_items`);
-  const allHos = await dbAll(`SELECT id, doc_no, doc_type, invoice_no, status, csat_rating FROM handovers`);
+  const orderIds = orders.map(o => o.id);
+  const invoiceNos = Array.from(new Set(orders.map(o => o.invoice_no).filter(Boolean)));
+
+  const [allItems, allHos] = await Promise.all([
+    batchQueryByIds(`SELECT * FROM order_items WHERE order_id IN`, orderIds),
+    batchQueryByIds(`SELECT id, doc_no, doc_type, invoice_no, status, csat_rating FROM handovers WHERE invoice_no IN`, invoiceNos),
+  ]);
 
   const itemMap = new Map();
   for (const it of allItems) {
@@ -602,6 +788,24 @@ app.post('/api/orders', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) =
     });
   }
 
+  const invoiceNo = String(b.invoice_no || '').trim();
+  if (!invoiceNo) {
+    return res.status(400).json({ error: 'Vui lòng nhập Mã hóa đơn POS!' });
+  }
+  // Prevent duplicate orders (e.g., accidental double-click on Save)
+  if (!b.allow_duplicate) {
+    const dupOrder = await dbGet(`SELECT id, customer_name FROM orders WHERE invoice_no = ? AND status != 'Cancelled' LIMIT 1`, [invoiceNo]);
+    if (dupOrder) {
+      return res.status(409).json({
+        error: `Đơn hàng ${invoiceNo} (${dupOrder.customer_name}) đã tồn tại! Vui lòng mở nút Sửa nếu cần cập nhật.`,
+      });
+    }
+  }
+
+  const defaultWh = b.source_warehouse || '9005';
+  const distinctWhs = Array.from(new Set(items.map(it => (it.source_warehouse || defaultWh).trim()).filter(Boolean)));
+  const summaryWh = distinctWhs.length > 0 ? distinctWhs.join(' + ') : defaultWh;
+
   const r = await dbRun(`
     INSERT INTO orders (
       invoice_no, order_date, delivery_date, customer_name, customer_phone, address, region,
@@ -610,9 +814,9 @@ app.post('/api/orders', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) =
       ktv1_name, ktv1_code, ktv2_name, ktv2_code, ktvs_json, status, install_status, notes
     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `, [
-    b.invoice_no, b.order_date || new Date().toISOString().slice(0, 10), b.delivery_date || '',
+    invoiceNo, b.order_date || getVnIsoDate(), b.delivery_date || '',
     b.customer_name || '', String(b.customer_phone || '').trim(), b.address || '', b.region || 'HCM',
-    num(b.distance_km), b.carrier || 'Ahamove', b.tracking_no || '', b.source_warehouse || '9005',
+    num(b.distance_km), b.carrier || 'Ahamove', b.tracking_no || '', summaryWh,
     b.moving_no || '', b.pic_sales || '', b.channel || '',
     num(b.shipping_fee_3pl), num(b.customer_paid_fee), b.is_promo_free_ship ? 1 : 0,
     b.require_install ? 1 : 0, b.is_stairs ? 1 : 0,
@@ -624,14 +828,27 @@ app.post('/api/orders', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) =
   for (const it of items) {
     const p = await dbGet('SELECT * FROM products WHERE barcode = ?', [it.barcode || '']);
     await dbRun(`
-      INSERT INTO order_items (order_id, barcode, product_name, unit, qty, net_weight_g, warranty_months, warranty_policy, p_handling_unit, p_installation_unit)
-      VALUES (?,?,?,?,?,?,?,?,?,?)
+      INSERT INTO order_items (order_id, barcode, product_name, unit, qty, net_weight_g, warranty_months, warranty_policy, p_handling_unit, p_installation_unit, source_warehouse, moving_no)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
     `, [
       oid, it.barcode || '', it.product_name || p?.name_vn || '', it.unit || p?.unit || 'Cái',
       num(it.qty) || 1, p?.net_weight_g || num(it.net_weight_g),
       p?.warranty_months || 0, p?.warranty_policy || 'Không bảo hành',
-      p ? p.p_handling : 15000, p ? p.p_installation : 0
+      p ? p.p_handling : 15000, p ? p.p_installation : 0,
+      (it.source_warehouse || defaultWh).trim(),
+      String(it.moving_no || b.moving_no || '').trim(),
     ]);
+  }
+
+  // Sync carrier & 3PL fee to delivery_tracking if this POS slip already exists there
+  if (invoiceNo && (b.carrier || num(b.shipping_fee_3pl) > 0)) {
+    await dbRun(`
+      UPDATE delivery_tracking
+      SET carrier_3pl = CASE WHEN carrier_3pl = '' AND ? != '' THEN ? ELSE carrier_3pl END,
+          fee_3pl = CASE WHEN fee_3pl = 0 AND ? > 0 THEN ? ELSE fee_3pl END,
+          updated_at = datetime('now', '+7 hours')
+      WHERE slip_no = ?
+    `, [b.carrier || '', b.carrier || '', num(b.shipping_fee_3pl), num(b.shipping_fee_3pl), invoiceNo]);
   }
   res.json({ id: oid, ok: true });
 }));
@@ -640,40 +857,176 @@ app.put('/api/orders/:id', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res
   const { id } = req.params;
   const b = req.body;
   const existing = await dbGet('SELECT * FROM orders WHERE id = ?', [id]);
+  if (!existing) return res.status(404).json({ error: 'Không tìm thấy đơn hàng' });
+
   const ktvNorm = normalizeKtvInput(b, existing);
+  const nextRequireInstall = b.require_install !== undefined ? (b.require_install ? 1 : 0) : existing.require_install;
+  const nextStatus = b.status ?? existing.status;
+
+  // Guardrail (TASK-13): Block edits to allowance-affecting fields on orders in a LOCKED allowance month
+  const existingPeriodDate = existing.delivery_date || existing.order_date;
+  const lockedInfo = existing.require_install ? await getLockedAllowanceMonth(existingPeriodDate) : null;
+  if (lockedInfo) {
+    const allowanceChanged =
+      (b.distance_km !== undefined && num(b.distance_km) !== num(existing.distance_km)) ||
+      (b.is_stairs !== undefined && (b.is_stairs ? 1 : 0) !== existing.is_stairs) ||
+      (b.require_install !== undefined && nextRequireInstall !== existing.require_install) ||
+      (b.delivery_date !== undefined && String(b.delivery_date) !== String(existing.delivery_date || '')) ||
+      (ktvNorm.json !== JSON.stringify(parseKtvs(existing)));
+    if (allowanceChanged) {
+      return res.status(423).json({
+        error: `Kỳ phụ cấp ${lockedInfo.month_ym} đã được KHÓA bởi ${lockedInfo.locked_by} (${lockedInfo.locked_at}). Admin cần Mở khóa kỳ trước khi sửa km/thang bộ/KTV/ngày giao.`,
+      });
+    }
+  }
+
+  // Enforce >= 25kg safety lock on updates as well (unless order is Cancelled)
+  const hasItemsUpdate = Array.isArray(b.items);
+  if (nextRequireInstall && nextStatus !== 'Cancelled') {
+    let maxWeight = 0;
+    if (hasItemsUpdate) {
+      for (const it of b.items) {
+        const prod = await dbGet('SELECT net_weight_g FROM products WHERE barcode = ?', [it.barcode || '']);
+        maxWeight = Math.max(maxWeight, prod?.net_weight_g || num(it.net_weight_g));
+      }
+    } else {
+      const wRow = await dbGet('SELECT MAX(net_weight_g) as max_w FROM order_items WHERE order_id = ?', [id]);
+      maxWeight = wRow?.max_w || 0;
+    }
+    if (maxWeight >= 25000 && ktvNorm.list.length < 2) {
+      return res.status(400).json({
+        error: 'Quy tắc an toàn Benom: Đơn có sản phẩm ≥ 25 kg bắt buộc phân công tối thiểu 2 KTV!',
+      });
+    }
+  }
+
+  const nextCarrier = b.carrier ?? existing.carrier;
+  const nextFee3pl = b.shipping_fee_3pl !== undefined ? num(b.shipping_fee_3pl) : existing.shipping_fee_3pl;
+  const defaultWh = b.source_warehouse ?? existing.source_warehouse ?? '9005';
+  const distinctWhs = hasItemsUpdate
+    ? Array.from(new Set(b.items.map(it => (it.source_warehouse || '9005').trim()).filter(Boolean)))
+    : [];
+  const nextSourceWh = distinctWhs.length > 0 ? distinctWhs.join(' + ') : defaultWh;
+
   await dbRun(`
-    UPDATE orders SET status=?, carrier=?, tracking_no=?, distance_km=?, shipping_fee_3pl=?,
+    UPDATE orders SET
+      invoice_no=?, customer_name=?, customer_phone=?, address=?, region=?, source_warehouse=?,
+      status=?, carrier=?, tracking_no=?, distance_km=?, shipping_fee_3pl=?,
       customer_paid_fee=?, is_promo_free_ship=?, is_stairs=?, require_install=?,
-      ktv1_name=?, ktv1_code=?, ktv2_name=?, ktv2_code=?, ktvs_json=?, install_status=?, delivery_date=?, notes=?
+      ktv1_name=?, ktv1_code=?, ktv2_name=?, ktv2_code=?, ktvs_json=?,
+      install_status=?, delivery_date=?, notes=?
     WHERE id=?
   `, [
-    b.status, b.carrier, b.tracking_no, num(b.distance_km), num(b.shipping_fee_3pl),
-    num(b.customer_paid_fee), b.is_promo_free_ship ? 1 : 0, b.is_stairs ? 1 : 0,
-    b.require_install ? 1 : 0, ktvNorm.ktv1_name, ktvNorm.ktv1_code, ktvNorm.ktv2_name, ktvNorm.ktv2_code, ktvNorm.json,
-    b.install_status || '', b.delivery_date || '', b.notes || '', id
+    b.invoice_no !== undefined ? String(b.invoice_no).trim() : existing.invoice_no,
+    b.customer_name ?? existing.customer_name,
+    b.customer_phone !== undefined ? String(b.customer_phone).trim() : existing.customer_phone,
+    b.address ?? existing.address,
+    b.region ?? existing.region,
+    nextSourceWh,
+    nextStatus,
+    nextCarrier,
+    b.tracking_no ?? existing.tracking_no,
+    b.distance_km !== undefined ? num(b.distance_km) : existing.distance_km,
+    nextFee3pl,
+    b.customer_paid_fee !== undefined ? num(b.customer_paid_fee) : existing.customer_paid_fee,
+    b.is_promo_free_ship !== undefined ? (b.is_promo_free_ship ? 1 : 0) : existing.is_promo_free_ship,
+    b.is_stairs !== undefined ? (b.is_stairs ? 1 : 0) : existing.is_stairs,
+    nextRequireInstall,
+    ktvNorm.ktv1_name, ktvNorm.ktv1_code, ktvNorm.ktv2_name, ktvNorm.ktv2_code, ktvNorm.json,
+    b.install_status ?? existing.install_status,
+    b.delivery_date ?? existing.delivery_date,
+    b.notes ?? existing.notes,
+    id
   ]);
+
+  if (hasItemsUpdate) {
+    await dbRun('DELETE FROM order_items WHERE order_id = ?', [id]);
+    for (const it of b.items) {
+      const p = await dbGet('SELECT * FROM products WHERE barcode = ?', [it.barcode || '']);
+      await dbRun(`
+        INSERT INTO order_items (order_id, barcode, product_name, unit, qty, net_weight_g, warranty_months, warranty_policy, p_handling_unit, p_installation_unit, source_warehouse, moving_no)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+      `, [
+        id, it.barcode || '', it.product_name || p?.name_vn || '', it.unit || p?.unit || 'Cái',
+        num(it.qty) || 1, p?.net_weight_g || num(it.net_weight_g),
+        p?.warranty_months || 0, p?.warranty_policy || 'Không bảo hành',
+        p ? p.p_handling : num(it.p_handling_unit) || 15000,
+        p ? p.p_installation : num(it.p_installation_unit) || 0,
+        (it.source_warehouse || '9005').trim(),
+        String(it.moving_no || '').trim(),
+      ]);
+    }
+  }
+
+  // 2-way sync carrier & 3PL fee to delivery_tracking if linked by invoice_no
+  if (existing.invoice_no) {
+    await dbRun(`
+      UPDATE delivery_tracking
+      SET carrier_3pl = CASE WHEN ? != '' THEN ? ELSE carrier_3pl END,
+          fee_3pl = CASE WHEN ? > 0 THEN ? ELSE fee_3pl END,
+          area = CASE WHEN ? != '' THEN ? ELSE area END,
+          updated_at = datetime('now', '+7 hours')
+      WHERE slip_no = ?
+    `, [nextCarrier || '', nextCarrier || '', nextFee3pl, nextFee3pl, b.region || '', b.region || '', existing.invoice_no]);
+  }
+  await logAudit(req, 'UPDATE_ORDER', 'ORDER', existing.invoice_no || id, `Cập nhật ĐH ${existing.invoice_no}: ${existing.status}→${nextStatus}, Kho ${nextSourceWh}, 3PL ${nextCarrier} (${nextFee3pl}đ)`, {
+    status: existing.status, carrier: existing.carrier, shipping_fee_3pl: existing.shipping_fee_3pl, distance_km: existing.distance_km, is_stairs: existing.is_stairs
+  }, {
+    status: nextStatus, carrier: nextCarrier, shipping_fee_3pl: nextFee3pl, distance_km: b.distance_km !== undefined ? num(b.distance_km) : existing.distance_km, is_stairs: b.is_stairs !== undefined ? (b.is_stairs ? 1 : 0) : existing.is_stairs
+  });
+  res.json({ ok: true });
+}));
+
+app.delete('/api/orders/:id', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const { id } = req.params;
+  const existing = await dbGet('SELECT * FROM orders WHERE id = ?', [id]);
+  if (!existing) return res.status(404).json({ error: 'Không tìm thấy đơn hàng' });
+  const periodDate = existing.delivery_date || existing.order_date;
+  const lockedInfo = existing.require_install ? await getLockedAllowanceMonth(periodDate) : null;
+  if (lockedInfo) {
+    return res.status(423).json({ error: `Kỳ phụ cấp ${lockedInfo.month_ym} đã bị KHÓA — không thể xóa đơn trong kỳ đã chốt.` });
+  }
+  await dbRun('DELETE FROM order_items WHERE order_id = ?', [id]);
+  await dbRun('DELETE FROM orders WHERE id = ?', [id]);
+  await logAudit(req, 'DELETE_ORDER', 'ORDER', existing.invoice_no || id, `Xóa đơn hàng ${existing.invoice_no} (${existing.customer_name})`, { invoice_no: existing.invoice_no, customer_name: existing.customer_name }, null);
   res.json({ ok: true });
 }));
 
 app.post('/api/orders/:id/generate-xk', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
   const o = await dbGet('SELECT * FROM orders WHERE id = ?', [req.params.id]);
   if (!o) return res.status(404).json({ error: 'Không tìm thấy đơn hàng' });
-  const items = await dbAll('SELECT * FROM order_items WHERE order_id = ?', [o.id]);
+  const allItems = await dbAll('SELECT * FROM order_items WHERE order_id = ?', [o.id]);
+  // Only export items picked from Warehouse 9005 (Toàn Nhất) — exclude items picked at Store 3001 or Pop-up 1001!
+  const items9005 = allItems.filter(it => {
+    const wh = (it.source_warehouse || o.source_warehouse || '9005').trim();
+    return wh === '9005' || wh.includes('9005');
+  });
+  if (items9005.length === 0) {
+    return res.status(400).json({ error: `Đơn ${o.invoice_no} không có sản phẩm nào lấy tại Kho 9005 Toàn Nhất (tất cả lấy ở 3001/1001)!` });
+  }
   const slipNo = await nextSlipNo('XK');
-  const today = new Date().toISOString().slice(0, 10);
+  const today = getVnIsoDate();
   const expDate = req.body.expected_date || o.delivery_date || today;
   const expTime = req.body.expected_time || '09:00';
   const warning = evaluateToanNhatCutoff(expDate, expTime);
+  const movingNos = Array.from(new Set(items9005.map(it => it.moving_no).filter(Boolean))).join(', ');
 
   const r = await dbRun(`
     INSERT INTO warehouse_slips (slip_no, slip_type, slip_date, expected_date, expected_time, created_by, partner_name, carrier, warehouse_code, purpose, ref_invoice, status, cutoff_warning, notes)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-  `, [slipNo, 'XK', today, expDate, expTime, req.user.full_name, 'Toàn Nhất Logistics', o.carrier || 'Ahamove', '9005', 'Giao khách', o.invoice_no, 'Draft', warning, `Xuất giao ĐH ${o.invoice_no} - ${o.customer_name}`]);
+  `, [
+    slipNo, 'XK', today, expDate, expTime, req.user.full_name, 'Toàn Nhất Logistics', o.carrier || 'Ahamove', '9005',
+    'Giao khách', o.invoice_no, 'Draft', warning,
+    `Xuất kho 9005 giao ĐH ${o.invoice_no} - ${o.customer_name}${movingNos ? ` (Moving: ${movingNos})` : ''}${items9005.length < allItems.length ? ` [Chỉ gồm ${items9005.length}/${allItems.length} SP lấy từ 9005]` : ''}`
+  ]);
   const sid = r.lastInsertRowid;
-  for (const it of items) {
-    await dbRun(`INSERT INTO warehouse_slip_items (slip_id, barcode, product_name, unit, qty) VALUES (?,?,?,?,?)`, [sid, it.barcode, it.product_name, it.unit, it.qty]);
+  for (const it of items9005) {
+    await dbRun(
+      `INSERT INTO warehouse_slip_items (slip_id, barcode, product_name, unit, qty, note) VALUES (?,?,?,?,?,?)`,
+      [sid, it.barcode, it.product_name, it.unit, it.qty, it.moving_no ? `Moving ${it.moving_no}` : '']
+    );
   }
-  res.json({ id: sid, slip_no: slipNo, cutoff_warning: warning });
+  res.json({ id: sid, slip_no: slipNo, items_count: items9005.length, total_order_items: allItems.length, cutoff_warning: warning });
 }));
 
 app.post('/api/orders/:id/generate-handover', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
@@ -690,7 +1043,7 @@ app.post('/api/orders/:id/generate-handover', requireRoles('ADMIN', 'EDITOR', 'K
     INSERT INTO handovers (doc_no, doc_type, order_id, invoice_no, handover_date, warehouse_code, customer_name, customer_phone, address, carrier, install_mode, ktv1_name, ktv1_code, ktv2_name, ktv2_code, ktvs_json, status)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `, [
-    docNo, docType, o.id, o.invoice_no, o.delivery_date || new Date().toISOString().slice(0, 10),
+    docNo, docType, o.id, o.invoice_no, o.delivery_date || getVnIsoDate(),
     o.source_warehouse || '9005', o.customer_name, o.customer_phone, o.address, o.carrier,
     req.body.install_mode || (docType === 'BM-01' ? 'Kỹ thuật Benom lắp đặt' : 'Khách hàng tự lắp đặt'),
     o.ktv1_name, o.ktv1_code, o.ktv2_name, o.ktv2_code, ktvsJson, 'Pending'
@@ -698,10 +1051,22 @@ app.post('/api/orders/:id/generate-handover', requireRoles('ADMIN', 'EDITOR', 'K
   res.json({ id: r.lastInsertRowid, doc_no: docNo, doc_type: docType });
 }));
 
-// ─── 4. HANDOVERS (BM-01 / BM-05 Mobile + CSAT) ───────────────
+// ─── 4. HANDOVERS (BM-01 / BM-05 Mobile + CSAT, LAZY MEDIA) ────
 app.get('/api/handovers', wrap(async (req, res) => {
-  const list = await dbAll(`SELECT * FROM handovers ORDER BY id DESC LIMIT 100`);
-  const allItems = await dbAll(`SELECT * FROM order_items`);
+  // Lightweight list query: omit heavy Base64 signature_data & photos_json blobs for fast 4G/Turso loads
+  const list = await dbAll(`
+    SELECT id, doc_no, doc_type, order_id, invoice_no, handover_date, warehouse_code,
+           customer_name, customer_phone, address, carrier, driver_name, driver_phone, vehicle_plate,
+           install_mode, ktv1_name, ktv1_code, ktv2_name, ktv2_code, ktvs_json,
+           check_1, check_2, check_3, check_4, issue_note, due_date,
+           csat_rating, csat_comment, status, created_at,
+           CASE WHEN signature_data IS NOT NULL AND signature_data != '' THEN 1 ELSE 0 END as has_signature,
+           CASE WHEN photos_json IS NOT NULL AND photos_json != '' AND photos_json != '[]' THEN 1 ELSE 0 END as has_photos
+    FROM handovers
+    ORDER BY id DESC LIMIT 100
+  `);
+  const orderIds = Array.from(new Set(list.map(h => h.order_id).filter(Boolean)));
+  const allItems = await batchQueryByIds(`SELECT * FROM order_items WHERE order_id IN`, orderIds);
   const itemMap = new Map();
   for (const it of allItems) {
     const arr = itemMap.get(it.order_id) || [];
@@ -709,6 +1074,13 @@ app.get('/api/handovers', wrap(async (req, res) => {
     itemMap.set(it.order_id, arr);
   }
   res.json(list.map(h => ({ ...h, ktvs: parseKtvs(h), items: h.order_id ? (itemMap.get(h.order_id) || []) : [] })));
+}));
+
+app.get('/api/handovers/:id', wrap(async (req, res) => {
+  const h = await dbGet('SELECT * FROM handovers WHERE id = ?', [req.params.id]);
+  if (!h) return res.status(404).json({ error: 'Không tìm thấy biên bản' });
+  const items = h.order_id ? await dbAll('SELECT * FROM order_items WHERE order_id = ? ORDER BY id ASC', [h.order_id]) : [];
+  res.json({ ...h, ktvs: parseKtvs(h), items });
 }));
 
 app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
@@ -771,7 +1143,7 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
       if (h.doc_type === 'BM-01') {
         await dbRun(
           `UPDATE orders SET status='Done', install_status='Đã lắp & Nghiệm thu', delivery_date=COALESCE(NULLIF(?,''), NULLIF(delivery_date,''), ?) WHERE id=?`,
-          [newDate, new Date().toISOString().slice(0, 10), targetOrderId]
+          [newDate, getVnIsoDate(), targetOrderId]
         );
       } else if (h.doc_type === 'BM-05') {
         if (newInstallMode === 'Hẹn kỹ thuật Benom lắp sau') {
@@ -786,7 +1158,7 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
         } else {
           await dbRun(
             `UPDATE orders SET status='Done', delivery_date=COALESCE(NULLIF(?,''), NULLIF(delivery_date,''), ?) WHERE id=?`,
-            [newDate, new Date().toISOString().slice(0, 10), targetOrderId]
+            [newDate, getVnIsoDate(), targetOrderId]
           );
         }
       }
@@ -795,28 +1167,110 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
   res.json({ ok: true });
 }));
 
-// ─── 5. TECHNICIAN ALLOWANCE ENGINE (0% #REF!, SUPPORTS N KTVs) ──
-async function computeAllowance(monthYm) {
+// ─── 5. TECHNICIAN ALLOWANCE ENGINE (SOP COMPLIANT, N KTVs) ────
+async function computeAllowance(monthInput, scopeInput = 'completed') {
+  const scope = ['completed', 'bm01_only', 'all'].includes(scopeInput) ? scopeInput : 'completed';
+
+  const monthsRows = await dbAll(`
+    SELECT DISTINCT substr(COALESCE(NULLIF(delivery_date,''), order_date), 1, 7) as ym
+    FROM orders
+    WHERE require_install = 1
+      AND (ktv1_name != '' OR ktv2_name != '' OR (ktvs_json IS NOT NULL AND ktvs_json != '' AND ktvs_json != '[]'))
+      AND length(COALESCE(NULLIF(delivery_date,''), order_date)) >= 7
+    ORDER BY ym DESC
+  `);
+  const available_months = monthsRows.map(r => r.ym).filter(Boolean);
+  const currentVnMonth = getVnYearMonth();
+  if (!available_months.includes(currentVnMonth)) {
+    available_months.unshift(currentVnMonth);
+  }
+
+  let effectiveMonth = monthInput;
+  if (monthInput === 'LATEST') {
+    effectiveMonth = available_months[0] || currentVnMonth;
+  } else if (monthInput === 'ALL') {
+    effectiveMonth = '';
+  }
+
   const orders = await dbAll(`
     SELECT * FROM orders
     WHERE require_install = 1
       AND (ktv1_name != '' OR ktv2_name != '' OR (ktvs_json IS NOT NULL AND ktvs_json != '' AND ktvs_json != '[]'))
       AND (? = '' OR COALESCE(NULLIF(delivery_date,''), order_date) LIKE ?)
     ORDER BY COALESCE(NULLIF(delivery_date,''), order_date) ASC, id ASC
-  `, [monthYm, `${monthYm}%`]);
+  `, [effectiveMonth, `${effectiveMonth}%`]);
 
-  const allItems = await dbAll(`SELECT * FROM order_items ORDER BY id ASC`);
+  // Fetch BM-01 handovers to verify SOP compliance (BEN-PRO-TechnicianAllowance Bước 4 & 6)
+  const bm01Rows = await dbAll(`SELECT id, order_id, invoice_no, doc_no, status FROM handovers WHERE doc_type = 'BM-01' AND status != 'Cancelled'`);
+  const bm01ByOrderId = new Map();
+  const bm01ByInvoice = new Map();
+  for (const h of bm01Rows) {
+    if (h.order_id && (!bm01ByOrderId.has(h.order_id) || h.status === 'Completed')) {
+      bm01ByOrderId.set(h.order_id, h);
+    }
+    if (h.invoice_no && (!bm01ByInvoice.has(h.invoice_no) || h.status === 'Completed')) {
+      bm01ByInvoice.set(h.invoice_no, h);
+    }
+  }
+
+  let excludedPendingCount = 0;
+  let unverifiedBm01Count = 0;
+  const eligibleOrders = [];
+
+  for (const o of orders) {
+    if (o.status === 'Cancelled') continue;
+    const bm01 = bm01ByOrderId.get(o.id) || bm01ByInvoice.get(o.invoice_no) || null;
+    const hasCompletedBm01 = bm01?.status === 'Completed';
+    const isHistoricalInstallDone = /đã lắp|nghiệm thu/i.test(o.install_status || '');
+    const isPendingOrder = ['New', 'In Transit'].includes(o.status) || /chờ lắp/i.test(o.install_status || '');
+    const isVerified = hasCompletedBm01 || isHistoricalInstallDone;
+    const isCompletedEligible = hasCompletedBm01 || isHistoricalInstallDone || !isPendingOrder;
+
+    if (!isCompletedEligible) excludedPendingCount++;
+
+    const include =
+      scope === 'all' ? true :
+      scope === 'bm01_only' ? isVerified :
+      isCompletedEligible;
+
+    if (!include) continue;
+    if (!isVerified) unverifiedBm01Count++;
+
+    eligibleOrders.push({
+      order: o,
+      bm01_doc_no: bm01?.doc_no || '',
+      bm01_status: hasCompletedBm01
+        ? 'Đã ký BM-01'
+        : isHistoricalInstallDone
+          ? 'Đã nghiệm thu (Lịch sử)'
+          : bm01
+            ? `BM-01 ${bm01.status}`
+            : 'Chưa có BM-01',
+      is_verified_bm01: isVerified,
+    });
+  }
+
+  // Targeted order_items lookup instead of full-table scan
   const itemMap = new Map();
-  for (const it of allItems) {
-    const arr = itemMap.get(it.order_id) || [];
-    arr.push(it);
-    itemMap.set(it.order_id, arr);
+  if (eligibleOrders.length > 0) {
+    const ids = eligibleOrders.map(e => e.order.id);
+    for (let i = 0; i < ids.length; i += 200) {
+      const slice = ids.slice(i, i + 200);
+      const ph = slice.map(() => '?').join(',');
+      const batchItems = await dbAll(`SELECT * FROM order_items WHERE order_id IN (${ph}) ORDER BY id ASC`, slice);
+      for (const it of batchItems) {
+        const arr = itemMap.get(it.order_id) || [];
+        arr.push(it);
+        itemMap.set(it.order_id, arr);
+      }
+    }
   }
 
   const lines = [];
   const ktvTotals = new Map();
 
-  for (const o of orders) {
+  for (const entry of eligibleOrders) {
+    const o = entry.order;
     const ktvs = parseKtvs(o);
     if (ktvs.length === 0) continue;
     const items = itemMap.get(o.id) || [];
@@ -833,6 +1287,8 @@ async function computeAllowance(monthYm) {
 
       lines.push({
         order_id: o.id, date: dateStr, invoice_no: o.invoice_no, customer_name: o.customer_name,
+        order_status: o.status, bm01_doc_no: entry.bm01_doc_no, bm01_status: entry.bm01_status,
+        is_verified_bm01: entry.is_verified_bm01,
         barcode: it.barcode, product_name: it.product_name, qty: it.qty, distance_km: o.distance_km,
         is_stairs: o.is_stairs, k_floor: kFloor,
         ktv_count: ktvs.length,
@@ -861,8 +1317,17 @@ async function computeAllowance(monthYm) {
     .map(x => ({ ktv_code: x.code, ktv_name: x.name, order_count: x.orders.size, total_allowance: Math.round(x.total) }))
     .sort((a, b) => b.total_allowance - a.total_allowance);
 
+  const allLocks = await dbAll('SELECT month_ym, locked_by, locked_at, grand_total, order_count, notes FROM allowance_locks ORDER BY month_ym DESC');
+  const lockInfo = effectiveMonth ? (allLocks.find(l => l.month_ym === effectiveMonth) || null) : null;
+
   return {
-    month: monthYm || 'ALL',
+    month: effectiveMonth || 'ALL',
+    scope,
+    available_months,
+    lock_info: lockInfo,
+    locked_months: allLocks.map(l => l.month_ym),
+    excluded_pending_count: excludedPendingCount,
+    unverified_bm01_count: unverifiedBm01Count,
     grand_total: summary.reduce((s, x) => s + x.total_allowance, 0),
     summary,
     lines,
@@ -870,13 +1335,51 @@ async function computeAllowance(monthYm) {
 }
 
 app.get('/api/allowance', wrap(async (req, res) => {
-  const month = (req.query.month ?? '2026-10').toString().trim();
-  res.json(await computeAllowance(month));
+  const month = (req.query.month ?? 'LATEST').toString().trim();
+  const scope = (req.query.scope ?? 'completed').toString().trim();
+  res.json(await computeAllowance(month, scope));
+}));
+
+app.post('/api/allowance/lock', requireRoles('ADMIN'), wrap(async (req, res) => {
+  const monthYm = String(req.body.month || '').trim();
+  const scope = String(req.body.scope || 'completed').trim();
+  const notes = String(req.body.notes || '').trim();
+  if (!/^\d{4}-\d{2}$/.test(monthYm)) {
+    return res.status(400).json({ error: 'Vui lòng chọn 1 tháng cụ thể (YYYY-MM) để chốt & khóa kỳ.' });
+  }
+  const existing = await dbGet('SELECT * FROM allowance_locks WHERE month_ym = ?', [monthYm]);
+  if (existing) {
+    return res.status(409).json({ error: `Kỳ ${monthYm} đã được khóa trước đó bởi ${existing.locked_by}.` });
+  }
+  const report = await computeAllowance(monthYm, scope);
+  const uniqueOrders = new Set(report.lines.map(l => l.invoice_no)).size;
+  const lockedAt = getVnDateTime();
+  await dbRun(
+    `INSERT INTO allowance_locks (month_ym, locked_by, locked_at, grand_total, order_count, snapshot_json, notes) VALUES (?,?,?,?,?,?,?)`,
+    [monthYm, req.user.full_name, lockedAt, report.grand_total, uniqueOrders, JSON.stringify({ scope, summary: report.summary }), notes]
+  );
+  await logAudit(req, 'LOCK_ALLOWANCE_PERIOD', 'ALLOWANCE', monthYm, `Chốt & khóa kỳ phụ cấp ${monthYm}: ${report.grand_total.toLocaleString('vi-VN')}đ (${uniqueOrders} đơn)`, null, {
+    month_ym: monthYm, grand_total: report.grand_total, order_count: uniqueOrders, notes
+  });
+  res.json({ ok: true, month_ym: monthYm, locked_by: req.user.full_name, locked_at: lockedAt, grand_total: report.grand_total });
+}));
+
+app.delete('/api/allowance/lock/:monthYm', requireRoles('ADMIN'), wrap(async (req, res) => {
+  const monthYm = String(req.params.monthYm || '').trim();
+  const reason = String(req.body?.reason || req.query?.reason || 'Admin mở khóa điều chỉnh').trim();
+  const existing = await dbGet('SELECT * FROM allowance_locks WHERE month_ym = ?', [monthYm]);
+  if (!existing) return res.status(404).json({ error: `Kỳ ${monthYm} chưa bị khóa.` });
+  await dbRun('DELETE FROM allowance_locks WHERE month_ym = ?', [monthYm]);
+  await logAudit(req, 'UNLOCK_ALLOWANCE_PERIOD', 'ALLOWANCE', monthYm, `Mở khóa kỳ phụ cấp ${monthYm} — Lý do: ${reason}`, {
+    locked_by: existing.locked_by, locked_at: existing.locked_at, grand_total: existing.grand_total
+  }, { unlocked: true, reason });
+  res.json({ ok: true });
 }));
 
 app.get('/api/allowance/export', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
-  const month = (req.query.month ?? '2026-10').toString().trim();
-  const data = await computeAllowance(month);
+  const month = (req.query.month ?? 'LATEST').toString().trim();
+  const scope = (req.query.scope ?? 'completed').toString().trim();
+  const data = await computeAllowance(month, scope);
   const wb = XLSX.utils.book_new();
   const wsSum = XLSX.utils.json_to_sheet(data.summary.map(s => ({
     'Mã NV (ID)': s.ktv_code || '',
@@ -886,6 +1389,7 @@ app.get('/api/allowance/export', requireRoles('ADMIN', 'EDITOR'), wrap(async (re
   })));
   const wsDet = XLSX.utils.json_to_sheet(data.lines.map(l => ({
     'Ngày': l.date, 'Mã hóa đơn': l.invoice_no, 'Khách hàng': l.customer_name,
+    'Trạng thái ĐH': l.order_status, 'Mã BM-01': l.bm01_doc_no || '', 'Đối soát BM-01': l.bm01_status,
     'Barcode': l.barcode, 'Sản phẩm': l.product_name, 'SL': l.qty, 'Km': l.distance_km,
     'K_Floor': l.k_floor, 'P_Handling': l.p_handling, 'P_Installation': l.p_installation,
     'P_Distance': l.p_distance, 'Tổng Dòng': l.total,
@@ -896,7 +1400,7 @@ app.get('/api/allowance/export', requireRoles('ADMIN', 'EDITOR'), wrap(async (re
   XLSX.utils.book_append_sheet(wb, wsSum, 'Tong_Hop_KTV');
   XLSX.utils.book_append_sheet(wb, wsDet, 'Chi_Tiet_Phu_Cap');
   const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-  res.setHeader('Content-Disposition', `attachment; filename="Benom_Phu_Cap_KTV_${month || 'ALL'}.xlsx"`);
+  res.setHeader('Content-Disposition', `attachment; filename="Benom_Phu_Cap_KTV_${data.month || 'ALL'}.xlsx"`);
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.send(buf);
 }));
@@ -909,7 +1413,8 @@ app.get('/api/slips', wrap(async (req, res) => {
   if (type) { sql += ` AND slip_type = ?`; params.push(type); }
   sql += ` ORDER BY slip_date DESC, id DESC LIMIT 150`;
   const slips = await dbAll(sql, params);
-  const allItems = await dbAll(`SELECT * FROM warehouse_slip_items`);
+  const slipIds = slips.map(s => s.id);
+  const allItems = await batchQueryByIds(`SELECT * FROM warehouse_slip_items WHERE slip_id IN`, slipIds);
   const itemMap = new Map();
   for (const it of allItems) {
     const arr = itemMap.get(it.slip_id) || [];
@@ -928,7 +1433,7 @@ app.post('/api/slips', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) =>
     INSERT INTO warehouse_slips (slip_no, slip_type, slip_date, expected_date, expected_time, created_by, partner_code, partner_name, carrier, warehouse_code, purpose, ref_invoice, ref_po, status, cutoff_warning, notes)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `, [
-    slipNo, slipType, b.slip_date || new Date().toISOString().slice(0, 10),
+    slipNo, slipType, b.slip_date || getVnIsoDate(),
     b.expected_date || '', b.expected_time || '', req.user.full_name || b.created_by || 'Trần Anh Tuyến',
     b.partner_code || '', b.partner_name || 'Toàn Nhất Logistics', b.carrier || '',
     b.warehouse_code || '9005', b.purpose || (slipType === 'NK' ? 'Nhập PO NCC' : 'Giao khách'),
@@ -947,17 +1452,30 @@ app.post('/api/slips', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) =>
 
 app.put('/api/slips/:id/status', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
   const { id } = req.params;
-  const { status, cancel_reason } = req.body;
+  const { status, cancel_reason, notes, items } = req.body;
   const slip = await dbGet('SELECT * FROM warehouse_slips WHERE id = ?', [id]);
   if (!slip) return res.status(404).json({ error: 'Không tìm thấy phiếu' });
   let warning = slip.cutoff_warning || '';
-  if (status === 'Cancelled') {
+  if (status === 'Cancelled' && !warning.includes('Đ5.3')) {
     warning = (warning ? warning + ' | ' : '') + 'Lưu ý Đ5.3: Hủy lệnh trễ < 2h trước giờ hẹn bị tính 50% phí xếp dỡ.';
   }
+  const nextNotes = notes !== undefined
+    ? String(notes)
+    : (cancel_reason ? `${slip.notes || ''} [Hủy: ${cancel_reason}]`.trim() : slip.notes);
   await dbRun(
-    `UPDATE warehouse_slips SET status=?, cutoff_warning=?, notes=CASE WHEN ? != '' THEN notes || ' [Hủy: ' || ? || ']' ELSE notes END WHERE id=?`,
-    [status, warning, cancel_reason || '', cancel_reason || '', id]
+    `UPDATE warehouse_slips SET status=?, cutoff_warning=?, notes=? WHERE id=?`,
+    [status || slip.status, warning, nextNotes, id]
   );
+  if (Array.isArray(items) && items.length > 0) {
+    const batch = items
+      .filter(it => it.id)
+      .map(it => ({
+        sql: `UPDATE warehouse_slip_items SET actual_qty=?, note=COALESCE(?, note) WHERE id=? AND slip_id=?`,
+        args: [it.actual_qty !== '' && it.actual_qty !== null && it.actual_qty !== undefined ? num(it.actual_qty) : null, it.note ?? null, it.id, id],
+      }));
+    if (batch.length > 0) await dbBatch(batch);
+  }
+  await logAudit(req, status === 'Cancelled' ? 'CANCEL_SLIP' : 'UPDATE_SLIP', 'WAREHOUSE_SLIP', slip.slip_no, `${slip.slip_no}: ${slip.status} → ${status || slip.status}${cancel_reason ? ` (${cancel_reason})` : ''}`, { status: slip.status }, { status: status || slip.status });
   res.json({ ok: true, cutoff_warning: warning });
 }));
 
@@ -1079,6 +1597,33 @@ app.post('/api/toannhat/reconcile', requireRoles('ADMIN', 'EDITOR'), upload.sing
   res.json({ sheet_used: tonSheetName, erp_month: latest9005, total_skus: comparison.length, matched, mismatched, comparison });
 }));
 
+app.post('/api/toannhat/reconcile/export', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const { erp_month = '', sheet_used = '', comparison = [] } = req.body || {};
+  if (!Array.isArray(comparison) || comparison.length === 0) {
+    return res.status(400).json({ error: 'Không có dữ liệu đối soát để xuất Excel.' });
+  }
+  const toRow = r => ({
+    'Barcode (Chuẩn hóa)': r.barcode,
+    'Tên sản phẩm': r.product_name,
+    'Tồn ERP 9005': r.erp_9005_qty,
+    'Toàn Nhất Hàng Tốt': r.toannhat_good_qty,
+    'Toàn Nhất Hàng Hư (R)': r.toannhat_damaged_qty,
+    'Tổng Tồn Toàn Nhất': r.toannhat_total_qty,
+    'Chênh Lệch (TN - ERP)': r.diff,
+    'Kết Luận': r.status,
+  });
+  const diffRows = comparison.filter(r => r.diff !== 0 || r.toannhat_damaged_qty > 0).map(toRow);
+  const allRows = comparison.map(toRow);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(diffRows.length ? diffRows : [{ 'Thông báo': '100% mã hàng khớp tồn & không có hàng hư hỏng' }]), 'Ma_Lech_Va_Hu_Hong');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(allRows), 'Toan_Bo_Doi_Soat');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  const tag = erp_month || getVnIsoDate();
+  res.setHeader('Content-Disposition', `attachment; filename="Bien_Ban_Doi_Soat_Toan_Nhat_9005_${tag}.xlsx"`);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.send(buf);
+}));
+
 // ─── 8. WARRANTY (BM-02/03/04), QC RETURNS & SUPPORT LOGS ─────
 app.get('/api/warranty/lookup', wrap(async (req, res) => {
   const q = (req.query.q || '').trim();
@@ -1093,15 +1638,15 @@ app.get('/api/warranty/lookup', wrap(async (req, res) => {
     ORDER BY o.order_date DESC LIMIT 30
   `, [`%${q}%`, `%${q}%`, `%${q}%`]);
 
-  const now = new Date();
+  const vnToday = new Date(getVnIsoDate() + 'T00:00:00Z');
   res.json(rows.map(r => {
     let daysLeft = 0;
     let status = 'Không bảo hành';
     if (r.warranty_months > 0 && r.handover_date) {
-      const start = new Date(r.handover_date + 'T00:00:00');
+      const start = new Date(r.handover_date + 'T00:00:00Z');
       const exp = new Date(start);
-      exp.setMonth(exp.getMonth() + r.warranty_months);
-      daysLeft = Math.ceil((exp - now) / (1000 * 60 * 60 * 24));
+      exp.setUTCMonth(exp.getUTCMonth() + r.warranty_months);
+      daysLeft = Math.ceil((exp - vnToday) / (1000 * 60 * 60 * 24));
       status = daysLeft >= 0 ? 'Còn bảo hành' : 'Hết hạn bảo hành';
     }
     return { ...r, days_left: daysLeft, warranty_status: status };
@@ -1115,8 +1660,6 @@ app.get('/api/warranty', wrap(async (req, res) => {
 app.post('/api/warranty', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
   const b = req.body;
   const ticketNo = await nextTicketNo();
-  const now = new Date();
-  const addHrs = h => new Date(now.getTime() + h * 3600000).toISOString().slice(0, 16).replace('T', ' ');
   const lvl = b.service_level || 'C1';
   const resolveHrs = lvl === 'C3' ? 240 : 48;
 
@@ -1133,16 +1676,26 @@ app.post('/api/warranty', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res)
     b.issue_desc || '', lvl, b.is_in_warranty ? 1 : 0,
     b.is_in_warranty ? 0 : (num(b.fee_service) || 100000), num(b.fee_parts), num(b.fee_ship),
     b.ktv_assigned || 'Trần Anh Tuyến', 'New',
-    addHrs(2), addHrs(24), addHrs(resolveHrs)
+    getVnDateTime(2), getVnDateTime(24), getVnDateTime(resolveHrs)
   ]);
   res.json({ id: r.lastInsertRowid, ticket_no: ticketNo });
 }));
 
 app.put('/api/warranty/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
   const b = req.body;
-  await dbRun(`UPDATE warranty_tickets SET status=?, service_level=?, ktv_assigned=?, resolution_note=?, bm03_no=?, bm04_no=? WHERE id=?`,
-    [b.status, b.service_level, b.ktv_assigned || '', b.resolution_note || '', b.bm03_no || '', b.bm04_no || '', req.params.id]);
-  res.json({ ok: true });
+  const existing = await dbGet('SELECT * FROM warranty_tickets WHERE id = ?', [req.params.id]);
+  if (!existing) return res.status(404).json({ error: 'Không tìm thấy Ticket bảo hành' });
+
+  const nowVn = getVnDateTime();
+  const nextStatus = b.status || existing.status;
+  const respondedAt = existing.responded_at || (nextStatus !== 'New' ? nowVn : '');
+  const resolvedAt = existing.resolved_at || (['Resolved', 'Closed'].includes(nextStatus) ? nowVn : '');
+
+  await dbRun(
+    `UPDATE warranty_tickets SET status=?, service_level=?, ktv_assigned=?, resolution_note=?, bm03_no=?, bm04_no=?, responded_at=?, resolved_at=? WHERE id=?`,
+    [nextStatus, b.service_level || existing.service_level, b.ktv_assigned ?? existing.ktv_assigned, b.resolution_note ?? existing.resolution_note, b.bm03_no ?? existing.bm03_no, b.bm04_no ?? existing.bm04_no, respondedAt, resolvedAt, req.params.id]
+  );
+  res.json({ ok: true, responded_at: respondedAt, resolved_at: resolvedAt });
 }));
 
 app.get('/api/qc-returns', wrap(async (req, res) => {
@@ -1151,22 +1704,261 @@ app.get('/api/qc-returns', wrap(async (req, res) => {
 
 app.post('/api/qc-returns', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
   const b = req.body;
+  if (!b.supplier_name || !b.product_name) {
+    return res.status(400).json({ error: 'Vui lòng nhập Nhà cung cấp và Tên sản phẩm.' });
+  }
+  const defQty = num(b.defective_qty);
+  const soldQty = num(b.sold_qty);
+  const stockQty = num(b.stock_qty);
+  const denom = soldQty + stockQty + defQty;
+  const calcRate = num(b.defect_rate) || (denom > 0 ? Number(((defQty / denom) * 100).toFixed(1)) : 0);
   const r = await dbRun(`
-    INSERT INTO qc_factory_returns (supplier_name, barcode, product_name, issue, defective_qty, sold_qty, stock_qty, defect_rate, action, est_out, est_in, ref_xk_no, status)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+    INSERT INTO qc_factory_returns (supplier_name, barcode, product_name, defect_category, issue, defective_qty, sold_qty, stock_qty, defect_rate, action, est_out, est_in, ref_xk_no, status)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `, [
-    b.supplier_name, b.barcode || '', b.product_name, b.issue || '', num(b.defective_qty),
-    num(b.sold_qty), num(b.stock_qty), num(b.defect_rate), b.action || 'Back to factory',
+    b.supplier_name, b.barcode || '', b.product_name, b.defect_category || 'Khác', b.issue || '', defQty,
+    soldQty, stockQty, calcRate, b.action || 'Back to factory',
     b.est_out || 'TBU', b.est_in || 'TBU', b.ref_xk_no || '', b.status || 'Open'
   ]);
-  res.json({ id: r.lastInsertRowid, ok: true });
+  await logAudit(req, 'CREATE_QC_RETURN', 'QC_RETURN', r.lastInsertRowid, `Ghi nhận QC lỗi: ${b.supplier_name} — ${b.product_name} (SL: ${defQty}, nhóm: ${b.defect_category || 'Khác'})`);
+  res.json({ id: r.lastInsertRowid, defect_rate: calcRate, ok: true });
 }));
 
 app.put('/api/qc-returns/:id', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
   const b = req.body;
-  await dbRun(`UPDATE qc_factory_returns SET status=?, est_out=?, est_in=?, ref_xk_no=?, ref_nk_no=? WHERE id=?`,
-    [b.status, b.est_out || '', b.est_in || '', b.ref_xk_no || '', b.ref_nk_no || '', req.params.id]);
+  const existing = await dbGet('SELECT * FROM qc_factory_returns WHERE id = ?', [req.params.id]);
+  if (!existing) return res.status(404).json({ error: 'Không tìm thấy dòng QC' });
+  await dbRun(
+    `UPDATE qc_factory_returns SET status=?, defect_category=?, issue=?, est_out=?, est_in=?, ref_xk_no=?, ref_nk_no=? WHERE id=?`,
+    [
+      b.status ?? existing.status,
+      b.defect_category ?? existing.defect_category ?? 'Khác',
+      b.issue ?? existing.issue,
+      b.est_out ?? existing.est_out,
+      b.est_in ?? existing.est_in,
+      b.ref_xk_no ?? existing.ref_xk_no,
+      b.ref_nk_no ?? existing.ref_nk_no,
+      req.params.id
+    ]
+  );
+  await logAudit(req, 'UPDATE_QC_RETURN', 'QC_RETURN', req.params.id, `Cập nhật QC ${existing.product_name}: ${existing.status} → ${b.status ?? existing.status}`);
   res.json({ ok: true });
+}));
+
+app.post('/api/qc-returns/:id/generate-slip', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const q = await dbGet('SELECT * FROM qc_factory_returns WHERE id = ?', [req.params.id]);
+  if (!q) return res.status(404).json({ error: 'Không tìm thấy bản ghi QC trả xưởng' });
+  const slipType = req.body?.slip_type === 'NK' ? 'NK' : 'XK';
+  const slipNo = await nextSlipNo(slipType);
+  const today = getVnIsoDate();
+  const expDate = req.body?.expected_date || getVnIsoDate(1);
+  const expTime = req.body?.expected_time || '09:00';
+  const warning = evaluateToanNhatCutoff(expDate, expTime);
+  const purpose = slipType === 'XK' ? `Trả NCC / QC (${q.supplier_name})` : `Nhập lại hàng QC từ xưởng (${q.supplier_name})`;
+  const notes = `[QC #${q.id}] ${q.defect_category || ''} — ${q.issue || ''}`.trim();
+
+  const r = await dbRun(`
+    INSERT INTO warehouse_slips (slip_no, slip_type, slip_date, expected_date, expected_time, created_by, partner_name, carrier, warehouse_code, purpose, status, cutoff_warning, notes)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `, [slipNo, slipType, today, expDate, expTime, req.user.full_name, q.supplier_name, 'Xe xưởng NCC', '9005', purpose, 'Sent', warning, notes]);
+  const sid = r.lastInsertRowid;
+  await dbRun(
+    `INSERT INTO warehouse_slip_items (slip_id, barcode, product_name, unit, qty, note) VALUES (?,?,?,?,?,?)`,
+    [sid, q.barcode || '', q.product_name, 'Cái', Math.max(1, num(q.defective_qty)), q.issue || '']
+  );
+
+  if (slipType === 'XK') {
+    await dbRun(`UPDATE qc_factory_returns SET ref_xk_no=?, status=CASE WHEN status='Open' THEN 'Sent to Factory' ELSE status END WHERE id=?`, [slipNo, q.id]);
+  } else {
+    await dbRun(`UPDATE qc_factory_returns SET ref_nk_no=?, status=CASE WHEN status IN ('Open','Sent to Factory') THEN 'Returned' ELSE status END WHERE id=?`, [slipNo, q.id]);
+  }
+  await logAudit(req, 'QC_GENERATE_SLIP', 'QC_RETURN', q.id, `Tạo phiếu ${slipNo} cho lô QC ${q.product_name} (${q.supplier_name}, SL: ${q.defective_qty})`);
+  res.json({ ok: true, slip_id: sid, slip_no: slipNo, slip_type: slipType, cutoff_warning: warning });
+}));
+
+// ─── 8B. BM-03 (INSPECTION & RETURN) & BM-04 (3PL INCIDENT/CLAIM) ───
+app.get('/api/bm03', wrap(async (req, res) => {
+  const rows = await dbAll(`
+    SELECT id, doc_no, doc_date, ticket_id, ticket_no, invoice_no, handover_no, location,
+           tech_name, wh_rep, customer_name, customer_phone, barcode, product_name, qty,
+           receive_date, packaging_state, damage_types_json, damage_other, root_cause,
+           customer_resolution, replacement_code, appointment_date, refund_amount,
+           warehouse_disposition, inv_adj_code, status, created_at,
+           CASE WHEN signature_data != '' THEN 1 ELSE 0 END as has_signature,
+           CASE WHEN photos_json != '' AND photos_json != '[]' THEN 1 ELSE 0 END as has_photos
+    FROM bm03_inspections ORDER BY id DESC LIMIT 100
+  `);
+  res.json(rows);
+}));
+
+app.get('/api/bm03/:id', wrap(async (req, res) => {
+  const row = await dbGet('SELECT * FROM bm03_inspections WHERE id = ?', [req.params.id]);
+  if (!row) return res.status(404).json({ error: 'Không tìm thấy biên bản BM-03' });
+  res.json(row);
+}));
+
+app.post('/api/bm03', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
+  const b = req.body;
+  const docNo = await nextBm03No();
+  const r = await dbRun(`
+    INSERT INTO bm03_inspections (
+      doc_no, doc_date, ticket_id, ticket_no, invoice_no, handover_no, location,
+      tech_name, wh_rep, customer_name, customer_phone, barcode, product_name, qty,
+      receive_date, packaging_state, damage_types_json, damage_other, root_cause,
+      customer_resolution, replacement_code, appointment_date, refund_amount,
+      warehouse_disposition, inv_adj_code, photos_json, signature_data, status
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `, [
+    docNo, b.doc_date || getVnIsoDate(), b.ticket_id || null, b.ticket_no || '', b.invoice_no || '', b.handover_no || '',
+    b.location || 'Nhà khách hàng', b.tech_name || req.user.full_name, b.wh_rep || '',
+    b.customer_name || '', b.customer_phone || '', b.barcode || '', b.product_name || '', num(b.qty) || 1,
+    b.receive_date || '', b.packaging_state || 'Bao bì gốc',
+    JSON.stringify(Array.isArray(b.damage_types) ? b.damage_types : []),
+    b.damage_other || '', b.root_cause || 'Lỗi NSX/NCC',
+    b.customer_resolution || 'Đổi mới 1-1', b.replacement_code || '', b.appointment_date || '', num(b.refund_amount),
+    b.warehouse_disposition || 'Nhập DC 9005 claim NCC', b.inv_adj_code || '',
+    b.photos_json || '[]', b.signature_data || '', b.status || 'Open'
+  ]);
+  if (b.ticket_id) {
+    await dbRun('UPDATE warranty_tickets SET bm03_no = ? WHERE id = ?', [docNo, b.ticket_id]);
+  } else if (b.ticket_no) {
+    await dbRun('UPDATE warranty_tickets SET bm03_no = ? WHERE ticket_no = ?', [docNo, b.ticket_no]);
+  }
+  await logAudit(req, 'CREATE_BM03', 'BM03', docNo, `Lập BM-03 ${docNo} cho ${b.product_name} (${b.customer_name}) — ${b.customer_resolution}`);
+  res.json({ id: r.lastInsertRowid, doc_no: docNo, ok: true });
+}));
+
+app.put('/api/bm03/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
+  const b = req.body;
+  const ex = await dbGet('SELECT * FROM bm03_inspections WHERE id = ?', [req.params.id]);
+  if (!ex) return res.status(404).json({ error: 'Không tìm thấy biên bản BM-03' });
+  await dbRun(`
+    UPDATE bm03_inspections SET
+      doc_date=?, location=?, tech_name=?, wh_rep=?, customer_name=?, customer_phone=?,
+      barcode=?, product_name=?, qty=?, receive_date=?, packaging_state=?,
+      damage_types_json=?, damage_other=?, root_cause=?, customer_resolution=?,
+      replacement_code=?, appointment_date=?, refund_amount=?, warehouse_disposition=?,
+      inv_adj_code=?, photos_json=?, signature_data=?, status=?
+    WHERE id=?
+  `, [
+    b.doc_date ?? ex.doc_date, b.location ?? ex.location, b.tech_name ?? ex.tech_name, b.wh_rep ?? ex.wh_rep,
+    b.customer_name ?? ex.customer_name, b.customer_phone ?? ex.customer_phone,
+    b.barcode ?? ex.barcode, b.product_name ?? ex.product_name, b.qty !== undefined ? num(b.qty) : ex.qty,
+    b.receive_date ?? ex.receive_date, b.packaging_state ?? ex.packaging_state,
+    Array.isArray(b.damage_types) ? JSON.stringify(b.damage_types) : (b.damage_types_json ?? ex.damage_types_json),
+    b.damage_other ?? ex.damage_other, b.root_cause ?? ex.root_cause,
+    b.customer_resolution ?? ex.customer_resolution, b.replacement_code ?? ex.replacement_code,
+    b.appointment_date ?? ex.appointment_date, b.refund_amount !== undefined ? num(b.refund_amount) : ex.refund_amount,
+    b.warehouse_disposition ?? ex.warehouse_disposition, b.inv_adj_code ?? ex.inv_adj_code,
+    b.photos_json ?? ex.photos_json, b.signature_data ?? ex.signature_data, b.status ?? ex.status,
+    req.params.id
+  ]);
+  await logAudit(req, 'UPDATE_BM03', 'BM03', ex.doc_no, `Cập nhật BM-03 ${ex.doc_no}: status=${b.status ?? ex.status}, kho=${b.warehouse_disposition ?? ex.warehouse_disposition}`);
+  res.json({ ok: true });
+}));
+
+app.get('/api/bm04', wrap(async (req, res) => {
+  const rows = await dbAll(`
+    SELECT id, doc_no, doc_date, location, ticket_id, ticket_no, invoice_no, carrier, awb_no, route,
+           vehicle_plate, driver_name, driver_phone, driver_cccd, packaging_checks_json,
+           evidence_checks_json, cause_assessment, items_json, goods_disposition,
+           claim_amount, claim_deadline_at, claim_status, notes, created_at,
+           CASE WHEN driver_signature_data != '' THEN 1 ELSE 0 END as has_signature,
+           CASE WHEN photos_json != '' AND photos_json != '[]' THEN 1 ELSE 0 END as has_photos
+    FROM bm04_incidents ORDER BY id DESC LIMIT 100
+  `);
+  res.json(rows);
+}));
+
+app.get('/api/bm04/:id', wrap(async (req, res) => {
+  const row = await dbGet('SELECT * FROM bm04_incidents WHERE id = ?', [req.params.id]);
+  if (!row) return res.status(404).json({ error: 'Không tìm thấy biên bản BM-04' });
+  res.json(row);
+}));
+
+app.post('/api/bm04', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
+  const b = req.body;
+  const docNo = await nextBm04No();
+  const claimDeadline = getVnDateTime(48); // SOP: phản hồi đền bù trong 48h
+  const r = await dbRun(`
+    INSERT INTO bm04_incidents (
+      doc_no, doc_date, location, ticket_id, ticket_no, invoice_no, carrier, awb_no, route,
+      vehicle_plate, driver_name, driver_phone, driver_cccd, packaging_checks_json,
+      evidence_checks_json, cause_assessment, items_json, goods_disposition,
+      claim_amount, claim_deadline_at, claim_status, photos_json, driver_signature_data, notes
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `, [
+    docNo, b.doc_date || getVnIsoDate(), b.location || 'Kho DC 9005',
+    b.ticket_id || null, b.ticket_no || '', b.invoice_no || '',
+    b.carrier || 'Ahamove', b.awb_no || '', b.route || '',
+    b.vehicle_plate || '', b.driver_name || '', b.driver_phone || '', b.driver_cccd || '',
+    JSON.stringify(Array.isArray(b.packaging_checks) ? b.packaging_checks : []),
+    JSON.stringify(Array.isArray(b.evidence_checks) ? b.evidence_checks : []),
+    b.cause_assessment || 'Chằng buộc sai quy cách/va đập',
+    JSON.stringify(Array.isArray(b.items) ? b.items : []),
+    b.goods_disposition || 'Tạm giữ tại DC 9005 cách ly',
+    num(b.claim_amount), claimDeadline, b.claim_status || 'Open',
+    b.photos_json || '[]', b.driver_signature_data || '', b.notes || ''
+  ]);
+  if (b.ticket_id) {
+    await dbRun('UPDATE warranty_tickets SET bm04_no = ? WHERE id = ?', [docNo, b.ticket_id]);
+  } else if (b.ticket_no) {
+    await dbRun('UPDATE warranty_tickets SET bm04_no = ? WHERE ticket_no = ?', [docNo, b.ticket_no]);
+  }
+  await logAudit(req, 'CREATE_BM04', 'BM04', docNo, `Lập BM-04 ${docNo} claim 3PL ${b.carrier || ''} — ĐH ${b.invoice_no || '—'} (${num(b.claim_amount).toLocaleString('vi-VN')}đ)`);
+  res.json({ id: r.lastInsertRowid, doc_no: docNo, claim_deadline_at: claimDeadline, ok: true });
+}));
+
+app.put('/api/bm04/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
+  const b = req.body;
+  const ex = await dbGet('SELECT * FROM bm04_incidents WHERE id = ?', [req.params.id]);
+  if (!ex) return res.status(404).json({ error: 'Không tìm thấy biên bản BM-04' });
+  await dbRun(`
+    UPDATE bm04_incidents SET
+      doc_date=?, location=?, invoice_no=?, carrier=?, awb_no=?, route=?,
+      vehicle_plate=?, driver_name=?, driver_phone=?, driver_cccd=?,
+      packaging_checks_json=?, evidence_checks_json=?, cause_assessment=?,
+      items_json=?, goods_disposition=?, claim_amount=?, claim_status=?,
+      photos_json=?, driver_signature_data=?, notes=?
+    WHERE id=?
+  `, [
+    b.doc_date ?? ex.doc_date, b.location ?? ex.location, b.invoice_no ?? ex.invoice_no,
+    b.carrier ?? ex.carrier, b.awb_no ?? ex.awb_no, b.route ?? ex.route,
+    b.vehicle_plate ?? ex.vehicle_plate, b.driver_name ?? ex.driver_name,
+    b.driver_phone ?? ex.driver_phone, b.driver_cccd ?? ex.driver_cccd,
+    Array.isArray(b.packaging_checks) ? JSON.stringify(b.packaging_checks) : (b.packaging_checks_json ?? ex.packaging_checks_json),
+    Array.isArray(b.evidence_checks) ? JSON.stringify(b.evidence_checks) : (b.evidence_checks_json ?? ex.evidence_checks_json),
+    b.cause_assessment ?? ex.cause_assessment,
+    Array.isArray(b.items) ? JSON.stringify(b.items) : (b.items_json ?? ex.items_json),
+    b.goods_disposition ?? ex.goods_disposition,
+    b.claim_amount !== undefined ? num(b.claim_amount) : ex.claim_amount,
+    b.claim_status ?? ex.claim_status,
+    b.photos_json ?? ex.photos_json,
+    b.driver_signature_data ?? ex.driver_signature_data,
+    b.notes ?? ex.notes,
+    req.params.id
+  ]);
+  await logAudit(req, 'UPDATE_BM04', 'BM04', ex.doc_no, `Cập nhật BM-04 ${ex.doc_no}: claim=${b.claim_status ?? ex.claim_status}, giá trị=${(b.claim_amount !== undefined ? num(b.claim_amount) : ex.claim_amount).toLocaleString('vi-VN')}đ`);
+  res.json({ ok: true });
+}));
+
+// ─── 8C. AUDIT TRAIL LOGS (GOVERNANCE / ACC) ──────────────────
+app.get('/api/audit-logs', wrap(async (req, res) => {
+  const entityType = String(req.query.entity_type || '').trim();
+  const q = String(req.query.q || '').trim();
+  const limit = Math.min(200, Math.max(10, Number(req.query.limit) || 100));
+  let sql = 'SELECT * FROM audit_logs WHERE 1=1';
+  const params = [];
+  if (entityType) {
+    sql += ' AND entity_type = ?';
+    params.push(entityType);
+  }
+  if (q) {
+    sql += ' AND (summary LIKE ? OR entity_id LIKE ? OR user_name LIKE ? OR action LIKE ?)';
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+  }
+  sql += ` ORDER BY id DESC LIMIT ${limit}`;
+  res.json(await dbAll(sql, params));
 }));
 
 app.get('/api/support-logs', wrap(async (req, res) => {
@@ -1176,7 +1968,7 @@ app.get('/api/support-logs', wrap(async (req, res) => {
 app.post('/api/support-logs', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
   const b = req.body;
   const r = await dbRun(`INSERT INTO support_logs (log_date, staff_name, category, location, hours, notes) VALUES (?,?,?,?,?,?)`,
-    [b.log_date || new Date().toISOString().slice(0, 10), b.staff_name || req.user.full_name, b.category, b.location || '', num(b.hours), b.notes || '']);
+    [b.log_date || getVnIsoDate(), b.staff_name || req.user.full_name, b.category, b.location || '', num(b.hours), b.notes || '']);
   res.json({ id: r.lastInsertRowid, ok: true });
 }));
 
@@ -1268,7 +2060,7 @@ async function buildDeliveryReport(monthFilter) {
 
   const effectiveMonth =
     !monthFilter || monthFilter === 'LATEST'
-      ? (available_months[0] || new Date().toISOString().slice(0, 7))
+      ? (available_months[0] || getVnYearMonth())
       : monthFilter;
 
   let rows;
@@ -1323,7 +2115,24 @@ async function buildDeliveryReport(monthFilter) {
     net_ship_gap: gDel - gFee,
   };
 
-  return { month: effectiveMonth, available_months, pivot, grand_total, rows };
+  // Annotate linked dispatch orders (TASK-08 2-way integration)
+  const slipNos = rows.map(r => r.slip_no).filter(Boolean);
+  const linkedOrders = await batchQueryByIds(`SELECT id, invoice_no, status, require_install FROM orders WHERE invoice_no IN`, slipNos);
+  const orderBySlip = new Map();
+  for (const lo of linkedOrders) {
+    orderBySlip.set(lo.invoice_no, lo);
+  }
+  const enrichedRows = rows.map(r => {
+    const lo = orderBySlip.get(r.slip_no);
+    return {
+      ...r,
+      linked_order_id: lo?.id || null,
+      linked_order_status: lo?.status || '',
+      linked_require_install: lo?.require_install || 0,
+    };
+  });
+
+  return { month: effectiveMonth, available_months, pivot, grand_total, rows: enrichedRows };
 }
 
 app.get('/api/delivery-tracking', wrap(async (req, res) => {
@@ -1339,6 +2148,74 @@ app.get('/api/delivery-tracking/lookup-pos', wrap(async (req, res) => {
     [`%${q}%`, `%${q}%`]
   );
   res.json(rows);
+}));
+
+app.post('/api/delivery-tracking/:slipNo/push-to-order', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const slipNo = String(req.params.slipNo || '').trim();
+  const existingOrder = await dbGet(`SELECT id, status FROM orders WHERE invoice_no = ? ORDER BY id DESC LIMIT 1`, [slipNo]);
+  if (existingOrder) {
+    return res.json({ ok: true, existed: true, order_id: existingOrder.id, status: existingOrder.status });
+  }
+  const dt = await dbGet(`SELECT * FROM delivery_tracking WHERE slip_no = ?`, [slipNo]);
+  const pos = await dbGet(`SELECT * FROM pos_slips WHERE slip_no = ?`, [slipNo]);
+  const src = dt || pos;
+  if (!src) return res.status(404).json({ error: `Không tìm thấy hóa đơn POS ${slipNo}` });
+
+  const custPayTotal = num(src.delivery_cust_pay) + num(src.install_cust_pay);
+  const reqInstall = num(src.install_cust_pay) > 0 ? 1 : 0;
+  const isFree = num(src.delivery_cust_pay) === 0 ? 1 : 0;
+  const r = await dbRun(`
+    INSERT INTO orders (
+      invoice_no, order_date, delivery_date, customer_name, customer_phone, address, region,
+      distance_km, carrier, tracking_no, source_warehouse, shipping_fee_3pl, customer_paid_fee,
+      is_promo_free_ship, require_install, is_stairs, ktvs_json, status, install_status, notes
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `, [
+    slipNo,
+    src.sales_day || getVnIsoDate(),
+    '',
+    req.body?.customer_name || `Khách POS ${slipNo}`,
+    req.body?.customer_phone || '',
+    req.body?.address || '',
+    dt?.area || 'HCM',
+    0,
+    dt?.carrier_3pl || 'Ahamove',
+    '',
+    '9005',
+    num(dt?.fee_3pl),
+    custPayTotal,
+    isFree,
+    reqInstall,
+    0,
+    '[]',
+    'New',
+    reqInstall ? 'Chờ lắp đặt' : '',
+    [dt?.note, src.items_summary ? `POS: ${src.items_summary}` : ''].filter(Boolean).join(' | '),
+  ]);
+  const oid = r.lastInsertRowid;
+
+  // Parse items_summary e.g. "Bàn Noma (x1), Ghế Cheri (x2)" and match against Master Data when possible
+  const rawSummary = String(src.items_summary || '').replace(/\s*\(\+\d+\)$/, '').trim();
+  const parsedEntries = rawSummary
+    ? rawSummary.split(/,\s*/).map(chunk => {
+        const m = chunk.match(/^(.+?)\s*\(x([\d.]+)\)$/i);
+        return { name: (m ? m[1] : chunk).trim(), qty: m ? num(m[2]) || 1 : 1 };
+      }).filter(x => x.name)
+    : [];
+
+  for (const it of parsedEntries) {
+    const prod = await dbGet(`SELECT * FROM products WHERE LOWER(name_vn) = LOWER(?) OR name_vn LIKE ? LIMIT 1`, [it.name, `%${it.name}%`]);
+    await dbRun(`
+      INSERT INTO order_items (order_id, barcode, product_name, unit, qty, net_weight_g, warranty_months, warranty_policy, p_handling_unit, p_installation_unit)
+      VALUES (?,?,?,?,?,?,?,?,?,?)
+    `, [
+      oid, prod?.barcode || '', prod?.name_vn || it.name, prod?.unit || 'Cái', it.qty,
+      prod?.net_weight_g || 0, prod?.warranty_months || 0, prod?.warranty_policy || 'Không bảo hành',
+      prod ? prod.p_handling : 15000, prod ? prod.p_installation : 0,
+    ]);
+  }
+
+  res.json({ ok: true, existed: false, order_id: oid, items_created: parsedEntries.length });
 }));
 
 app.post('/api/delivery-tracking/upload-pos', requireRoles('ADMIN', 'EDITOR'), upload.single('file'), wrap(async (req, res) => {
@@ -1394,8 +2271,8 @@ app.post('/api/delivery-tracking', requireRoles('ADMIN', 'EDITOR'), wrap(async (
   if (!slipNo) return res.status(400).json({ error: 'Vui lòng nhập Số hóa đơn (No Slip.)' });
 
   const pos = await dbGet(`SELECT * FROM pos_slips WHERE slip_no = ?`, [slipNo]);
-  const salesMonth = b.sales_month || pos?.sales_month || new Date().toISOString().slice(0, 7);
-  const salesDay = b.sales_day || pos?.sales_day || new Date().toISOString().slice(0, 10);
+  const salesMonth = b.sales_month || pos?.sales_month || getVnYearMonth();
+  const salesDay = b.sales_day || pos?.sales_day || getVnIsoDate();
 
   await dbRun(`
     INSERT INTO delivery_tracking (slip_no,sales_month,sales_day,store_code,delivery_cust_pay,install_cust_pay,fee_3pl,net_sales_excl_tax,carrier_3pl,area,note,items_summary)
@@ -1426,6 +2303,7 @@ app.post('/api/delivery-tracking', requireRoles('ADMIN', 'EDITOR'), wrap(async (
 app.put('/api/delivery-tracking/:slipNo', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
   const slipNo = req.params.slipNo;
   const b = req.body;
+  const before = await dbGet('SELECT carrier_3pl, fee_3pl, area, note FROM delivery_tracking WHERE slip_no = ?', [slipNo]);
   await dbRun(`
     UPDATE delivery_tracking SET
       carrier_3pl=?, fee_3pl=?, area=?, note=?,
@@ -1444,11 +2322,24 @@ app.put('/api/delivery-tracking/:slipNo', requireRoles('ADMIN', 'EDITOR'), wrap(
     b.net_sales_excl_tax !== undefined ? num(b.net_sales_excl_tax) : null,
     slipNo,
   ]);
+  // 2-way sync carrier & 3PL fee back to orders if linked
+  await dbRun(`
+    UPDATE orders
+    SET carrier = CASE WHEN ? != '' THEN ? ELSE carrier END,
+        shipping_fee_3pl = CASE WHEN ? > 0 THEN ? ELSE shipping_fee_3pl END,
+        region = CASE WHEN ? != '' THEN ? ELSE region END
+    WHERE invoice_no = ?
+  `, [b.carrier_3pl ?? '', b.carrier_3pl ?? '', num(b.fee_3pl), num(b.fee_3pl), b.area ?? '', b.area ?? '', slipNo]);
+  await logAudit(req, 'UPDATE_3PL_FEE', 'DELIVERY_3PL', slipNo, `Sửa 3PL ${slipNo}: ${b.carrier_3pl || '—'} (${num(b.fee_3pl).toLocaleString('vi-VN')}đ)`, before, {
+    carrier_3pl: b.carrier_3pl ?? '', fee_3pl: num(b.fee_3pl), area: b.area ?? 'HCM'
+  });
   res.json({ ok: true });
 }));
 
 app.delete('/api/delivery-tracking/:slipNo', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const before = await dbGet('SELECT slip_no, carrier_3pl, fee_3pl, net_sales_excl_tax FROM delivery_tracking WHERE slip_no = ?', [req.params.slipNo]);
   await dbRun(`DELETE FROM delivery_tracking WHERE slip_no = ?`, [req.params.slipNo]);
+  await logAudit(req, 'DELETE_3PL_ROW', 'DELIVERY_3PL', req.params.slipNo, `Xóa hóa đơn ${req.params.slipNo} khỏi báo cáo 3PL`, before, null);
   res.json({ ok: true });
 }));
 

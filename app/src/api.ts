@@ -62,6 +62,34 @@ export async function apiUpload<T = any>(url: string, file: File): Promise<T> {
   return data;
 }
 
+export async function apiDownload(url: string, fallbackFilename: string, postBody?: any): Promise<void> {
+  const init: RequestInit = postBody !== undefined
+    ? { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(postBody) }
+    : { headers: authHeaders() };
+  const res = await fetch(url, init);
+  if (res.status === 401) {
+    clearAuthToken();
+    window.dispatchEvent(new Event('benom-auth-expired'));
+    throw new Error('Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.');
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: `Lỗi tải file (${res.status})` }));
+    throw new Error(err.error || `Lỗi tải file (${res.status})`);
+  }
+  const cd = res.headers.get('Content-Disposition') || '';
+  const match = cd.match(/filename="?([^"]+)"?/i);
+  const filename = match ? match[1] : fallbackFilename;
+  const blob = await res.blob();
+  const objUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(objUrl), 5000);
+}
+
 export function fmtVnd(v: number | string | null | undefined): string {
   const n = Number(v || 0);
   return new Intl.NumberFormat('vi-VN').format(Math.round(n)) + ' đ';
@@ -91,4 +119,6 @@ export interface AuthUser {
 export type PrintDoc =
   | { type: 'HANDOVER'; data: any }
   | { type: 'SLIP'; data: any }
-  | { type: 'WARRANTY'; data: any };
+  | { type: 'WARRANTY'; data: any }
+  | { type: 'BM03'; data: any }
+  | { type: 'BM04'; data: any };

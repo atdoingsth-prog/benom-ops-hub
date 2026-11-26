@@ -1,11 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import {
-  BarChart3, BookOpen, Calculator, LayoutDashboard, LogOut, ShieldCheck, Truck, Users, Warehouse
+  BarChart3, BookOpen, Calculator, History, KeyRound, LayoutDashboard, LogOut, ShieldCheck, Truck, Users, Warehouse
 } from 'lucide-react';
 import { apiGet, AuthUser, clearAuthToken, getAuthToken, PrintDoc } from './api';
 import PrintModal from './components/PrintModal';
 import LoginScreen from './components/LoginScreen';
 import ShareUsersModal from './components/ShareUsersModal';
+import ChangePasswordModal from './components/ChangePasswordModal';
+import AuditLogModal from './components/AuditLogModal';
 import DashboardView from './views/DashboardView';
 import OrdersDispatchView from './views/OrdersDispatchView';
 import DeliveryTrackingView from './views/DeliveryTrackingView';
@@ -48,6 +50,8 @@ export default function App() {
   const [tab, setTabState] = useState<string>(getInitialTab);
   const [printDoc, setPrintDoc] = useState<PrintDoc | null>(null);
   const [showShare, setShowShare] = useState(false);
+  const [showChangePwd, setShowChangePwd] = useState(false);
+  const [showAudit, setShowAudit] = useState(false);
   const [toast, setToast] = useState<{ msg: string; tone: 'ok' | 'err' } | null>(null);
 
   const setTab = (nextTab: string) => {
@@ -152,6 +156,22 @@ export default function App() {
             </button>
           )}
 
+          {user.role !== 'KTV' && (
+            <button
+              onClick={() => setShowAudit(true)}
+              className="w-full py-1.5 px-3 rounded-lg bg-[#563C28] text-[#F8F4EC] font-medium text-[11px] flex items-center justify-center gap-1.5 hover:bg-[#6a4b33] cursor-pointer"
+            >
+              <History className="w-3 h-3" /> Nhật ký kiểm toán
+            </button>
+          )}
+
+          <button
+            onClick={() => setShowChangePwd(true)}
+            className="w-full py-1.5 px-3 rounded-lg bg-[#563C28] text-[#F8F4EC] font-medium text-[11px] flex items-center justify-center gap-1.5 hover:bg-[#6a4b33] cursor-pointer"
+          >
+            <KeyRound className="w-3 h-3" /> Đổi mật khẩu
+          </button>
+
           <div className="flex items-center justify-between pt-1 text-[10px] opacity-80">
             <span>{dbMode === 'turso-cloud' ? 'Cloud 24/7 (Turso)' : 'Local SQLite'}</span>
             <button onClick={handleLogout} className="flex items-center gap-1 text-[#F8F4EC] hover:underline cursor-pointer">
@@ -175,7 +195,10 @@ export default function App() {
                 Chia sẻ
               </button>
             )}
-            <button onClick={handleLogout} className="p-1.5 rounded hover:bg-white/10 cursor-pointer">
+            <button onClick={() => setShowChangePwd(true)} title="Đổi mật khẩu" className="p-1.5 rounded hover:bg-white/10 cursor-pointer">
+              <KeyRound className="w-4 h-4" />
+            </button>
+            <button onClick={handleLogout} title="Đăng xuất" className="p-1.5 rounded hover:bg-white/10 cursor-pointer">
               <LogOut className="w-4 h-4" />
             </button>
           </div>
@@ -188,13 +211,13 @@ export default function App() {
         )}
 
         <div className="max-w-7xl mx-auto p-4 sm:p-6 lg:p-8">
-          {tab === 'dashboard' && <DashboardView onToast={showToast} onNavigate={setTab} />}
-          {tab === 'delivery3pl' && <DeliveryTrackingView onToast={showToast} />}
-          {tab === 'orders' && <OrdersDispatchView onToast={showToast} onPrint={setPrintDoc} />}
-          {tab === 'allowance' && <AllowanceView onToast={showToast} />}
-          {tab === 'warehouse' && <WarehouseErpView onToast={showToast} onPrint={setPrintDoc} />}
-          {tab === 'warranty' && <WarrantyQcView onToast={showToast} onPrint={setPrintDoc} />}
-          {tab === 'master' && <MasterDataView onToast={showToast} />}
+          {tab === 'dashboard' && <DashboardView user={user} onToast={showToast} onNavigate={setTab} />}
+          {tab === 'delivery3pl' && <DeliveryTrackingView user={user} onToast={showToast} onNavigate={setTab} />}
+          {tab === 'orders' && <OrdersDispatchView user={user} onToast={showToast} onPrint={setPrintDoc} />}
+          {tab === 'allowance' && <AllowanceView user={user} onToast={showToast} />}
+          {tab === 'warehouse' && <WarehouseErpView user={user} onToast={showToast} onPrint={setPrintDoc} />}
+          {tab === 'warranty' && <WarrantyQcView user={user} onToast={showToast} onPrint={setPrintDoc} />}
+          {tab === 'master' && <MasterDataView user={user} onToast={showToast} />}
         </div>
       </main>
 
@@ -232,6 +255,18 @@ export default function App() {
 
       {/* Share & RBAC Modal (Admin) */}
       {showShare && <ShareUsersModal onClose={() => setShowShare(false)} onToast={showToast} />}
+
+      {/* Change Password Modal (All roles) */}
+      {showChangePwd && (
+        <ChangePasswordModal
+          email={user.email}
+          onClose={() => setShowChangePwd(false)}
+          onToast={showToast}
+        />
+      )}
+
+      {/* Audit Trail Modal */}
+      {showAudit && <AuditLogModal onClose={() => setShowAudit(false)} onToast={showToast} />}
     </div>
   );
 }

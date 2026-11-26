@@ -18,7 +18,7 @@ export default function PrintModal({ doc, onClose }: Props) {
         {/* Toolbar (hidden on print) */}
         <div className="no-print flex items-center justify-between px-5 py-3 bg-[#3B281A] text-[#F8F4EC]">
           <div className="font-semibold text-sm">
-            Xem trước bản in A4 — {doc.type === 'HANDOVER' ? doc.data.doc_no : doc.type === 'SLIP' ? doc.data.slip_no : doc.data.ticket_no}
+            Xem trước bản in A4 — {doc.type === 'HANDOVER' || doc.type === 'BM03' || doc.type === 'BM04' ? doc.data.doc_no : doc.type === 'SLIP' ? doc.data.slip_no : doc.data.ticket_no}
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -69,6 +69,20 @@ export default function PrintModal({ doc, onClose }: Props) {
                   <div>Mức độ: <strong>{doc.data.service_level}</strong></div>
                 </>
               )}
+              {doc.type === 'BM03' && (
+                <>
+                  <div className="font-bold text-[#3B281A] text-sm">BIÊN BẢN KIỂM ĐỊNH & THU HỒI (BM-03)</div>
+                  <div>Số biên bản: <strong>{doc.data.doc_no}</strong></div>
+                  <div>Ngày lập: <strong>{doc.data.doc_date || '—'}</strong></div>
+                </>
+              )}
+              {doc.type === 'BM04' && (
+                <>
+                  <div className="font-bold text-[#9A2B26] text-sm">BIÊN BẢN SỰ CỐ GIAO NHẬN (BM-04)</div>
+                  <div>Số biên bản: <strong>{doc.data.doc_no}</strong></div>
+                  <div>Ngày lập: <strong>{doc.data.doc_date || '—'}</strong></div>
+                </>
+              )}
             </div>
           </div>
 
@@ -96,6 +110,7 @@ export default function PrintModal({ doc, onClose }: Props) {
                     <th className="border border-[#cbb7a2] p-2 text-center w-10">STT</th>
                     <th className="border border-[#cbb7a2] p-2 text-left w-32">Barcode</th>
                     <th className="border border-[#cbb7a2] p-2 text-left">Tên sản phẩm</th>
+                    <th className="border border-[#cbb7a2] p-2 text-center w-16">Điểm lấy</th>
                     <th className="border border-[#cbb7a2] p-2 text-center w-14">ĐVT</th>
                     <th className="border border-[#cbb7a2] p-2 text-center w-14">SL</th>
                     <th className="border border-[#cbb7a2] p-2 text-left w-28">Bảo hành</th>
@@ -106,7 +121,11 @@ export default function PrintModal({ doc, onClose }: Props) {
                     <tr key={i}>
                       <td className="border border-[#cbb7a2] p-2 text-center">{i + 1}</td>
                       <td className="border border-[#cbb7a2] p-2 font-mono">{it.barcode}</td>
-                      <td className="border border-[#cbb7a2] p-2">{it.product_name}</td>
+                      <td className="border border-[#cbb7a2] p-2">
+                        {it.product_name}
+                        {it.moving_no ? <span className="text-[10px] text-gray-500 ml-1">(Moving: {it.moving_no})</span> : null}
+                      </td>
+                      <td className="border border-[#cbb7a2] p-2 text-center font-mono font-semibold">{it.source_warehouse || doc.data.warehouse_code || '9005'}</td>
                       <td className="border border-[#cbb7a2] p-2 text-center">{it.unit || 'Cái'}</td>
                       <td className="border border-[#cbb7a2] p-2 text-center font-semibold">{it.qty}</td>
                       <td className="border border-[#cbb7a2] p-2">{it.warranty_policy || 'Theo quy định'}</td>
@@ -268,6 +287,134 @@ export default function PrintModal({ doc, onClose }: Props) {
               </div>
             </div>
           )}
+
+          {/* BM-03 (KIỂM ĐỊNH KỸ THUẬT & THU HỒI CẤP 3) */}
+          {doc.type === 'BM03' && (() => {
+            const damages: string[] = (() => { try { return JSON.parse(doc.data.damage_types_json || '[]'); } catch { return []; } })();
+            return (
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 gap-3 bg-[#F8F4EC] p-3.5 rounded-lg border border-[#E6DDD1]">
+                  <div><strong>Căn cứ Ticket BM-02:</strong> {doc.data.ticket_no || '—'}</div>
+                  <div><strong>Mã đơn hàng gốc:</strong> {doc.data.invoice_no || '—'}</div>
+                  <div><strong>Địa điểm kiểm định:</strong> {doc.data.location}</div>
+                  <div><strong>Kỹ thuật kiểm định:</strong> {doc.data.tech_name || '—'}</div>
+                  <div><strong>Khách hàng / ĐVVC:</strong> {doc.data.customer_name} ({doc.data.customer_phone || '—'})</div>
+                  <div><strong>Đóng gói thu hồi:</strong> {doc.data.packaging_state}</div>
+                </div>
+
+                <div className="border border-[#cbb7a2] rounded-lg p-3.5 space-y-1.5 text-xs">
+                  <div className="font-bold text-[#3B281A]">II. THÔNG TIN SẢN PHẨM THU HỒI</div>
+                  <div><strong>Sản phẩm:</strong> {doc.data.product_name} | <strong>Barcode:</strong> <span className="font-mono">{doc.data.barcode || '—'}</span> | <strong>SL:</strong> {doc.data.qty}</div>
+                </div>
+
+                <div className="border border-[#cbb7a2] rounded-lg p-3.5 space-y-1.5 text-xs">
+                  <div className="font-bold text-[#3B281A]">III. KẾT QUẢ KIỂM ĐỊNH KỸ THUẬT</div>
+                  <div><strong>Hiện trạng hư hỏng:</strong> {damages.join('; ') || '—'}{doc.data.damage_other ? ` (${doc.data.damage_other})` : ''}</div>
+                  <div><strong>Xác định nguyên nhân:</strong> <strong>{doc.data.root_cause}</strong></div>
+                </div>
+
+                <div className="border border-[#cbb7a2] rounded-lg p-3.5 space-y-1.5 text-xs bg-[#FAF7F2]">
+                  <div className="font-bold text-[#3B281A]">IV. PHƯƠNG ÁN QUYẾT ĐỊNH XỬ LÝ</div>
+                  <div><strong>Với Khách hàng:</strong> {doc.data.customer_resolution} {doc.data.replacement_code ? `(Mã/Hẹn: ${doc.data.replacement_code})` : ''} {doc.data.refund_amount > 0 ? `(Hoàn: ${fmtVnd(doc.data.refund_amount)})` : ''}</div>
+                  <div><strong>Quản trị kho DC 9005:</strong> {doc.data.warehouse_disposition} | <strong>Mã Inventory Adjustment (ERP):</strong> <span className="font-mono">{doc.data.inv_adj_code || '____________'}</span></div>
+                </div>
+
+                <div className="grid grid-cols-4 gap-4 pt-6 text-center text-[11px]">
+                  <div>
+                    <div className="font-bold">KỸ THUẬT KIỂM ĐỊNH</div>
+                    <div className="text-gray-500 mb-14">(Ký, ghi rõ họ tên)</div>
+                    <div className="font-semibold">{doc.data.tech_name || '___________'}</div>
+                  </div>
+                  <div>
+                    <div className="font-bold">KHO 9005 / STORE</div>
+                    <div className="text-gray-500 mb-14">(Ký, ghi rõ họ tên)</div>
+                    <div>{doc.data.wh_rep || '___________'}</div>
+                  </div>
+                  <div>
+                    <div className="font-bold">PHÊ DUYỆT SCM</div>
+                    <div className="text-gray-500 mb-14">(Ký, ghi rõ họ tên)</div>
+                    <div>___________</div>
+                  </div>
+                  <div>
+                    <div className="font-bold">KHÁCH HÀNG</div>
+                    <div className="text-gray-500 mb-2">(Ký xác nhận)</div>
+                    {doc.data.signature_data ? <img src={doc.data.signature_data} alt="Chữ ký KH" className="h-14 mx-auto object-contain mb-1" /> : <div className="h-12" />}
+                    <div className="font-semibold">{doc.data.customer_name}</div>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* BM-04 (BIÊN BẢN SỰ CỐ GIAO NHẬN & CLAIM 3PL) */}
+          {doc.type === 'BM04' && (() => {
+            const pkg: string[] = (() => { try { return JSON.parse(doc.data.packaging_checks_json || '[]'); } catch { return []; } })();
+            const evd: string[] = (() => { try { return JSON.parse(doc.data.evidence_checks_json || '[]'); } catch { return []; } })();
+            const items: any[] = (() => { try { return JSON.parse(doc.data.items_json || '[]'); } catch { return []; } })();
+            return (
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 gap-2.5 bg-[#F8F4EC] p-3.5 rounded-lg border border-[#E6DDD1] text-xs">
+                  <div><strong>Đơn vị vận chuyển:</strong> {doc.data.carrier}</div>
+                  <div><strong>Mã AWB / Chuyến:</strong> <span className="font-mono">{doc.data.awb_no || '—'}</span></div>
+                  <div><strong>Mã đơn Benom:</strong> <span className="font-mono">{doc.data.invoice_no || '—'}</span></div>
+                  <div><strong>Địa điểm lập:</strong> {doc.data.location}</div>
+                  <div><strong>Tài xế:</strong> {doc.data.driver_name || '—'} (SĐT: {doc.data.driver_phone || '—'})</div>
+                  <div><strong>Biển số xe / CCCD:</strong> {doc.data.vehicle_plate || '—'} / {doc.data.driver_cccd || '—'}</div>
+                </div>
+
+                <div className="text-xs space-y-1">
+                  <div><strong>Bao bì ngoại quan:</strong> {pkg.join('; ') || '—'}</div>
+                  <div><strong>Bằng chứng thu thập:</strong> {evd.join('; ') || '—'}</div>
+                  <div><strong>Đánh giá nguyên nhân:</strong> {doc.data.cause_assessment}</div>
+                </div>
+
+                <table className="w-full border-collapse border border-[#cbb7a2] text-xs">
+                  <thead>
+                    <tr className="bg-[#9A2B26] text-white">
+                      <th className="border border-[#cbb7a2] p-2 text-center w-10">STT</th>
+                      <th className="border border-[#cbb7a2] p-2 text-left">Tên sản phẩm</th>
+                      <th className="border border-[#cbb7a2] p-2 text-center w-16">SL hỏng</th>
+                      <th className="border border-[#cbb7a2] p-2 text-left">Mô tả tổn thất</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {items.map((it, i) => (
+                      <tr key={i}>
+                        <td className="border border-[#cbb7a2] p-2 text-center">{i + 1}</td>
+                        <td className="border border-[#cbb7a2] p-2 font-medium">{it.product_name}</td>
+                        <td className="border border-[#cbb7a2] p-2 text-center font-bold text-[#9A2B26]">{it.qty_damaged}</td>
+                        <td className="border border-[#cbb7a2] p-2">{it.damage_desc}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+
+                <div className="p-3 rounded-lg border border-[#9A2B26]/50 bg-red-50 text-xs space-y-1">
+                  <div><strong>Tình trạng hàng:</strong> {doc.data.goods_disposition} | <strong>Giá trị yêu cầu đền bù:</strong> <strong className="text-[#9A2B26]">{fmtVnd(doc.data.claim_amount)}</strong></div>
+                  <div><strong>Cam kết SLA bồi thường (SOP-BENOM-SCM-03):</strong> Đơn vị vận chuyển phản hồi đền bù trong vòng 48 giờ ({doc.data.claim_deadline_at || '—'}) theo giá trị xuất kho/hóa đơn Công ty TNHH Kohnan Việt Nam.</div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-6 pt-5 text-center text-xs">
+                  <div>
+                    <div className="font-bold">TÀI XẾ / ĐẠI DIỆN 3PL</div>
+                    <div className="text-gray-500 mb-2">(Ký, ghi rõ họ tên)</div>
+                    {doc.data.driver_signature_data ? <img src={doc.data.driver_signature_data} alt="Chữ ký tài xế" className="h-16 mx-auto object-contain mb-1" /> : <div className="h-14" />}
+                    <div className="font-semibold">{doc.data.driver_name || '___________________'}</div>
+                  </div>
+                  <div>
+                    <div className="font-bold">KHO 9005 / STORE 3001</div>
+                    <div className="text-gray-500 mb-16">(Ký, ghi rõ họ tên)</div>
+                    <div>___________________</div>
+                  </div>
+                  <div>
+                    <div className="font-bold">PHÊ DUYỆT SCM</div>
+                    <div className="text-gray-500 mb-16">(Ký, ghi rõ họ tên)</div>
+                    <div>___________________</div>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
 
           {/* Official Footer */}
           <div className="mt-10 pt-3 border-t border-[#D6BCA5] text-[10px] text-center text-[#6e5543]">

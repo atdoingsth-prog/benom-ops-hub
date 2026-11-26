@@ -7,14 +7,17 @@ import {
   Bar, BarChart, CartesianGrid, ComposedChart, Legend, Line,
   ResponsiveContainer, Tooltip, XAxis, YAxis
 } from 'recharts';
-import { apiGet, apiSend, fmtMonth, fmtNum, fmtVnd } from '../api';
+import { apiGet, apiSend, AuthUser, fmtMonth, fmtNum, fmtVnd } from '../api';
 
 interface Props {
+  user: AuthUser;
   onToast: (msg: string, tone?: 'ok' | 'err') => void;
   onNavigate: (tab: string) => void;
 }
 
-export default function DashboardView({ onToast, onNavigate }: Props) {
+export default function DashboardView({ user, onToast, onNavigate }: Props) {
+  const canEdit = user.role === 'ADMIN' || user.role === 'EDITOR';
+  const canUploadErp = user.role === 'ADMIN';
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [showSlowAll, setShowSlowAll] = useState(false);
@@ -81,12 +84,14 @@ export default function DashboardView({ onToast, onNavigate }: Props) {
             Dữ liệu thực tế ERP 3001 ({fmtMonth(data.latest3001)}) • Kho 9005 Toàn Nhất ({fmtMonth(wh9005.target_month)}) • Điều phối & Hậu mãi
           </p>
         </div>
-        <button
-          onClick={() => onNavigate('warehouse')}
-          className="self-start sm:self-auto px-3.5 py-2 rounded-lg bg-[#3B281A] text-[#F8F4EC] text-xs font-semibold hover:bg-[#563C28] cursor-pointer"
-        >
-          + Nạp file ERP CSV / Toàn Nhất mới
-        </button>
+        {canEdit && (
+          <button
+            onClick={() => onNavigate('warehouse')}
+            className="self-start sm:self-auto px-3.5 py-2 rounded-lg bg-[#3B281A] text-[#F8F4EC] text-xs font-semibold hover:bg-[#563C28] cursor-pointer"
+          >
+            {canUploadErp ? '+ Nạp file ERP CSV / Toàn Nhất mới' : 'Mở Kho 9005 & Đối soát Toàn Nhất'}
+          </button>
+        )}
       </div>
 
       {/* KPI Grid */}
@@ -236,12 +241,14 @@ export default function DashboardView({ onToast, onNavigate }: Props) {
                       Store 3001: <strong className="text-[#9A2B26]">{it.stock_3001}</strong> • Kho 9005: <strong className="text-[#234E36]">{it.stock_9005}</strong> • Bán 3T: {it.sold_3m}
                     </div>
                   </div>
-                  <button
-                    onClick={() => handleQuickReplenish(it)}
-                    className="shrink-0 px-2.5 py-1.5 rounded-lg bg-[#224B85] text-white text-[11px] font-semibold hover:bg-[#1a3a68] cursor-pointer"
-                  >
-                    Tạo XK chuyển kho
-                  </button>
+                  {canEdit && (
+                    <button
+                      onClick={() => handleQuickReplenish(it)}
+                      className="shrink-0 px-2.5 py-1.5 rounded-lg bg-[#224B85] text-white text-[11px] font-semibold hover:bg-[#1a3a68] cursor-pointer"
+                    >
+                      Tạo XK chuyển kho
+                    </button>
+                  )}
                 </div>
               ))}
             </div>

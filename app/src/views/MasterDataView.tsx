@@ -1,12 +1,14 @@
 import React, { useEffect, useState } from 'react';
 import { BookOpen, Edit3, Package, Search, X } from 'lucide-react';
-import { apiGet, apiSend, fmtVnd } from '../api';
+import { apiGet, apiSend, AuthUser, fmtVnd } from '../api';
 
 interface Props {
+  user: AuthUser;
   onToast: (msg: string, tone?: 'ok' | 'err') => void;
 }
 
-export default function MasterDataView({ onToast }: Props) {
+export default function MasterDataView({ user, onToast }: Props) {
+  const canEditMaster = user.role === 'ADMIN';
   const [subTab, setSubTabState] = useState<'products' | 'guides'>(() =>
     (localStorage.getItem('benom_master_subtab') === 'guides' ? 'guides' : 'products')
   );
@@ -116,7 +118,7 @@ export default function MasterDataView({ onToast }: Props) {
                   <th className="py-2.5 px-2 text-right">P_Install</th>
                   <th className="py-2.5 px-2 text-center">Bảo hành</th>
                   <th className="py-2.5 px-2 text-center">Min 3001</th>
-                  <th className="py-2.5 px-2 text-center">Sửa</th>
+                  {canEditMaster && <th className="py-2.5 px-2 text-center">Sửa</th>}
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#F0E9DF]">
@@ -137,11 +139,13 @@ export default function MasterDataView({ onToast }: Props) {
                     <td className="py-2 px-2 text-right">{fmtVnd(p.p_installation)}</td>
                     <td className="py-2 px-2 text-center">{p.warranty_months ? `${p.warranty_months}T` : 'Không'}</td>
                     <td className="py-2 px-2 text-center font-semibold">{p.min_stock_3001}</td>
-                    <td className="py-2 px-2 text-center">
-                      <button onClick={() => setEditing({ ...p })} className="p-1 rounded hover:bg-[#EFE7DC] text-[#3B281A] cursor-pointer">
-                        <Edit3 className="w-3.5 h-3.5" />
-                      </button>
-                    </td>
+                    {canEditMaster && (
+                      <td className="py-2 px-2 text-center">
+                        <button onClick={() => setEditing({ ...p })} className="p-1 rounded hover:bg-[#EFE7DC] text-[#3B281A] cursor-pointer">
+                          <Edit3 className="w-3.5 h-3.5" />
+                        </button>
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>

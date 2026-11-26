@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'csv-parse/sync';
-import { getDb, DB_PATH } from './db.mjs';
+import { initDb, dbAll, dbGet, dbRun, dbBatch, DB_PATH, isCloudDb } from './db.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '../..'); // d:\Projects\benom operations SOP
@@ -59,27 +59,23 @@ function normalizeRegion(v) {
 function parseDateIso(v) {
   const s = String(v || '').trim();
   if (!s) return '';
-  // dd-Mon-yyyy e.g. 1-Oct-2026
   const mMon = s.match(/^(\d{1,2})[-/]([A-Za-z]{3})[-/](\d{2,4})$/);
   if (mMon) {
-    const months = { jan:'01', feb:'02', mar:'03', apr:'04', may:'05', jun:'06', jul:'07', aug:'08', sep:'09', oct:'10', nov:'11', dec:'12' };
+    const months = { jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06', jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12' };
     const mo = months[mMon[2].toLowerCase()];
     if (mo) {
       const yr = mMon[3].length === 2 ? '20' + mMon[3] : mMon[3];
       return `${yr}-${mo}-${mMon[1].padStart(2, '0')}`;
     }
   }
-  // dd/mm/yyyy
   const mSlash = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
   if (mSlash) {
     let a = parseInt(mSlash[1], 10);
     let b = parseInt(mSlash[2], 10);
     const yr = mSlash[3].length === 2 ? '20' + mSlash[3] : mSlash[3];
-    // Handle US mm/dd when b > 12
     if (b > 12 && a <= 12) { const tmp = a; a = b; b = tmp; }
     return `${yr}-${String(b).padStart(2, '0')}-${String(a).padStart(2, '0')}`;
   }
-  // yyyy-mm-dd
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
   return s;
 }
@@ -94,74 +90,117 @@ function warrantyMonthsFromText(txt) {
 function classifyPurpose(note) {
   const l = String(note || '').toLowerCase();
   if (l.includes('1001') || l.includes('pop') || l.includes('aeon')) return 'Moving Pop-up 1001';
-  if (l.includes('replenish') || l.includes('xuân') || l.includes('3001') && !/3001020\d+/.test(l)) return 'Replenish Store 3001';
+  if (l.includes('replenish') || l.includes('xuân') || (l.includes('3001') && !/3001020\d+/.test(l))) return 'Replenish Store 3001';
   if (l.includes('return') || l.includes('trả') || l.includes('supplier') || l.includes('lỗi')) return 'Trả NCC / QC';
   if (l.includes('#')) return 'Đơn Online / Web';
   return 'Giao khách';
 }
 
-export function runSeed(force = false) {
-  const db = getDb();
-  const existing = db.prepare('SELECT COUNT(*) as c FROM products').get().c;
+function buildKtvsJson(k1Code, k1Name, k2Code, k2Name) {
+  const arr = [];
+  if (k1Name || k1Code) arr.push({ code: k1Code || '', name: k1Name || '' });
+  if (k2Name || k2Code) arr.push({ code: k2Code || '', name: k2Name || '' });
+  return JSON.stringify(arr);
+}
+
+function fastCsvLine(line) {
+  if (!line.includes('"')) return line.split(',');
+  const out = [];
+  let cur = '', inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQ && line[i + 1] === '"') { cur += '"'; i++; }
+      else inQ = !inQ;
+    } else if (ch === ',' && !inQ) {
+      out.push(cur); cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+async function batchInsert(sql, rows, chunkSize = 100) {
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    const chunk = rows.slice(i, i + chunkSize).map(args => ({ sql, args }));
+    await dbBatch(chunk);
+  }
+}
+
+export async function runSeed(force = false, confirmCloudReset = false) {
+  await initDb();
+  const existingRow = await dbGet('SELECT COUNT(*) as c FROM products');
+  const existing = existingRow?.c || 0;
   if (existing > 0 && !force) {
-    console.log(`[Seed] Database already seeded (${existing} products). Skipping.`);
+    console.log(`[Seed] Database already seeded (${existing} products). Skipping. Pass --force to re-seed.`);
     return;
   }
+  if (force && isCloudDb() && !confirmCloudReset) {
+    throw new Error('[Seed Safety Guard] Refusing to --force wipe Turso Cloud DB without --confirm-cloud-reset flag!');
+  }
 
-  console.log('[Seed] Initializing Benom Operations Hub database from real data...');
+  console.log(`[Seed] Initializing Benom Operations Hub (${isCloudDb() ? 'Turso Cloud' : 'Local SQLite'}) from real data...`);
 
-  db.exec(`
-    DELETE FROM order_items; DELETE FROM orders;
-    DELETE FROM warehouse_slip_items; DELETE FROM warehouse_slips;
-    DELETE FROM handovers; DELETE FROM warranty_tickets;
-    DELETE FROM qc_factory_returns; DELETE FROM erp_snapshots;
-    DELETE FROM support_logs; DELETE FROM product_guides;
-    DELETE FROM products; DELETE FROM staff; DELETE FROM warehouses; DELETE FROM partners;
-  `);
+  const clearTables = [
+    'order_items', 'orders',
+    'warehouse_slip_items', 'warehouse_slips',
+    'handovers', 'warranty_tickets',
+    'qc_factory_returns', 'erp_snapshots',
+    'support_logs', 'product_guides',
+    'products', 'staff', 'warehouses', 'partners',
+  ];
+  await dbBatch(clearTables.map(t => ({ sql: `DELETE FROM ${t}`, args: [] })));
 
   // 1. WAREHOUSES
-  const insWh = db.prepare(`INSERT OR REPLACE INTO warehouses VALUES (?,?,?,?,?,?)`);
-  [
-    ['3001', 'Store 3001 — Parkson Lê Thánh Tôn', 'Store', 'Tầng 3, 35-45 Lê Thánh Tôn, P. Sài Gòn, TP.HCM', 140, 0],
-    ['9005', 'DC 9005 — Toàn Nhất Logistics (BD02)', '3PL Warehouse', 'Số 10 Đại lộ Độc Lập, KCN Sóng Thần 1, Dĩ An', 300, 32700000],
-    ['1001', 'Pop-up Store 1001 — Aeon Mall Bình Tân', 'Pop-up', 'Lô G64-G65, Tầng trệt, Aeon Mall Bình Tân, TP.HCM', 90, 0],
-    ['PCS', 'Kho PCS', 'Transit', 'TP.HCM', 0, 0],
-  ].forEach(r => insWh.run(...r));
+  await batchInsert(
+    `INSERT OR REPLACE INTO warehouses (code, name, type, address, capacity_m2, monthly_fee_vnd) VALUES (?,?,?,?,?,?)`,
+    [
+      ['3001', 'Store 3001 — Parkson Lê Thánh Tôn', 'Store', 'Tầng 3, 35-45 Lê Thánh Tôn, P. Sài Gòn, TP.HCM', 140, 0],
+      ['9005', 'DC 9005 — Toàn Nhất Logistics (BD02)', '3PL Warehouse', 'Số 10 Đại lộ Độc Lập, KCN Sóng Thần 1, Dĩ An', 300, 32700000],
+      ['1001', 'Pop-up Store 1001 — Aeon Mall Bình Tân', 'Pop-up', 'Lô G64-G65, Tầng trệt, Aeon Mall Bình Tân, TP.HCM', 90, 0],
+      ['PCS', 'Kho PCS', 'Transit', 'TP.HCM', 0, 0],
+    ]
+  );
 
   // 2. STAFF
-  const insStaff = db.prepare(`INSERT OR REPLACE INTO staff VALUES (?,?,?,?,?,?,1)`);
-  [
-    ['260135', 'Trần Anh Tuyến', 'OPT AM / SC Coordinator', 'Operations', '', 'tuyen.tran@kohnanvn.com'],
-    ['260107', 'Nguyễn Huy Hoàng Tuấn', 'KTV Lắp đặt / Sales', 'Operations / Sales', '', ''],
-    ['250182', 'Đặng Phương Nam', 'Hỗ trợ lắp đặt / Sales', 'Sales', '', ''],
-    ['260199', 'Trương Văn Tính', 'Hỗ trợ lắp đặt / Sales', 'Sales', '', ''],
-    ['260001', 'Trần Thị Quỳnh Nhi', 'Department Manager', 'Management', '0903684778', 'nhi.tran@kohnanvn.com'],
-    ['260010', 'Bùi Phạm Thanh Xuân', 'Sales Senior / ASM', 'Sales', '', 'xuan.bui@kohnanvn.com'],
-    ['260011', 'Trần Hoàng Gia Uyên', 'Operations Support', 'Operations', '', 'uyennhi.tran@kohnanvn.com'],
-    ['260020', 'Huỳnh Thị Đương Thời', 'Sales Staff', 'Sales', '', ''],
-    ['260021', 'Đỗ Huỳnh Bích Ngọc', 'Sales Staff', 'Sales', '', ''],
-    ['260022', 'Trần Thái Khang', 'Hỗ trợ lắp đặt / Sales', 'Sales', '', ''],
-  ].forEach(r => insStaff.run(...r));
+  await batchInsert(
+    `INSERT OR REPLACE INTO staff (emp_code, full_name, role, department, phone, email, active) VALUES (?,?,?,?,?,?,1)`,
+    [
+      ['260135', 'Trần Anh Tuyến', 'OPT AM / SC Coordinator', 'Operations', '', 'tuyen.tran@kohnanvn.com'],
+      ['260107', 'Nguyễn Huy Hoàng Tuấn', 'KTV Lắp đặt / Sales', 'Operations / Sales', '', ''],
+      ['250182', 'Đặng Phương Nam', 'Hỗ trợ lắp đặt / Sales', 'Sales', '', ''],
+      ['260199', 'Trương Văn Tính', 'Hỗ trợ lắp đặt / Sales', 'Sales', '', ''],
+      ['260001', 'Trần Thị Quỳnh Nhi', 'Department Manager', 'Management', '0903684778', 'nhi.tran@kohnanvn.com'],
+      ['260010', 'Bùi Phạm Thanh Xuân', 'Sales Senior / ASM', 'Sales', '', 'xuan.bui@kohnanvn.com'],
+      ['260011', 'Trần Hoàng Gia Uyên', 'Operations Support', 'Operations', '', 'uyennhi.tran@kohnanvn.com'],
+      ['260020', 'Huỳnh Thị Đương Thời', 'Sales Staff', 'Sales', '', ''],
+      ['260021', 'Đỗ Huỳnh Bích Ngọc', 'Sales Staff', 'Sales', '', ''],
+      ['260022', 'Trần Thái Khang', 'Hỗ trợ lắp đặt / Sales', 'Sales', '', ''],
+    ]
+  );
 
   // 3. PARTNERS (Suppliers + Carriers)
-  const insPartner = db.prepare(`INSERT OR REPLACE INTO partners VALUES (?,?,?,?,?)`);
+  const partnerRows = [];
   const supRows = readCsv(path.join(IMPORTED, 'Automatic_Inventory 9005 - Supplier.csv'), { columns: true });
   let supIdx = 1;
   for (const r of supRows) {
     const code = (r['SUPPLIER CODE'] || '').trim() || `SUP-${supIdx++}`;
     const name = (r['SUPPLIER NAME'] || '').trim();
     if (!name) continue;
-    insPartner.run(code, name, (r['TYPE'] || 'TRADING').trim(), (r['CATEGORY'] || '').trim(), '');
+    partnerRows.push([code, name, (r['TYPE'] || 'TRADING').trim(), (r['CATEGORY'] || '').trim(), '']);
   }
-  [
+  partnerRows.push(
     ['3PL-TN', 'Toàn Nhất Logistics (BD02)', '3PL', 'Kho tổng 9005 Sóng Thần 1', 'nam.nguyen@toannhat.com; tuan.ngo@toannhat.com'],
     ['CAR-AHA', 'Ahamove', 'CARRIER', 'Giao nội thành HCM & xe tải', 'BUSINESS_ACCOUNT'],
     ['CAR-XSM', 'Xanh SM', 'CARRIER', 'Giao hàng nhỏ gọn nội thành', ''],
     ['CAR-247', '247 Express', 'CARRIER', 'Giao liên tỉnh hàng nhỏ/vừa', ''],
     ['CAR-SGW', 'Sagawa', 'CARRIER', 'Giao liên tỉnh (cũ)', 'Mã KH: 0233805'],
     ['CAR-NTL', 'Nhất Tín Logistics', 'CARRIER', 'Pilot Q4 hàng cồng kềnh đi tỉnh', ''],
-    ['CAR-BN', 'Kỹ thuật Benom', 'CARRIER', 'Giao lắp trực tiếp nội bộ', 'service.benom@kohnanvn.com'],
-  ].forEach(r => insPartner.run(...r));
+    ['CAR-BN', 'Kỹ thuật Benom', 'CARRIER', 'Giao lắp trực tiếp nội bộ', 'service.benom@kohnanvn.com']
+  );
+  await batchInsert(`INSERT OR REPLACE INTO partners (code, name, partner_type, category, contact_info) VALUES (?,?,?,?,?)`, partnerRows);
 
   // 4. UNIFIED PRODUCTS MASTER
   const productMap = new Map();
@@ -186,9 +225,7 @@ export function runSeed(force = false) {
     productMap.set(cleanBc, cur);
   };
 
-  // 4a. product_master.csv
-  const pmRows = readCsv(path.join(DATA, 'product_master.csv'), { columns: true });
-  for (const r of pmRows) {
+  for (const r of readCsv(path.join(DATA, 'product_master.csv'), { columns: true })) {
     const bc = r['Barcode'] || r['BARCODE'] || Object.values(r)[0];
     if (!bc || String(bc).toLowerCase().includes('barcode')) continue;
     const wp = r['Chính sách bảo hành'] || r['Warranty Policy'] || 'Không bảo hành';
@@ -213,9 +250,7 @@ export function runSeed(force = false) {
     });
   }
 
-  // 4b. nk_sheet/Product_list.csv (Cost + BN-* items)
-  const plRows = readCsv(path.join(DATA, 'nk_sheet', 'Product_list.csv'), { columns: true });
-  for (const r of plRows) {
+  for (const r of readCsv(path.join(DATA, 'nk_sheet', 'Product_list.csv'), { columns: true })) {
     const bc = r['Barcode'] || r['BARCODE'];
     if (!bc) continue;
     upsertProd(bc, {
@@ -226,15 +261,12 @@ export function runSeed(force = false) {
     });
   }
 
-  // 4c. Master_SKU_Allowance.csv (P_Handling, P_Installation, Net Weight)
-  const alRows = readCsv(path.join(DATA, 'allowance_sheet', 'Master_SKU_Allowance.csv'), { columns: true });
-  for (const r of alRows) {
+  for (const r of readCsv(path.join(DATA, 'allowance_sheet', 'Master_SKU_Allowance.csv'), { columns: true })) {
     const bc = r['Barcode'];
     if (!bc) continue;
     const ph = num(r['Phụ Cấp Khuân Vác (VND)\nP_Handling'] ?? r['Phụ Cấp Khuân Vác (VND) P_Handling']);
     const pi = num(r['Phụ Cấp Lắp Đặt (VND)\nP_Installation'] ?? r['Phụ Cấp Lắp Đặt (VND) P_Installation']);
     const il = (r['Mức độ Lắp đặt\n(Installation Level)'] || r['Mức độ Lắp đặt (Installation Level)'] || 'No').trim();
-    const cur = productMap.get(String(bc).trim());
     upsertProd(bc, {
       supplier_code: r['Partner Code'] || '',
       supplier_name: r['Partner Name'] || '',
@@ -248,7 +280,6 @@ export function runSeed(force = false) {
       net_weight_g: num(r['Net Weight\n(g)']),
       install_level: il,
     });
-    // Explicitly set exact P_Handling & P_Installation (including 0)
     const p = productMap.get(String(bc).trim());
     if (p) {
       p.p_handling = ph;
@@ -256,13 +287,10 @@ export function runSeed(force = false) {
     }
   }
 
-  // 4d. Automatic_Inventory 9005 - Master_Data.csv (Box dims & Max Stack)
-  const invMdRows = readCsv(path.join(IMPORTED, 'Automatic_Inventory 9005 - Master_Data.csv'), { columns: true });
-  for (const r of invMdRows) {
+  for (const r of readCsv(path.join(IMPORTED, 'Automatic_Inventory 9005 - Master_Data.csv'), { columns: true })) {
     const bc = r['Barcode'];
     if (!bc) continue;
-    const msRaw = r['Max Stack\n(Maximum Stacking Layer)'] || r['Max Stack'];
-    const ms = num(msRaw) || 1;
+    const ms = num(r['Max Stack\n(Maximum Stacking Layer)'] || r['Max Stack']) || 1;
     upsertProd(bc, {
       name_vn: r['Product Name'] || bc,
       supplier_code: r['Supplier Code'] || '',
@@ -277,7 +305,6 @@ export function runSeed(force = false) {
     });
   }
 
-  // 4e. Service/Fee SKUs & BN-* from danhmuc.csv
   const dmRows = readCsv(path.join(DATA, 'danh_muc', 'danhmuc.csv'));
   for (let i = 1; i < dmRows.length; i++) {
     const [bc, name] = dmRows[i];
@@ -295,29 +322,27 @@ export function runSeed(force = false) {
     }
   }
 
-  const insProd = db.prepare(`
-    INSERT INTO products (
+  await batchInsert(
+    `INSERT INTO products (
       barcode, sku, name_vn, name_en, category, product_family, item_type,
       supplier_code, supplier_name, retail_price, cost_price, unit,
       length_mm, width_mm, height_mm, net_weight_g,
       box_w_cm, box_d_cm, box_h_cm, qty_per_pcs, qty_per_box, max_stack,
       p_handling, install_level, p_installation,
       warranty_policy, warranty_months, has_hdlr, has_hdbq, min_stock_3001, is_top_50, status
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-  `);
-  for (const p of productMap.values()) {
-    insProd.run(
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    Array.from(productMap.values()).map(p => [
       p.barcode, p.sku, p.name_vn, p.name_en, p.category, p.product_family, p.item_type,
       p.supplier_code, p.supplier_name, p.retail_price, p.cost_price, p.unit,
       p.length_mm, p.width_mm, p.height_mm, p.net_weight_g,
       p.box_w_cm, p.box_d_cm, p.box_h_cm, p.qty_per_pcs, p.qty_per_box, p.max_stack,
       p.p_handling, p.install_level, p.p_installation,
-      p.warranty_policy, p.warranty_months, p.has_hdlr, p.has_hdbq, p.min_stock_3001, p.is_top_50, p.status
-    );
-  }
+      p.warranty_policy, p.warranty_months, p.has_hdlr, p.has_hdbq, p.min_stock_3001, p.is_top_50, p.status,
+    ])
+  );
   console.log(`[Seed] Products: ${productMap.size}`);
 
-  // 5. ORDERS & ORDER ITEMS from shipments_tracking.csv (header is on line 4 / index 3)
+  // 5. ORDERS & ORDER ITEMS from shipments_tracking.csv
   const shipRaw = readCsv(path.join(DATA, 'shipments_tracking.csv'));
   const shipHeaderIdx = shipRaw.findIndex(r => r.some(c => String(c || '').includes('Mã hoá đơn')));
   const shipHeaders = shipHeaderIdx >= 0 ? shipRaw[shipHeaderIdx] : [];
@@ -328,6 +353,7 @@ export function runSeed(force = false) {
         return obj;
       })
     : [];
+
   const orderGroups = new Map();
   let autoInvIdx = 1;
   for (const r of shipRows) {
@@ -341,6 +367,8 @@ export function runSeed(force = false) {
       let ktv2Code = String(r['Mã Nhân Viên 2'] || '').replace(/[^\d]/g, '');
       if (ktv1Code === '260153') ktv1Code = '260135';
       if (ktv2Code === '260153') ktv2Code = '260135';
+      const ktv1Name = (r['Kỹ thuật viên \nphụ trách 1'] || r['Kỹ thuật viên phụ trách 1'] || '').trim();
+      const ktv2Name = (r['Kỹ thuật viên phụ trách 2'] || '').trim();
       const note = (r['Note for sales'] || r['Ghi chú'] || '').trim();
       const addr = (r['Địa chỉ giao hàng'] || '').trim();
       const isStairs = /thang bộ|khiêng bộ|lầu bộ|không có thang máy/i.test(addr + ' ' + note) ? 1 : 0;
@@ -364,10 +392,11 @@ export function runSeed(force = false) {
         is_promo_free_ship: /free|miễn phí/i.test(note) ? 1 : 0,
         require_install: String(r['Yêu cầu lắp đặt'] || '').toLowerCase().includes('có') ? 1 : 0,
         is_stairs: isStairs,
-        ktv1_name: (r['Kỹ thuật viên \nphụ trách 1'] || r['Kỹ thuật viên phụ trách 1'] || '').trim(),
+        ktv1_name: ktv1Name,
         ktv1_code: ktv1Code,
-        ktv2_name: (r['Kỹ thuật viên phụ trách 2'] || '').trim(),
+        ktv2_name: ktv2Name,
         ktv2_code: ktv2Code,
+        ktvs_json: buildKtvsJson(ktv1Code, ktv1Name, ktv2Code, ktv2Name),
         status: (r['Trạng thái'] || 'Done').trim() || 'New',
         install_status: (r['Trạng thái\nlắp đặt (BM-01)'] || '').trim(),
         notes: note,
@@ -376,7 +405,6 @@ export function runSeed(force = false) {
       });
     }
     const og = orderGroups.get(inv);
-    // accumulate shipping fee if first row had 0
     if (og.shipping_fee_3pl === 0 && num(r['Chi phí vận chuyển']) > 0) {
       og.shipping_fee_3pl = num(r['Chi phí vận chuyển']);
     }
@@ -410,63 +438,49 @@ export function runSeed(force = false) {
     }
   }
 
-  const insOrder = db.prepare(`
-    INSERT INTO orders (
-      invoice_no, order_date, delivery_date, customer_name, customer_phone, address, region,
-      distance_km, carrier, tracking_no, source_warehouse, moving_no, pic_sales, channel,
-      shipping_fee_3pl, customer_paid_fee, is_promo_free_ship, require_install, is_stairs,
-      ktv1_name, ktv1_code, ktv2_name, ktv2_code, status, install_status, notes
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-  `);
-  const insItem = db.prepare(`
-    INSERT INTO order_items (
-      order_id, barcode, product_name, unit, qty, net_weight_g,
-      warranty_months, warranty_policy, p_handling_unit, p_installation_unit
-    ) VALUES (?,?,?,?,?,?,?,?,?,?)
-  `);
-  const insTicket = db.prepare(`
-    INSERT OR IGNORE INTO warranty_tickets (
-      ticket_no, invoice_no, customer_name, customer_phone, address, barcode, product_name,
-      channel, issue_desc, service_level, is_in_warranty, ktv_assigned, status
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-  `);
-
   let orderCount = 0;
   let itemCount = 0;
   const orderIdByInv = new Map();
+  const orderItemRows = [];
+  const ticketRows = [];
+
   for (const og of orderGroups.values()) {
-    const res = insOrder.run(
-      og.invoice_no, og.order_date, og.delivery_date, og.customer_name, og.customer_phone, og.address, og.region,
-      og.distance_km, og.carrier, og.tracking_no, og.source_warehouse, og.moving_no, og.pic_sales, og.channel,
-      og.shipping_fee_3pl, og.customer_paid_fee, og.is_promo_free_ship, og.require_install, og.is_stairs,
-      og.ktv1_name, og.ktv1_code, og.ktv2_name, og.ktv2_code, og.status, og.install_status, og.notes
+    const res = await dbRun(
+      `INSERT INTO orders (
+        invoice_no, order_date, delivery_date, customer_name, customer_phone, address, region,
+        distance_km, carrier, tracking_no, source_warehouse, moving_no, pic_sales, channel,
+        shipping_fee_3pl, customer_paid_fee, is_promo_free_ship, require_install, is_stairs,
+        ktv1_name, ktv1_code, ktv2_name, ktv2_code, ktvs_json, status, install_status, notes
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        og.invoice_no, og.order_date, og.delivery_date, og.customer_name, og.customer_phone, og.address, og.region,
+        og.distance_km, og.carrier, og.tracking_no, og.source_warehouse, og.moving_no, og.pic_sales, og.channel,
+        og.shipping_fee_3pl, og.customer_paid_fee, og.is_promo_free_ship, og.require_install, og.is_stairs,
+        og.ktv1_name, og.ktv1_code, og.ktv2_name, og.ktv2_code, og.ktvs_json, og.status, og.install_status, og.notes,
+      ]
     );
-    const oid = Number(res.lastInsertRowid);
+    const oid = res.lastInsertRowid;
     orderIdByInv.set(og.invoice_no, oid);
     orderCount++;
     for (const it of og.items) {
-      insItem.run(oid, it.barcode, it.product_name, it.unit, it.qty, it.net_weight_g, it.warranty_months, it.warranty_policy, it.p_handling_unit, it.p_installation_unit);
+      orderItemRows.push([oid, it.barcode, it.product_name, it.unit, it.qty, it.net_weight_g, it.warranty_months, it.warranty_policy, it.p_handling_unit, it.p_installation_unit]);
       itemCount++;
     }
     for (const tk of og.tickets) {
-      insTicket.run(tk.ticket_no, tk.invoice_no, tk.customer_name, tk.customer_phone, tk.address, tk.barcode, tk.product_name, 'Zalo OA', 'Sự cố bảo hành lịch sử (Shipments)', tk.service_level, 1, 'Trần Anh Tuyến', tk.status);
+      ticketRows.push([tk.ticket_no, tk.invoice_no, tk.customer_name, tk.customer_phone, tk.address, tk.barcode, tk.product_name, 'Zalo OA', 'Sự cố bảo hành lịch sử (Shipments)', tk.service_level, 1, 'Trần Anh Tuyến', tk.status]);
     }
   }
+  await batchInsert(
+    `INSERT INTO order_items (order_id, barcode, product_name, unit, qty, net_weight_g, warranty_months, warranty_policy, p_handling_unit, p_installation_unit) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    orderItemRows
+  );
+  await batchInsert(
+    `INSERT OR IGNORE INTO warranty_tickets (ticket_no, invoice_no, customer_name, customer_phone, address, barcode, product_name, channel, issue_desc, service_level, is_in_warranty, ktv_assigned, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    ticketRows
+  );
   console.log(`[Seed] Orders: ${orderCount} (${itemCount} items)`);
 
   // 6. WAREHOUSE SLIPS (NK & XK)
-  const insSlip = db.prepare(`
-    INSERT OR IGNORE INTO warehouse_slips (
-      slip_no, slip_type, slip_date, expected_date, expected_time, created_by,
-      partner_code, partner_name, carrier, warehouse_code, purpose, ref_invoice, ref_po, status, notes
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-  `);
-  const insSlipItem = db.prepare(`
-    INSERT INTO warehouse_slip_items (slip_id, barcode, product_name, unit, qty, actual_qty, note)
-    VALUES (?,?,?,?,?,?,?)
-  `);
-
-  // 6a. NK (PHIEU_DATA_NK.csv - remember shifted header: col0=Số phiếu, col1=Ngày, col2=Người lập, col3=Mã NCC, col4=Tên NCC, col5=Đơn vị nhập, col6=Giờ, col7=Ghi chú, col8=Barcode, col9=Tên SP, col10=ĐVT, col11=SL)
   const nkRaw = readCsv(path.join(DATA, 'nk_sheet', 'PHIEU_DATA_NK.csv'));
   const nkGroups = new Map();
   for (let i = 2; i < nkRaw.length; i++) {
@@ -501,13 +515,17 @@ export function runSeed(force = false) {
       qty: num(r[11]) || 1,
     });
   }
+
+  const slipItemRows = [];
   for (const g of nkGroups.values()) {
-    const res = insSlip.run(g.slip_no, 'NK', g.slip_date, g.slip_date, g.expected_time, g.created_by, g.partner_code, g.partner_name, g.carrier, '9005', g.purpose, g.ref_invoice, g.ref_po, g.status, g.notes);
-    const sid = Number(res.lastInsertRowid);
-    if (sid) g.items.forEach(it => insSlipItem.run(sid, it.barcode, it.product_name, it.unit, it.qty, it.qty, ''));
+    const res = await dbRun(
+      `INSERT OR IGNORE INTO warehouse_slips (slip_no, slip_type, slip_date, expected_date, expected_time, created_by, partner_code, partner_name, carrier, warehouse_code, purpose, ref_invoice, ref_po, status, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [g.slip_no, 'NK', g.slip_date, g.slip_date, g.expected_time, g.created_by, g.partner_code, g.partner_name, g.carrier, '9005', g.purpose, g.ref_invoice, g.ref_po, g.status, g.notes]
+    );
+    const sid = res.lastInsertRowid;
+    if (sid) g.items.forEach(it => slipItemRows.push([sid, it.barcode, it.product_name, it.unit, it.qty, it.qty, '']));
   }
 
-  // 6b. XK (PHIEU_DATA.csv)
   const xkRaw = readCsv(path.join(DATA, 'xk_sheet', 'PHIEU_DATA.csv'));
   const xkGroups = new Map();
   for (let i = 2; i < xkRaw.length; i++) {
@@ -539,82 +557,73 @@ export function runSeed(force = false) {
     });
   }
   for (const g of xkGroups.values()) {
-    const res = insSlip.run(g.slip_no, 'XK', g.slip_date, g.expected_date, g.expected_time, g.created_by, '', 'Toàn Nhất Logistics', g.carrier, '9005', g.purpose, g.ref_invoice, '', g.status, g.notes);
-    const sid = Number(res.lastInsertRowid);
-    if (sid) g.items.forEach(it => insSlipItem.run(sid, it.barcode, it.product_name, it.unit, it.qty, it.qty, ''));
+    const res = await dbRun(
+      `INSERT OR IGNORE INTO warehouse_slips (slip_no, slip_type, slip_date, expected_date, expected_time, created_by, partner_code, partner_name, carrier, warehouse_code, purpose, ref_invoice, ref_po, status, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [g.slip_no, 'XK', g.slip_date, g.expected_date, g.expected_time, g.created_by, '', 'Toàn Nhất Logistics', g.carrier, '9005', g.purpose, g.ref_invoice, '', g.status, g.notes]
+    );
+    const sid = res.lastInsertRowid;
+    if (sid) g.items.forEach(it => slipItemRows.push([sid, it.barcode, it.product_name, it.unit, it.qty, it.qty, '']));
   }
+  await batchInsert(
+    `INSERT INTO warehouse_slip_items (slip_id, barcode, product_name, unit, qty, actual_qty, note) VALUES (?,?,?,?,?,?,?)`,
+    slipItemRows
+  );
   console.log(`[Seed] Warehouse slips: ${nkGroups.size} NK, ${xkGroups.size} XK`);
 
   // 7. HANDOVERS (BM-01 from BIEN_BAN_DATA.csv)
   const bmRaw = readCsv(path.join(DATA, 'bm01_sheet', 'BIEN_BAN_DATA.csv'));
-  const insHo = db.prepare(`
-    INSERT OR IGNORE INTO handovers (
-      doc_no, doc_type, order_id, invoice_no, handover_date, warehouse_code,
-      customer_name, customer_phone, address, carrier, install_mode,
-      ktv1_name, ktv1_code, ktv2_name, ktv2_code, csat_rating, status
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-  `);
   const seenBm = new Set();
+  const hoRows = [];
   for (let i = 2; i < bmRaw.length; i++) {
     const r = bmRaw[i];
     const docNo = (r[0] || '').trim();
     if (!docNo || !docNo.startsWith('BB-') || seenBm.has(docNo)) continue;
     seenBm.add(docNo);
     const inv = (r[1] || '').trim();
-    insHo.run(
+    const k1Name = (r[9] || '').trim(), k1Code = (r[10] || '').trim();
+    const k2Name = (r[11] || '').trim(), k2Code = (r[12] || '').trim();
+    hoRows.push([
       docNo, 'BM-01', orderIdByInv.get(inv) || null, inv, parseDateIso(r[2]), (r[3] || 'DC 9005').replace('DC ', '').trim(),
       (r[4] || '').trim(), cleanPhone(r[5]), (r[6] || '').trim(), normalizeCarrier(r[7]), (r[8] || 'Kỹ thuật Benom').trim(),
-      (r[9] || '').trim(), (r[10] || '').trim(), (r[11] || '').trim(), (r[12] || '').trim(), 5, 'Completed'
-    );
+      k1Name, k1Code, k2Name, k2Code, buildKtvsJson(k1Code, k1Name, k2Code, k2Name), 5, 'Completed',
+    ]);
   }
+  await batchInsert(
+    `INSERT OR IGNORE INTO handovers (
+      doc_no, doc_type, order_id, invoice_no, handover_date, warehouse_code,
+      customer_name, customer_phone, address, carrier, install_mode,
+      ktv1_name, ktv1_code, ktv2_name, ktv2_code, ktvs_json, csat_rating, status
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    hoRows
+  );
   console.log(`[Seed] Handovers (BM-01): ${seenBm.size}`);
 
-  // 8. QC FACTORY RETURNS (Slide 6 of benom leader 19/11/2026)
-  const insQc = db.prepare(`
-    INSERT INTO qc_factory_returns (supplier_name, barcode, product_name, issue, defective_qty, sold_qty, stock_qty, defect_rate, action, est_out, est_in, status)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-  `);
-  [
-    ['ELEK', '8935273401013', 'Đèn Elia', 'Broken shade', 1, 2, 51, 1.9, 'Replace shade', '16/11', '17/11', 'Returned'],
-    ['ELEK', '8935273400993', 'Đèn Livia Đỏ', 'Broken + tilted', 2, 9, 37, 4.3, 'Exchange new', '16/11', '17/11', 'Returned'],
-    ['HIỂU ĐỨC', '8935382601229', 'Kệ Claro Xanh Đen', 'Misaligned holes', 1, 1, 0, 100.0, 'Back to factory', '10/11', 'TBU', 'Sent'],
-    ['SAVIMEX', '8935273401143', 'Kệ Keepsake 5 Tự Nhiên', 'No screw holes', 1, 1, 24, 4.0, 'Back to factory', 'TBU', 'TBU', 'Open'],
-    ['SAVIMEX', '8935273401501', 'Sofa Murest 2M2', 'Missing middle leg', 1, 0, 5, 20.0, 'Back to factory', 'TBU', 'TBU', 'Open'],
-    ['SAVIMEX', '8935273401525', 'Đôn Murest', 'Dented cushion', 1, 0, 11, 9.1, 'Back to factory', 'TBU', 'TBU', 'Open'],
-    ['CABAY', '8935273400849', 'Mâm Harmin Gỗ Nâu', 'Cracked, no feet', 2, 9, 87, 2.1, 'Back to Sala office', '16/11', 'TBU', 'Sent'],
-    ['HIỂU ĐỨC', '8935273455047', 'Kệ Treo Nolyn Xanh Đen', 'Scratch marks (38%)', 19, 3, 47, 38.0, 'Back to factory', '16/11', 'TBU', 'Sent'],
-    ['HIỂU ĐỨC', '8935382601113', 'Bàn Ăn Noma Tự Nhiên', 'Turntable raised', 1, 0, 14, 7.1, 'Back to factory', '16/11', 'TBU', 'Sent'],
-  ].forEach(r => insQc.run(...r));
+  // 8. QC FACTORY RETURNS
+  await batchInsert(
+    `INSERT INTO qc_factory_returns (supplier_name, barcode, product_name, issue, defective_qty, sold_qty, stock_qty, defect_rate, action, est_out, est_in, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      ['ELEK', '8935273401013', 'Đèn Elia', 'Broken shade', 1, 2, 51, 1.9, 'Replace shade', '16/11', '17/11', 'Returned'],
+      ['ELEK', '8935273400993', 'Đèn Livia Đỏ', 'Broken + tilted', 2, 9, 37, 4.3, 'Exchange new', '16/11', '17/11', 'Returned'],
+      ['HIỂU ĐỨC', '8935382601229', 'Kệ Claro Xanh Đen', 'Misaligned holes', 1, 1, 0, 100.0, 'Back to factory', '10/11', 'TBU', 'Sent to Factory'],
+      ['SAVIMEX', '8935273401143', 'Kệ Keepsake 5 Tự Nhiên', 'No screw holes', 1, 1, 24, 4.0, 'Back to factory', 'TBU', 'TBU', 'Open'],
+      ['SAVIMEX', '8935273401501', 'Sofa Murest 2M2', 'Missing middle leg', 1, 0, 5, 20.0, 'Back to factory', 'TBU', 'TBU', 'Open'],
+      ['SAVIMEX', '8935273401525', 'Đôn Murest', 'Dented cushion', 1, 0, 11, 9.1, 'Back to factory', 'TBU', 'TBU', 'Open'],
+      ['CABAY', '8935273400849', 'Mâm Harmin Gỗ Nâu', 'Cracked, no feet', 2, 9, 87, 2.1, 'Back to Sala office', '16/11', 'TBU', 'Sent to Factory'],
+      ['HIỂU ĐỨC', '8935273455047', 'Kệ Treo Nolyn Xanh Đen', 'Scratch marks (38%)', 19, 3, 47, 38.0, 'Back to factory', '16/11', 'TBU', 'Sent to Factory'],
+      ['HIỂU ĐỨC', '8935382601113', 'Bàn Ăn Noma Tự Nhiên', 'Turntable raised', 1, 0, 14, 7.1, 'Back to factory', '16/11', 'TBU', 'Sent to Factory'],
+    ]
+  );
 
-  // 9. ERP SNAPSHOTS (DC 9005 T11.2026 + Store 3001 T1-T11.2026, active Benom rows only!)
-  const insErp = db.prepare(`
+  // 9. ERP SNAPSHOTS
+  const erpInsertSql = `
     INSERT INTO erp_snapshots (
       target_month, store_code, barcode, product_name, supplier_code,
       open_qty, income_qty, sales_qty, sales_amt, cogs,
       movement_qty, return_qty, adj_qty, close_qty, close_cst, loss_qty
     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-  `);
+  `;
 
-  function fastCsvLine(line) {
-    if (!line.includes('"')) return line.split(',');
-    const out = [];
-    let cur = '', inQ = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (ch === '"') {
-        if (inQ && line[i + 1] === '"') { cur += '"'; i++; }
-        else inQ = !inQ;
-      } else if (ch === ',' && !inQ) {
-        out.push(cur); cur = '';
-      } else {
-        cur += ch;
-      }
-    }
-    out.push(cur);
-    return out;
-  }
-
-  function ingestErpFile(filePath, overrideMonth = null) {
+  async function ingestErpFile(filePath, overrideMonth = null) {
     if (!fs.existsSync(filePath)) return 0;
     const raw = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
     const lines = raw.split(/\r?\n/);
@@ -623,8 +632,7 @@ export function runSeed(force = false) {
     const idx = {};
     headers.forEach((h, i) => { idx[h.trim()] = i; });
 
-    let inserted = 0;
-    db.exec('BEGIN');
+    const rows = [];
     for (let li = 1; li < lines.length; li++) {
       const line = lines[li];
       if (!line) continue;
@@ -638,7 +646,7 @@ export function runSeed(force = false) {
       const mq = num(row[idx['Movement Qty']]);
       if (oq === 0 && iq === 0 && sq === 0 && sa === 0 && cq === 0 && mq === 0) continue;
 
-      insErp.run(
+      rows.push([
         overrideMonth || (row[idx['Target Month']] || '').trim(),
         (row[idx['Store Code']] || '').trim(),
         (row[idx['Barcode']] || '').trim(),
@@ -646,15 +654,14 @@ export function runSeed(force = false) {
         (row[idx['Supplier Code']] || '').trim(),
         oq, iq, sq, sa, num(row[idx['COGS']]),
         mq, num(row[idx['Return Qty']]), num(row[idx['Adj Qty']]),
-        cq, num(row[idx['Close Cst']]), num(row[idx['Loss Qty']])
-      );
-      inserted++;
+        cq, num(row[idx['Close Cst']]), num(row[idx['Loss Qty']]),
+      ]);
     }
-    db.exec('COMMIT');
-    return inserted;
+    await batchInsert(erpInsertSql, rows, 150);
+    return rows.length;
   }
 
-  const cnt9005 = ingestErpFile(path.join(IMPORTED, 'Automatic_Inventory 9005 - Raw_ERP.csv'), '202611');
+  const cnt9005 = await ingestErpFile(path.join(IMPORTED, 'Automatic_Inventory 9005 - Raw_ERP.csv'), '202611');
   let cnt3001 = 0;
   const inv3001Dir = path.join(DATA, 'inventory 3001');
   if (fs.existsSync(inv3001Dir)) {
@@ -662,47 +669,56 @@ export function runSeed(force = false) {
     for (const f of invFiles) {
       const m = f.match(/_T(\d+)[._]2026\.csv$/);
       const ym = m ? `2026${m[1].padStart(2, '0')}` : null;
-      cnt3001 += ingestErpFile(path.join(inv3001Dir, f), ym);
+      cnt3001 += await ingestErpFile(path.join(inv3001Dir, f), ym);
     }
   }
-  console.log(`[Seed] ERP snapshots: 9005=${cnt9005} rows, 3001 (11 months)=${cnt3001} rows`);
+  console.log(`[Seed] ERP snapshots: 9005=${cnt9005} rows, 3001=${cnt3001} rows`);
 
-  // Mark Top 50 SKUs by 2026 Store 3001 revenue
-  const top50 = db.prepare(`
+  // Mark Top 50 SKUs by Store 3001 revenue
+  const top50 = await dbAll(`
     SELECT barcode FROM erp_snapshots
     WHERE store_code = '3001' AND sales_amt > 0
     GROUP BY barcode ORDER BY SUM(sales_amt) DESC LIMIT 50
-  `).all();
-  const updTop = db.prepare(`UPDATE products SET is_top_50 = 1, min_stock_3001 = CASE WHEN min_stock_3001 = 0 THEN 2 ELSE min_stock_3001 END WHERE barcode = ?`);
-  top50.forEach(r => updTop.run(r.barcode));
+  `);
+  await batchInsert(
+    `UPDATE products SET is_top_50 = 1, min_stock_3001 = CASE WHEN min_stock_3001 = 0 THEN 2 ELSE min_stock_3001 END WHERE barcode = ?`,
+    top50.map(r => [r.barcode])
+  );
 
   // 10. PRODUCT GUIDES (HDLR & HDBQ)
   const guidePath = path.join(ROOT, '06_product_guides', 'HDLR_HDBQ_San_pham_2025-2026.md');
   if (fs.existsSync(guidePath)) {
     const md = fs.readFileSync(guidePath, 'utf8');
-    // Split on top-level headings (# or ##)
     const sections = md.split(/\n(?=#{1,2}\s+)/).filter(s => s.trim().length > 80);
-    const insGuide = db.prepare(`INSERT INTO product_guides (title, product_line, guide_type, content_md) VALUES (?,?,?,?)`);
-    for (const sec of sections.slice(0, 40)) {
+    const guideRows = sections.slice(0, 40).map(sec => {
       const firstLine = sec.split('\n')[0].replace(/^#+\s*/, '').replace(/\*\*/g, '').trim();
-      const lineKey = ['Noma','Jomo','Welin','Cherish','Pourin','Sunim','Raima','Keepsake','Solace','Livia','Lilow','Be-there','Stillie','Orini','Claro','Stelo','Murest','Nelia'].find(k => firstLine.toLowerCase().includes(k.toLowerCase())) || 'Chung';
+      const lineKey = ['Noma', 'Jomo', 'Welin', 'Cherish', 'Pourin', 'Sunim', 'Raima', 'Keepsake', 'Solace', 'Livia', 'Lilow', 'Be-there', 'Stillie', 'Orini', 'Claro', 'Stelo', 'Murest', 'Nelia'].find(k => firstLine.toLowerCase().includes(k.toLowerCase())) || 'Chung';
       const gtype = /bảo quản|hdbq/i.test(firstLine) ? 'HDBQ' : 'HDLR';
-      insGuide.run(firstLine.slice(0, 120), lineKey, gtype, sec.slice(0, 6000));
-    }
-    console.log(`[Seed] Product guides: ${Math.min(sections.length, 40)} sections`);
+      return [firstLine.slice(0, 120), lineKey, gtype, sec.slice(0, 6000)];
+    });
+    await batchInsert(`INSERT INTO product_guides (title, product_line, guide_type, content_md) VALUES (?,?,?,?)`, guideRows);
+    console.log(`[Seed] Product guides: ${guideRows.length} sections`);
   }
 
-  // 11. Sample Support Logs (to illustrate OPT AM time tracking)
-  const insSup = db.prepare(`INSERT INTO support_logs (log_date, staff_name, category, location, hours, notes) VALUES (?,?,?,?,?,?)`);
-  [
-    ['2026-11-16', 'Trần Anh Tuyến', 'Factory QC', 'Xưởng Hiểu Đức', 4.5, 'Kiểm tra lô 19 Kệ treo Nolyn xanh đen bị trầy xước (38%)'],
-    ['2026-11-18', 'Trần Anh Tuyến', 'Pop-up 1001 Support', 'Aeon Mall Bình Tân (1001)', 5.0, 'Hỗ trợ đứng ca & điều phối trưng bày hàng Pop-up 1001'],
-    ['2026-11-20', 'Trần Anh Tuyến', 'Warehouse 9005 Audit', 'Toàn Nhất Sóng Thần (BD02)', 3.0, 'Đo đạc tối ưu layout đưa diện tích kho về 296,58 m²'],
-  ].forEach(r => insSup.run(...r));
+  // 11. Sample Support Logs
+  await batchInsert(
+    `INSERT INTO support_logs (log_date, staff_name, category, location, hours, notes) VALUES (?,?,?,?,?,?)`,
+    [
+      ['2026-11-16', 'Trần Anh Tuyến', 'QC Xưởng NCC', 'Xưởng Hiểu Đức', 4.5, 'Kiểm tra lô 19 Kệ treo Nolyn xanh đen bị trầy xước (38%)'],
+      ['2026-11-18', 'Trần Anh Tuyến', 'Hỗ trợ Pop-up 1001', 'Aeon Mall Bình Tân (1001)', 5.0, 'Hỗ trợ đứng ca & điều phối trưng bày hàng Pop-up 1001'],
+      ['2026-11-20', 'Trần Anh Tuyến', 'QC Xưởng NCC', 'Toàn Nhất Sóng Thần (BD02)', 3.0, 'Đo đạc tối ưu layout đưa diện tích kho về 296,58 m²'],
+    ]
+  );
 
-  console.log(`[Seed] Complete! SQLite saved to ${DB_PATH}`);
+  console.log(`[Seed] Complete! Database ready (${isCloudDb() ? 'Turso Cloud' : DB_PATH})`);
 }
 
 if (process.argv[1] && process.argv[1].endsWith('seed.mjs')) {
-  runSeed(process.argv.includes('--force'));
+  runSeed(
+    process.argv.includes('--force'),
+    process.argv.includes('--confirm-cloud-reset')
+  ).catch(err => {
+    console.error(err);
+    process.exit(1);
+  });
 }

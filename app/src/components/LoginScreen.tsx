@@ -7,7 +7,7 @@ interface Props {
 }
 
 export default function LoginScreen({ onSuccess }: Props) {
-  const [email, setEmail] = useState('admin@benom.vn');
+  const [email, setEmail] = useState(import.meta.env.DEV ? 'admin@benom.vn' : '');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
@@ -55,6 +55,7 @@ export default function LoginScreen({ onSuccess }: Props) {
               <input
                 type="email"
                 required
+                autoComplete="username"
                 value={email}
                 onChange={e => setEmail(e.target.value)}
                 placeholder="ten@benom.vn"
@@ -70,6 +71,7 @@ export default function LoginScreen({ onSuccess }: Props) {
               <input
                 type={showPassword ? 'text' : 'password'}
                 required
+                autoComplete="current-password"
                 value={password}
                 onChange={e => setPassword(e.target.value)}
                 placeholder="Nhập mật khẩu..."
@@ -95,29 +97,36 @@ export default function LoginScreen({ onSuccess }: Props) {
             {loading ? 'Đang xác thực...' : 'Đăng nhập'}
           </button>
 
-          <div className="pt-3 border-t border-[#EFE7DC] text-[11px] text-[#6e5543] space-y-1">
-            <div className="flex items-center gap-1 font-semibold text-[#3B281A]">
-              <ShieldCheck className="w-3.5 h-3.5 text-[#234E36]" /> Tài khoản khởi tạo mặc định (mật khẩu: <code className="bg-[#F8F4EC] px-1 rounded">benom2026</code>):
+          {import.meta.env.DEV ? (
+            <div className="pt-3 border-t border-[#EFE7DC] text-[11px] text-[#6e5543] space-y-1">
+              <div className="flex items-center gap-1 font-semibold text-[#3B281A]">
+                <ShieldCheck className="w-3.5 h-3.5 text-[#234E36]" /> Chế độ Local Dev — Chọn nhanh vai trò kiểm thử:
+              </div>
+              <div className="grid grid-cols-2 gap-1 pt-1">
+                {[
+                  ['admin@benom.vn', 'Admin (Toàn quyền)'],
+                  ['store@benom.vn', 'Store/CSKH (Sửa)'],
+                  ['ktv@benom.vn', 'KTV (Ký BM-01)'],
+                  ['viewer@benom.vn', 'Quản lý (Chỉ xem)'],
+                ].map(([em, lbl]) => (
+                  <button
+                    key={em}
+                    type="button"
+                    onClick={() => { setEmail(em); setPassword('benom2026'); }}
+                    className="text-left px-2 py-1 rounded-lg bg-[#FAF7F2] hover:bg-[#EFE7DC] border border-[#E6DDD1] cursor-pointer"
+                  >
+                    <div className="font-semibold text-[#3B281A]">{lbl}</div>
+                    <div className="text-[10px] text-[#6e5543]">{em}</div>
+                  </button>
+                ))}
+              </div>
             </div>
-            <div className="grid grid-cols-2 gap-1 pt-1">
-              {[
-                ['admin@benom.vn', 'Admin (Toàn quyền)'],
-                ['store@benom.vn', 'Store/CSKH (Sửa)'],
-                ['ktv@benom.vn', 'KTV (Ký BM-01)'],
-                ['viewer@benom.vn', 'Quản lý (Chỉ xem)'],
-              ].map(([em, lbl]) => (
-                <button
-                  key={em}
-                  type="button"
-                  onClick={() => { setEmail(em); setPassword('benom2026'); }}
-                  className="text-left px-2 py-1 rounded-lg bg-[#FAF7F2] hover:bg-[#EFE7DC] border border-[#E6DDD1] cursor-pointer"
-                >
-                  <div className="font-semibold text-[#3B281A]">{lbl}</div>
-                  <div className="text-[10px] text-[#6e5543]">{em}</div>
-                </button>
-              ))}
+          ) : (
+            <div className="pt-3 border-t border-[#EFE7DC] text-[11px] text-[#6e5543] flex items-start gap-1.5">
+              <ShieldCheck className="w-4 h-4 text-[#234E36] shrink-0 mt-0.5" />
+              <span>Hệ thống nội bộ Công ty TNHH Kohnan Việt Nam. Liên hệ Operations Lead để cấp tài khoản hoặc đặt lại mật khẩu.</span>
             </div>
-          </div>
+          )}
         </form>
       </div>
     </div>

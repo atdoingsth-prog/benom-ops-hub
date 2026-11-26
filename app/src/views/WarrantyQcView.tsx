@@ -2,14 +2,17 @@ import React, { useEffect, useState } from 'react';
 import {
   Clock, Factory, Plus, Printer, Search, ShieldCheck, Wrench, X
 } from 'lucide-react';
-import { apiGet, apiSend, PrintDoc } from '../api';
+import { apiGet, apiSend, AuthUser, PrintDoc } from '../api';
 
 interface Props {
+  user: AuthUser;
   onToast: (msg: string, tone?: 'ok' | 'err') => void;
   onPrint: (doc: PrintDoc) => void;
 }
 
-export default function WarrantyQcView({ onToast, onPrint }: Props) {
+export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
+  const canCreateOrEditQc = user.role === 'ADMIN' || user.role === 'EDITOR';
+  const canUpdateTicketOrLog = user.role === 'ADMIN' || user.role === 'EDITOR' || user.role === 'KTV';
   const [subTab, setSubTabState] = useState<'warranty' | 'qc' | 'support'>(() => {
     const s = localStorage.getItem('benom_war_subtab');
     return s === 'qc' || s === 'support' ? s : 'warranty';
@@ -168,12 +171,14 @@ export default function WarrantyQcView({ onToast, onPrint }: Props) {
               <div className="font-bold text-sm text-[#3B281A] flex items-center gap-1.5">
                 <ShieldCheck className="w-4 h-4 text-[#234E36]" /> Tra Cứu Bảo Hành Tức Thì (SĐT / Mã Hóa Đơn / Tên Khách)
               </div>
-              <button
-                onClick={() => setShowNewTicket(true)}
-                className="px-3 py-1.5 rounded-lg bg-[#3B281A] text-white text-xs font-semibold flex items-center gap-1 cursor-pointer"
-              >
-                <Plus className="w-3.5 h-3.5" /> Tạo Ticket BM-02
-              </button>
+              {canCreateOrEditQc && (
+                <button
+                  onClick={() => setShowNewTicket(true)}
+                  className="px-3 py-1.5 rounded-lg bg-[#3B281A] text-white text-xs font-semibold flex items-center gap-1 cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" /> Tạo Ticket BM-02
+                </button>
+              )}
             </div>
             <form onSubmit={doLookup} className="flex gap-2">
               <div className="relative flex-1">
@@ -202,12 +207,14 @@ export default function WarrantyQcView({ onToast, onPrint }: Props) {
                       }`}>
                         {r.warranty_status} {r.days_left > 0 ? `(còn ${r.days_left} ngày)` : ''}
                       </span>
-                      <button
-                        onClick={() => prefillTicketFromLookup(r)}
-                        className="px-2.5 py-1 rounded bg-[#3B281A] text-white text-[11px] font-semibold cursor-pointer"
-                      >
-                        Mở Ticket
-                      </button>
+                      {canCreateOrEditQc && (
+                        <button
+                          onClick={() => prefillTicketFromLookup(r)}
+                          className="px-2.5 py-1 rounded bg-[#3B281A] text-white text-[11px] font-semibold cursor-pointer"
+                        >
+                          Mở Ticket
+                        </button>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -227,23 +234,36 @@ export default function WarrantyQcView({ onToast, onPrint }: Props) {
                       {t.is_in_warranty ? 'Trong BH' : 'Ngoài BH'}
                     </span>
                   </div>
-                  <select
-                    value={t.status}
-                    onChange={e => updateTicketStatus(t, e.target.value)}
-                    className="text-[11px] font-semibold px-2 py-1 rounded border border-[#D6BCA5] bg-white"
-                  >
-                    <option value="New">New</option>
-                    <option value="Assessing">Đang chẩn đoán</option>
-                    <option value="In Progress">Đang xử lý</option>
-                    <option value="Resolved">Đã xong</option>
-                    <option value="Closed">Đóng Ticket</option>
-                  </select>
+                  {canUpdateTicketOrLog ? (
+                    <select
+                      value={t.status}
+                      onChange={e => updateTicketStatus(t, e.target.value)}
+                      className="text-[11px] font-semibold px-2 py-1 rounded border border-[#D6BCA5] bg-white"
+                    >
+                      <option value="New">New</option>
+                      <option value="Assessing">Đang chẩn đoán</option>
+                      <option value="In Progress">Đang xử lý</option>
+                      <option value="Resolved">Đã xong</option>
+                      <option value="Closed">Đóng Ticket</option>
+                    </select>
+                  ) : (
+                    <span className="px-2 py-0.5 rounded-full bg-[#F8F4EC] border border-[#D6BCA5] text-[10px] font-bold text-[#3B281A]">
+                      {t.status}
+                    </span>
+                  )}
                 </div>
                 <div className="text-sm font-bold text-[#3B281A]">{t.product_name}</div>
                 <div className="text-xs text-[#6e5543]">{t.customer_name} • {t.customer_phone} • ĐH {t.invoice_no || '—'}</div>
                 <div className="text-xs bg-[#FAF7F2] p-2.5 rounded-lg border border-[#EFE7DC]">{t.issue_desc}</div>
-                <div className="flex items-center justify-between text-[11px] text-[#6e5543] pt-1">
-                  <span className="flex items-center gap-1"><Clock className="w-3.5 h-3.5 text-[#9A2B26]" /> SLA xử lý: <strong>{t.sla_resolve_at || '—'}</strong></span>
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#6e5543] pt-1">
+                  <div className="space-y-0.5">
+                    <div className="flex items-center gap-1"><Clock className="w-3.5 h-3.5 text-[#9A2B26]" /> SLA xử lý (GMT+7): <strong>{t.sla_resolve_at || '—'}</strong></div>
+                    {(t.responded_at || t.resolved_at) && (
+                      <div className="text-[10px] text-[#234E36]">
+                        {t.responded_at ? `Phản hồi: ${t.responded_at}` : ''}{t.responded_at && t.resolved_at ? ' • ' : ''}{t.resolved_at ? `Hoàn tất: ${t.resolved_at}` : ''}
+                      </div>
+                    )}
+                  </div>
                   <button
                     onClick={() => onPrint({ type: 'WARRANTY', data: t })}
                     className="px-2.5 py-1 rounded border border-[#D6BCA5] text-[#3B281A] font-semibold hover:bg-[#F8F4EC] cursor-pointer flex items-center gap-1"
@@ -289,16 +309,22 @@ export default function WarrantyQcView({ onToast, onPrint }: Props) {
                     <td className="py-2.5 px-2 text-center">{q.defect_rate ? `${q.defect_rate}%` : '—'}</td>
                     <td className="py-2.5 px-3 text-[11px] text-[#6e5543]">Out: {q.est_out || 'TBU'}<br />In: {q.est_in || 'TBU'}</td>
                     <td className="py-2.5 px-3">
-                      <select
-                        value={q.status}
-                        onChange={e => updateQcStatus(q, e.target.value)}
-                        className="px-2 py-1 rounded border border-[#D6BCA5] bg-white text-[11px] font-semibold"
-                      >
-                        <option value="Open">Open (Chờ xuất trả)</option>
-                        <option value="Sent to Factory">Đã xuất về xưởng</option>
-                        <option value="Returned">Xưởng đã trả hàng</option>
-                        <option value="Closed">Hoàn tất (Closed)</option>
-                      </select>
+                      {canCreateOrEditQc ? (
+                        <select
+                          value={q.status}
+                          onChange={e => updateQcStatus(q, e.target.value)}
+                          className="px-2 py-1 rounded border border-[#D6BCA5] bg-white text-[11px] font-semibold"
+                        >
+                          <option value="Open">Open (Chờ xuất trả)</option>
+                          <option value="Sent to Factory">Đã xuất về xưởng</option>
+                          <option value="Returned">Xưởng đã trả hàng</option>
+                          <option value="Closed">Hoàn tất (Closed)</option>
+                        </select>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded-full bg-[#F8F4EC] border border-[#D6BCA5] text-[10px] font-bold text-[#3B281A]">
+                          {q.status}
+                        </span>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -311,6 +337,7 @@ export default function WarrantyQcView({ onToast, onPrint }: Props) {
       {/* TAB 3: CROSS-DEPT SUPPORT LOG */}
       {subTab === 'support' && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+          {canUpdateTicketOrLog && (
           <form onSubmit={submitSupportLog} className="bg-white rounded-xl p-5 border border-[#E6DDD1] space-y-3 text-xs h-fit">
             <div className="font-bold text-sm text-[#3B281A] flex items-center gap-1.5">
               <Wrench className="w-4 h-4 text-[#224B85]" /> Ghi Nhận Giờ Support Chéo
@@ -351,8 +378,9 @@ export default function WarrantyQcView({ onToast, onPrint }: Props) {
               Lưu nhật ký
             </button>
           </form>
+          )}
 
-          <div className="lg:col-span-2 bg-white rounded-xl border border-[#E6DDD1] overflow-hidden">
+          <div className={`${canUpdateTicketOrLog ? 'lg:col-span-2' : 'lg:col-span-3'} bg-white rounded-xl border border-[#E6DDD1] overflow-hidden`}>
             <div className="p-4 bg-[#F8F4EC] border-b border-[#E6DDD1] font-bold text-sm text-[#3B281A]">
               Lịch Sử Hỗ Trợ Chéo Phòng Ban (Tổng: {totalSupportHours} giờ)
             </div>

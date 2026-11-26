@@ -14,19 +14,28 @@ const ROLE_LABELS: Record<string, string> = {
   VIEWER: 'Chỉ xem (Viewer)',
 };
 
+function generateTempPassword(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  let out = 'Bn';
+  for (let i = 0; i < bytes.length; i++) out += chars[bytes[i] % chars.length];
+  return out;
+}
+
 export default function ShareUsersModal({ onClose, onToast }: Props) {
   const [users, setUsers] = useState<any[]>([]);
   const [mailerReady, setMailerReady] = useState(false);
   const [lastInvite, setLastInvite] = useState<{ email: string; fullName: string; password: string; role: string; sent: boolean; error?: string } | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [form, setForm] = useState({
+  const [form, setForm] = useState(() => ({
     email: '',
     full_name: '',
     department: 'Store 3001',
     role: 'VIEWER',
-    password: 'benom2026',
+    password: generateTempPassword(),
     send_email: true,
-  });
+  }));
 
   const load = async () => {
     try {
@@ -68,7 +77,7 @@ export default function ShareUsersModal({ onClose, onToast }: Props) {
       } else {
         onToast(`Đã tạo tài khoản ${form.email}! (Chưa cấu hình SMTP — bạn có thể sao chép hoặc gửi mail nhanh bên dưới)`);
       }
-      setForm({ email: '', full_name: '', department: 'Store 3001', role: 'VIEWER', password: 'benom2026', send_email: true });
+      setForm({ email: '', full_name: '', department: 'Store 3001', role: 'VIEWER', password: generateTempPassword(), send_email: true });
       load();
     } catch (err: any) {
       onToast(err.message, 'err');

@@ -1,23 +1,28 @@
 import React, { useEffect, useState } from 'react';
 import {
-  BarChart3, Check, Download, Plus, Search, Trash2, Truck, UploadCloud, X
+  ArrowUpRight, BarChart3, Check, Download, Plus, Search, Trash2, Truck, UploadCloud, X
 } from 'lucide-react';
 import {
   Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis
 } from 'recharts';
-import { apiGet, apiSend, apiUpload, fmtMonth, fmtVnd, getAuthToken } from '../api';
+import { apiDownload, apiGet, apiSend, apiUpload, AuthUser, fmtMonth, fmtVnd } from '../api';
 
 interface Props {
+  user: AuthUser;
   onToast: (msg: string, tone?: 'ok' | 'err') => void;
+  onNavigate?: (tab: string) => void;
 }
 
 const CARRIERS = ['', 'Ahamove', 'Xanh SM', '247 Express', 'Sagawa', 'Benom staff', 'Lalamove', 'Viettel Post', 'Khác'];
 
-export default function DeliveryTrackingView({ onToast }: Props) {
+export default function DeliveryTrackingView({ user, onToast, onNavigate }: Props) {
+  const canEdit = user.role === 'ADMIN' || user.role === 'EDITOR';
+  const [pushingSlip, setPushingSlip] = useState<string | null>(null);
   const [month, setMonthState] = useState<string>(() => localStorage.getItem('benom_3pl_month') || 'LATEST');
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [searchQ, setSearchQ] = useState('');
   const [edits, setEdits] = useState<Record<string, any>>({});
 
@@ -128,6 +133,23 @@ export default function DeliveryTrackingView({ onToast }: Props) {
     }
   };
 
+  const pushToDispatch = async (slipNo: string) => {
+    setPushingSlip(slipNo);
+    try {
+      const res = await apiSend(`/api/delivery-tracking/${encodeURIComponent(slipNo)}/push-to-order`, 'POST', {});
+      if (res.existed) {
+        onToast(`Hóa đơn ${slipNo} đã có bên Điều phối (${res.status})!`);
+      } else {
+        onToast(`Đã đẩy ${slipNo} sang tab Điều phối & BM-01 (${res.items_created || 0} dòng SP)!`);
+      }
+      await load(month);
+    } catch (e: any) {
+      onToast(e.message, 'err');
+    } finally {
+      setPushingSlip(null);
+    }
+  };
+
   const searchPosSlip = async (val: string) => {
     setPosQuery(val);
     setNewSlip(prev => ({ ...prev, slip_no: val }));
@@ -209,25 +231,41 @@ export default function DeliveryTrackingView({ onToast }: Props) {
             ))}
           </select>
 
-          <label className="px-3.5 py-2 rounded-lg bg-[#3B281A] text-[#F8F4EC] text-xs font-semibold flex items-center gap-1.5 hover:bg-[#563C28] cursor-pointer">
-            <UploadCloud className="w-4 h-4" />
-            {uploading ? 'Đang nạp CSV...' : 'Nạp transaction_detail CSV'}
-            <input type="file" accept=".csv" className="hidden" onChange={handleUploadPos} />
-          </label>
+          {canEdit && (
+            <>
+              <label className="px-3.5 py-2 rounded-lg bg-[#3B281A] text-[#F8F4EC] text-xs font-semibold flex items-center gap-1.5 hover:bg-[#563C28] cursor-pointer">
+                <UploadCloud className="w-4 h-4" />
+                {uploading ? 'Đang nạp CSV...' : 'Nạp transaction_detail CSV'}
+                <input type="file" accept=".csv" className="hidden" onChange={handleUploadPos} />
+              </label>
 
-          <button
-            onClick={() => { setNewSlip({ ...newSlip, sales_month: month === 'ALL' ? '2026-10' : month }); setShowAdd(true); }}
-            className="px-3 py-2 rounded-lg border border-[#3B281A] text-[#3B281A] bg-white text-xs font-semibold flex items-center gap-1 hover:bg-[#F8F4EC] cursor-pointer"
-          >
-            <Plus className="w-4 h-4" /> Thêm đơn Freeship
-          </button>
+              <button
+                onClick={() => { setNewSlip({ ...newSlip, sales_month: month === 'ALL' ? (data?.month || '2026-11') : month }); setShowAdd(true); }}
+                className="px-3 py-2 rounded-lg border border-[#3B281A] text-[#3B281A] bg-white text-xs font-semibold flex items-center gap-1 hover:bg-[#F8F4EC] cursor-pointer"
+              >
+                <Plus className="w-4 h-4" /> Thêm đơn Freeship
+              </button>
 
-          <a
-            href={`/api/delivery-tracking/export?month=${encodeURIComponent(month)}&token=${encodeURIComponent(getAuthToken())}`}
-            className="px-3.5 py-2 rounded-lg bg-[#234E36] text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-[#1b3d2a]"
-          >
-            <Download className="w-4 h-4" /> Xuất Excel Pivot
-          </a>
+              <button
+                disabled={exporting || loading}
+                onClick={async () => {
+                  setExporting(true);
+                  try {
+                    const m = data?.month || month;
+                    await apiDownload(`/api/delivery-tracking/export?month=${encodeURIComponent(m)}`, `Benom_3PL_Delivery_Report_${m}.xlsx`);
+                    onToast(`Đã xuất Excel Báo cáo 3PL (${m === 'ALL' ? '2026' : fmtMonth(m)})!`);
+                  } catch (e: any) {
+                    onToast(e.message, 'err');
+                  } finally {
+                    setExporting(false);
+                  }
+                }}
+                className="px-3.5 py-2 rounded-lg bg-[#234E36] text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-[#1b3d2a] cursor-pointer disabled:opacity-60"
+              >
+                <Download className="w-4 h-4" /> {exporting ? 'Đang xuất...' : 'Xuất Excel Pivot'}
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -367,7 +405,8 @@ export default function DeliveryTrackingView({ onToast }: Props) {
                     <th className="py-2.5 px-2">Fee (3PL)</th>
                     <th className="py-2.5 px-2">Area</th>
                     <th className="py-2.5 px-2">Note</th>
-                    <th className="py-2.5 px-2 text-center">Lưu</th>
+                    <th className="py-2.5 px-2 text-center">Điều phối</th>
+                    {canEdit && <th className="py-2.5 px-2 text-center">Lưu</th>}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#F0E9DF]">
@@ -384,56 +423,98 @@ export default function DeliveryTrackingView({ onToast }: Props) {
                         <td className="py-2 px-2 text-right whitespace-nowrap">{fmtVnd(r.install_cust_pay)}</td>
                         <td className="py-2 px-2 text-right whitespace-nowrap font-semibold text-[#3B281A]">{fmtVnd(r.net_sales_excl_tax)}</td>
                         <td className="py-2 px-2">
-                          <select
-                            value={ed.carrier_3pl}
-                            onChange={e => setField(r.slip_no, 'carrier_3pl', e.target.value)}
-                            className="px-2 py-1 rounded border border-[#D6BCA5] bg-white text-xs font-medium"
-                          >
-                            {CARRIERS.map(c => <option key={c} value={c}>{c || '— Chọn 3PL —'}</option>)}
-                          </select>
+                          {canEdit ? (
+                            <select
+                              value={ed.carrier_3pl}
+                              onChange={e => setField(r.slip_no, 'carrier_3pl', e.target.value)}
+                              className="px-2 py-1 rounded border border-[#D6BCA5] bg-white text-xs font-medium"
+                            >
+                              {CARRIERS.map(c => <option key={c} value={c}>{c || '— Chọn 3PL —'}</option>)}
+                            </select>
+                          ) : (
+                            <span className="font-medium text-[#3B281A]">{r.carrier_3pl || '—'}</span>
+                          )}
                         </td>
                         <td className="py-2 px-2">
-                          <input
-                            type="number"
-                            value={ed.fee_3pl}
-                            onChange={e => setField(r.slip_no, 'fee_3pl', e.target.value)}
-                            onKeyDown={e => e.key === 'Enter' && saveRow(r.slip_no)}
-                            className="w-24 px-2 py-1 rounded border border-[#D6BCA5] bg-white text-right font-semibold text-[#9A2B26]"
-                          />
+                          {canEdit ? (
+                            <input
+                              type="number"
+                              value={ed.fee_3pl}
+                              onChange={e => setField(r.slip_no, 'fee_3pl', e.target.value)}
+                              onKeyDown={e => e.key === 'Enter' && saveRow(r.slip_no)}
+                              className="w-24 px-2 py-1 rounded border border-[#D6BCA5] bg-white text-right font-semibold text-[#9A2B26]"
+                            />
+                          ) : (
+                            <span className="font-semibold text-[#9A2B26]">{fmtVnd(r.fee_3pl)}</span>
+                          )}
                         </td>
                         <td className="py-2 px-2">
-                          <input
-                            value={ed.area}
-                            onChange={e => setField(r.slip_no, 'area', e.target.value)}
-                            onKeyDown={e => e.key === 'Enter' && saveRow(r.slip_no)}
-                            className="w-20 px-2 py-1 rounded border border-[#D6BCA5] bg-white"
-                          />
+                          {canEdit ? (
+                            <input
+                              value={ed.area}
+                              onChange={e => setField(r.slip_no, 'area', e.target.value)}
+                              onKeyDown={e => e.key === 'Enter' && saveRow(r.slip_no)}
+                              className="w-20 px-2 py-1 rounded border border-[#D6BCA5] bg-white"
+                            />
+                          ) : (
+                            <span>{r.area || '—'}</span>
+                          )}
                         </td>
                         <td className="py-2 px-2">
-                          <input
-                            value={ed.note}
-                            onChange={e => setField(r.slip_no, 'note', e.target.value)}
-                            onKeyDown={e => e.key === 'Enter' && saveRow(r.slip_no)}
-                            placeholder="Ghi chú..."
-                            className="w-28 px-2 py-1 rounded border border-[#D6BCA5] bg-white"
-                          />
+                          {canEdit ? (
+                            <input
+                              value={ed.note}
+                              onChange={e => setField(r.slip_no, 'note', e.target.value)}
+                              onKeyDown={e => e.key === 'Enter' && saveRow(r.slip_no)}
+                              placeholder="Ghi chú..."
+                              className="w-28 px-2 py-1 rounded border border-[#D6BCA5] bg-white"
+                            />
+                          ) : (
+                            <span className="text-[#6e5543]">{r.note || '—'}</span>
+                          )}
                         </td>
-                        <td className="py-2 px-2 text-center whitespace-nowrap space-x-1">
-                          <button
-                            onClick={() => saveRow(r.slip_no)}
-                            className={`p-1.5 rounded-lg cursor-pointer ${ed.dirty ? 'bg-[#234E36] text-white' : 'bg-[#F8F4EC] text-[#3B281A] hover:bg-[#EFE7DC]'}`}
-                            title="Lưu dòng này"
-                          >
-                            <Check className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            onClick={() => deleteRow(r.slip_no)}
-                            className="p-1.5 rounded-lg bg-red-50 text-[#9A2B26] hover:bg-red-100 cursor-pointer"
-                            title="Xóa khỏi bảng theo dõi"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                        <td className="py-2 px-2 text-center whitespace-nowrap">
+                          {r.linked_order_id ? (
+                            <button
+                              type="button"
+                              onClick={() => onNavigate?.('orders')}
+                              className="px-2 py-1 rounded-full bg-emerald-50 text-[#234E36] text-[10px] font-bold hover:bg-emerald-100 cursor-pointer inline-flex items-center gap-0.5"
+                              title="Mở tab Điều phối & BM-01"
+                            >
+                              ✓ {r.linked_order_status || 'Đã ĐP'} <ArrowUpRight className="w-3 h-3" />
+                            </button>
+                          ) : canEdit ? (
+                            <button
+                              type="button"
+                              disabled={pushingSlip === r.slip_no}
+                              onClick={() => pushToDispatch(r.slip_no)}
+                              className="px-2 py-1 rounded-lg bg-[#224B85] text-white text-[10px] font-semibold hover:bg-[#1a3a68] cursor-pointer disabled:opacity-60"
+                              title="Tạo đơn giao/lắp bên Điều phối & tự đồng bộ 3PL"
+                            >
+                              {pushingSlip === r.slip_no ? '...' : '+ Đẩy ĐP'}
+                            </button>
+                          ) : (
+                            <span className="text-[10px] text-[#6e5543]">—</span>
+                          )}
                         </td>
+                        {canEdit && (
+                          <td className="py-2 px-2 text-center whitespace-nowrap space-x-1">
+                            <button
+                              onClick={() => saveRow(r.slip_no)}
+                              className={`p-1.5 rounded-lg cursor-pointer ${ed.dirty ? 'bg-[#234E36] text-white' : 'bg-[#F8F4EC] text-[#3B281A] hover:bg-[#EFE7DC]'}`}
+                              title="Lưu dòng này"
+                            >
+                              <Check className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              onClick={() => deleteRow(r.slip_no)}
+                              className="p-1.5 rounded-lg bg-red-50 text-[#9A2B26] hover:bg-red-100 cursor-pointer"
+                              title="Xóa khỏi bảng theo dõi"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </td>
+                        )}
                       </tr>
                     );
                   })}
