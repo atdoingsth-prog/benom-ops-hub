@@ -7,7 +7,11 @@ interface Props {
 }
 
 export default function AllowanceView({ onToast }: Props) {
-  const [month, setMonth] = useState('2026-10');
+  const [month, setMonthState] = useState(() => localStorage.getItem('benom_allow_month') || '2026-11');
+  const setMonth = (m: string) => {
+    setMonthState(m);
+    localStorage.setItem('benom_allow_month', m);
+  };
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 

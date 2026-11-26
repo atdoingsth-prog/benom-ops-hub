@@ -11,7 +11,14 @@ interface Props {
 }
 
 export default function WarehouseErpView({ onToast, onPrint }: Props) {
-  const [subTab, setSubTab] = useState<'slips' | 'erp' | 'reconcile'>('slips');
+  const [subTab, setSubTabState] = useState<'slips' | 'erp' | 'reconcile'>(() => {
+    const s = localStorage.getItem('benom_wh_subtab');
+    return s === 'erp' || s === 'reconcile' ? s : 'slips';
+  });
+  const setSubTab = (v: 'slips' | 'erp' | 'reconcile') => {
+    setSubTabState(v);
+    localStorage.setItem('benom_wh_subtab', v);
+  };
   const [slips, setSlips] = useState<any[]>([]);
   const [slipFilter, setSlipFilter] = useState('');
   const [showNewSlip, setShowNewSlip] = useState(false);

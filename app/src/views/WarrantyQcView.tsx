@@ -10,7 +10,14 @@ interface Props {
 }
 
 export default function WarrantyQcView({ onToast, onPrint }: Props) {
-  const [subTab, setSubTab] = useState<'warranty' | 'qc' | 'support'>('warranty');
+  const [subTab, setSubTabState] = useState<'warranty' | 'qc' | 'support'>(() => {
+    const s = localStorage.getItem('benom_war_subtab');
+    return s === 'qc' || s === 'support' ? s : 'warranty';
+  });
+  const setSubTab = (v: 'warranty' | 'qc' | 'support') => {
+    setSubTabState(v);
+    localStorage.setItem('benom_war_subtab', v);
+  };
   const [tickets, setTickets] = useState<any[]>([]);
   const [qcList, setQcList] = useState<any[]>([]);
   const [logs, setLogs] = useState<any[]>([]);

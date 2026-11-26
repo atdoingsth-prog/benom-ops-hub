@@ -14,12 +14,17 @@ interface Props {
 const CARRIERS = ['', 'Ahamove', 'Xanh SM', '247 Express', 'Sagawa', 'Benom staff', 'Lalamove', 'Viettel Post', 'Khác'];
 
 export default function DeliveryTrackingView({ onToast }: Props) {
-  const [month, setMonth] = useState('2026-10');
+  const [month, setMonthState] = useState<string>(() => localStorage.getItem('benom_3pl_month') || 'LATEST');
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [searchQ, setSearchQ] = useState('');
   const [edits, setEdits] = useState<Record<string, any>>({});
+
+  const setMonth = (m: string) => {
+    setMonthState(m);
+    localStorage.setItem('benom_3pl_month', m);
+  };
 
   // Add Manual / Freeship Slip Modal
   const [showAdd, setShowAdd] = useState(false);
@@ -27,7 +32,7 @@ export default function DeliveryTrackingView({ onToast }: Props) {
   const [posMatches, setPosMatches] = useState<any[]>([]);
   const [newSlip, setNewSlip] = useState({
     slip_no: '',
-    sales_month: '2026-10',
+    sales_month: new Date().toISOString().slice(0, 7),
     sales_day: new Date().toISOString().slice(0, 10),
     delivery_cust_pay: 0,
     install_cust_pay: 0,
@@ -44,6 +49,11 @@ export default function DeliveryTrackingView({ onToast }: Props) {
     try {
       const res = await apiGet(`/api/delivery-tracking?month=${encodeURIComponent(m)}`);
       setData(res);
+      // If requested LATEST (or resolved month differs from 'LATEST'), sync dropdown to exact resolved month (e.g. 2026-11)
+      if (m === 'LATEST' && res.month && res.month !== 'LATEST') {
+        setMonthState(res.month);
+        localStorage.setItem('benom_3pl_month', res.month);
+      }
       const initEdits: Record<string, any> = {};
       for (const r of (res.rows || [])) {
         initEdits[r.slip_no] = {
@@ -64,21 +74,20 @@ export default function DeliveryTrackingView({ onToast }: Props) {
 
   useEffect(() => { load(month); }, [month]);
 
-  const handleUploadPos = async (file: File | undefined) => {
+  const handleUploadPos = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
     setUploading(true);
     try {
       const res = await apiUpload('/api/delivery-tracking/upload-pos', file);
-      onToast(`Đã nạp ${res.total_pos_slips} hóa đơn POS • Tự động nhận diện ${res.auto_tracked_delivery_slips} đơn có phí giao/lắp!`);
-      if (res.months?.length) {
-        const latest = res.months[res.months.length - 1];
-        setMonth(latest);
-        await load(latest);
-      } else {
-        await load(month);
-      }
-    } catch (e: any) {
-      onToast(e.message, 'err');
+      const uploadedMonths: string[] = Array.isArray(res.months) ? [...res.months].sort() : [];
+      const targetMonth = uploadedMonths.length ? uploadedMonths[uploadedMonths.length - 1] : 'LATEST';
+      onToast(`Đã nạp ${res.total_pos_slips} hóa đơn POS (${targetMonth !== 'LATEST' ? fmtMonth(targetMonth) : 'mới nhất'}) • Tự động tách ${res.auto_tracked_delivery_slips} đơn có phí giao/lắp!`);
+      setMonth(targetMonth);
+      await load(targetMonth);
+    } catch (err: any) {
+      onToast(err.message, 'err');
     } finally {
       setUploading(false);
     }
@@ -190,12 +199,12 @@ export default function DeliveryTrackingView({ onToast }: Props) {
 
         <div className="flex flex-wrap items-center gap-2">
           <select
-            value={month}
+            value={month === 'LATEST' ? (data?.month || '') : month}
             onChange={e => setMonth(e.target.value)}
             className="px-3 py-2 rounded-lg border border-[#D6BCA5] bg-white text-xs font-bold text-[#3B281A]"
           >
             <option value="ALL">Tất cả các tháng (2026)</option>
-            {(data?.available_months || ['2026-10']).map((m: string) => (
+            {(data?.available_months || []).map((m: string) => (
               <option key={m} value={m}>{fmtMonth(m)}</option>
             ))}
           </select>
@@ -203,7 +212,7 @@ export default function DeliveryTrackingView({ onToast }: Props) {
           <label className="px-3.5 py-2 rounded-lg bg-[#3B281A] text-[#F8F4EC] text-xs font-semibold flex items-center gap-1.5 hover:bg-[#563C28] cursor-pointer">
             <UploadCloud className="w-4 h-4" />
             {uploading ? 'Đang nạp CSV...' : 'Nạp transaction_detail CSV'}
-            <input type="file" accept=".csv" className="hidden" onChange={e => handleUploadPos(e.target.files?.[0])} />
+            <input type="file" accept=".csv" className="hidden" onChange={handleUploadPos} />
           </label>
 
           <button

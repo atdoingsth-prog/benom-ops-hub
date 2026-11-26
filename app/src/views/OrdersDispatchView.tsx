@@ -24,7 +24,13 @@ interface Props {
 }
 
 export default function OrdersDispatchView({ onToast, onPrint }: Props) {
-  const [subTab, setSubTab] = useState<'orders' | 'handovers'>('orders');
+  const [subTab, setSubTabState] = useState<'orders' | 'handovers'>(() =>
+    (localStorage.getItem('benom_orders_subtab') === 'handovers' ? 'handovers' : 'orders')
+  );
+  const setSubTab = (v: 'orders' | 'handovers') => {
+    setSubTabState(v);
+    localStorage.setItem('benom_orders_subtab', v);
+  };
   const [orders, setOrders] = useState<any[]>([]);
   const [handovers, setHandovers] = useState<any[]>([]);
   const [staff, setStaff] = useState<any[]>([]);

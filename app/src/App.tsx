@@ -31,14 +31,49 @@ const ROLE_BADGE: Record<string, string> = {
   VIEWER: 'Viewer • Chỉ xem',
 };
 
+const VALID_TABS = new Set(NAV_ITEMS.map(n => n.id));
+
+function getInitialTab(): string {
+  const fromHash = window.location.hash.replace(/^#/, '').trim();
+  if (VALID_TABS.has(fromHash)) return fromHash;
+  const fromStorage = localStorage.getItem('benom_active_tab') || '';
+  if (VALID_TABS.has(fromStorage)) return fromStorage;
+  return 'dashboard';
+}
+
 export default function App() {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [dbMode, setDbMode] = useState('local-sqlite');
   const [checkingAuth, setCheckingAuth] = useState(true);
-  const [tab, setTab] = useState('dashboard');
+  const [tab, setTabState] = useState<string>(getInitialTab);
   const [printDoc, setPrintDoc] = useState<PrintDoc | null>(null);
   const [showShare, setShowShare] = useState(false);
   const [toast, setToast] = useState<{ msg: string; tone: 'ok' | 'err' } | null>(null);
+
+  const setTab = (nextTab: string) => {
+    if (!VALID_TABS.has(nextTab)) return;
+    setTabState(nextTab);
+    localStorage.setItem('benom_active_tab', nextTab);
+    if (window.location.hash !== `#${nextTab}`) {
+      window.history.replaceState(null, '', `#${nextTab}`);
+    }
+  };
+
+  useEffect(() => {
+    // Sync URL hash on initial load and browser back/forward
+    if (window.location.hash !== `#${tab}`) {
+      window.history.replaceState(null, '', `#${tab}`);
+    }
+    const onHashChange = () => {
+      const h = window.location.hash.replace(/^#/, '').trim();
+      if (VALID_TABS.has(h)) {
+        setTabState(h);
+        localStorage.setItem('benom_active_tab', h);
+      }
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
 
   const showToast = (msg: string, tone: 'ok' | 'err' = 'ok') => {
     setToast({ msg, tone });

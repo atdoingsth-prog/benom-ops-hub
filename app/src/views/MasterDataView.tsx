@@ -7,7 +7,13 @@ interface Props {
 }
 
 export default function MasterDataView({ onToast }: Props) {
-  const [subTab, setSubTab] = useState<'products' | 'guides'>('products');
+  const [subTab, setSubTabState] = useState<'products' | 'guides'>(() =>
+    (localStorage.getItem('benom_master_subtab') === 'guides' ? 'guides' : 'products')
+  );
+  const setSubTab = (v: 'products' | 'guides') => {
+    setSubTabState(v);
+    localStorage.setItem('benom_master_subtab', v);
+  };
   const [q, setQ] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
   const [products, setProducts] = useState<any[]>([]);

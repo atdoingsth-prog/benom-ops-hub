@@ -1266,9 +1266,14 @@ async function buildDeliveryReport(monthFilter) {
   const monthsRows = await dbAll(`SELECT DISTINCT sales_month FROM delivery_tracking WHERE sales_month != '' ORDER BY sales_month DESC`);
   const available_months = monthsRows.map(r => r.sales_month);
 
+  const effectiveMonth =
+    !monthFilter || monthFilter === 'LATEST'
+      ? (available_months[0] || new Date().toISOString().slice(0, 7))
+      : monthFilter;
+
   let rows;
-  if (monthFilter && monthFilter !== 'ALL') {
-    rows = await dbAll(`SELECT * FROM delivery_tracking WHERE sales_month = ? ORDER BY sales_day DESC, slip_no DESC`, [monthFilter]);
+  if (effectiveMonth && effectiveMonth !== 'ALL') {
+    rows = await dbAll(`SELECT * FROM delivery_tracking WHERE sales_month = ? ORDER BY sales_day DESC, slip_no DESC`, [effectiveMonth]);
   } else {
     rows = await dbAll(`SELECT * FROM delivery_tracking ORDER BY sales_month DESC, sales_day DESC, slip_no DESC`);
   }
@@ -1318,11 +1323,11 @@ async function buildDeliveryReport(monthFilter) {
     net_ship_gap: gDel - gFee,
   };
 
-  return { month: monthFilter || 'ALL', available_months, pivot, grand_total, rows };
+  return { month: effectiveMonth, available_months, pivot, grand_total, rows };
 }
 
 app.get('/api/delivery-tracking', wrap(async (req, res) => {
-  const month = String(req.query.month || '2026-10').trim();
+  const month = String(req.query.month || 'LATEST').trim();
   res.json(await buildDeliveryReport(month));
 }));
 
@@ -1448,7 +1453,7 @@ app.delete('/api/delivery-tracking/:slipNo', requireRoles('ADMIN', 'EDITOR'), wr
 }));
 
 app.get('/api/delivery-tracking/export', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
-  const month = String(req.query.month || '2026-10').trim();
+  const month = String(req.query.month || 'LATEST').trim();
   const report = await buildDeliveryReport(month);
   const wb = XLSX.utils.book_new();
   const wsPivot = XLSX.utils.json_to_sheet([
