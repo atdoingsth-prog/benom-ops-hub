@@ -1,6 +1,9 @@
-import React, { useEffect, useState } from 'react';
-import { BookOpen, ChevronDown, ChevronUp, Edit3, Package, Search, X } from 'lucide-react';
+import React, { lazy, Suspense, useEffect, useMemo, useState } from 'react';
+import { BookOpen, Edit3, ExternalLink, Image as ImageIcon, Package, Search, X } from 'lucide-react';
 import { apiGet, apiGetPage, apiSend, AuthUser, fmtVnd } from '../api';
+import type { GuideLightboxData } from '../components/GuideLightboxModal';
+
+const GuideLightboxModal = lazy(() => import('../components/GuideLightboxModal'));
 
 interface Props {
   user: AuthUser;
@@ -8,6 +11,19 @@ interface Props {
 }
 
 const PAGE_SIZE = 50;
+
+type GuideCategory = 'ALL' | 'MIRROR' | 'TABLE' | 'CHAIR' | 'SOFA' | 'SHELF' | 'LAMP';
+
+function classifyGuideCategory(g: any): GuideCategory {
+  const h = `${g.handle || ''} ${g.title || ''}`.toLowerCase();
+  if (h.includes('mirror') || h.includes('gương')) return 'MIRROR';
+  if (h.includes('sofa')) return 'SOFA';
+  if (h.includes('table') || h.includes('desk') || h.includes('bàn')) return 'TABLE';
+  if (h.includes('chair') || h.includes('armchair') || h.includes('ottoman') || h.includes('stool') || h.includes('ghế') || h.includes('đôn')) return 'CHAIR';
+  if (h.includes('shelf') || h.includes('shelve') || h.includes('kệ')) return 'SHELF';
+  if (h.includes('lamp') || h.includes('đèn')) return 'LAMP';
+  return 'ALL';
+}
 
 export default function MasterDataView({ user, onToast }: Props) {
   const canEditMaster = user.role === 'ADMIN';
@@ -20,15 +36,13 @@ export default function MasterDataView({ user, onToast }: Props) {
   };
   const [q, setQ] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
+  const [guideCat, setGuideCat] = useState<GuideCategory>('ALL');
   const [products, setProducts] = useState<any[]>([]);
   const [totalProducts, setTotalProducts] = useState(0);
   const [loadingMore, setLoadingMore] = useState(false);
 
-  // Guides: lightweight summary list; full content_md fetched on-demand per card
   const [guides, setGuides] = useState<any[]>([]);
-  const [expandedGuides, setExpandedGuides] = useState<Record<number, string>>({});
-  const [loadingGuideId, setLoadingGuideId] = useState<number | null>(null);
-
+  const [lightboxGuide, setLightboxGuide] = useState<GuideLightboxData | null>(null);
   const [editing, setEditing] = useState<any>(null);
 
   const loadProducts = async (offset = 0, append = false) => {
@@ -48,29 +62,23 @@ export default function MasterDataView({ user, onToast }: Props) {
 
   const loadGuides = async () => {
     try {
-      setGuides(await apiGet(`/api/guides?summary=1&q=${encodeURIComponent(q)}`, { cacheMs: 60000 }));
+      const list = await apiGet<any[]>(`/api/guides?summary=1&q=${encodeURIComponent(q)}`, { cacheMs: 60000 });
+      setGuides((list || []).filter(g => (g.image_count || 0) > 0));
     } catch (e: any) {
       onToast(e.message, 'err');
     }
   };
 
-  const toggleGuide = async (id: number) => {
-    if (expandedGuides[id] !== undefined) {
-      setExpandedGuides(prev => {
-        const next = { ...prev };
-        delete next[id];
-        return next;
-      });
-      return;
-    }
-    setLoadingGuideId(id);
+  const openGuideById = async (guideId: number, initialIndex = 0) => {
     try {
-      const full = await apiGet(`/api/guides/${id}`, { cacheMs: 300000 });
-      setExpandedGuides(prev => ({ ...prev, [id]: full.content_md || '' }));
+      const full = await apiGet<any>(`/api/guides/${guideId}`, { cacheMs: 300000 });
+      if (full?.images?.length > 0) {
+        setLightboxGuide({ ...full, initialIndex });
+      } else {
+        onToast('Tài liệu này chưa có ảnh bản vẽ .webp', 'err');
+      }
     } catch (e: any) {
       onToast(e.message, 'err');
-    } finally {
-      setLoadingGuideId(null);
     }
   };
 
@@ -96,12 +104,26 @@ export default function MasterDataView({ user, onToast }: Props) {
     }
   };
 
+  const catCounts = useMemo(() => {
+    const c: Record<GuideCategory, number> = { ALL: guides.length, MIRROR: 0, TABLE: 0, CHAIR: 0, SOFA: 0, SHELF: 0, LAMP: 0 };
+    for (const g of guides) {
+      const cat = classifyGuideCategory(g);
+      if (cat !== 'ALL') c[cat]++;
+    }
+    return c;
+  }, [guides]);
+
+  const filteredGuides = useMemo(() => {
+    if (guideCat === 'ALL') return guides;
+    return guides.filter(g => classifyGuideCategory(g) === guideCat);
+  }, [guides, guideCat]);
+
   return (
     <div className="space-y-5">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold text-[#3B281A]">Danh Mục Master & Thư Viện HDLR / HDBQ</h1>
-          <p className="text-xs text-[#6e5543]">Nguồn sự thật duy nhất (682 mã SKU) & bộ hướng dẫn lắp ráp/bảo quản — tải phân trang & mở nội dung theo nhu cầu.</p>
+          <p className="text-xs text-[#6e5543]">Nguồn sự thật duy nhất (SKU ERP) & bộ bản vẽ .webp Hướng dẫn bảo quản / lắp ráp chính thức từ benom.com.vn.</p>
         </div>
         <div className="flex bg-[#EFE7DC] p-1 rounded-lg self-start">
           <button
@@ -126,7 +148,7 @@ export default function MasterDataView({ user, onToast }: Props) {
           <input
             value={q}
             onChange={e => setQ(e.target.value)}
-            placeholder={subTab === 'products' ? 'Tìm theo Barcode, tên sản phẩm, NCC...' : 'Tìm hướng dẫn lắp ráp / bảo quản (Noma, Murest, Lilow, Kito...)'}
+            placeholder={subTab === 'products' ? 'Tìm theo Barcode, tên sản phẩm, NCC...' : 'Tìm bản vẽ theo tên SP, dòng SP hoặc Barcode (Be-There, Noma, Murest, Lilow, 893...)'}
             className="w-full pl-9 pr-3 py-2 rounded-lg border border-[#D6BCA5] bg-white text-xs"
           />
         </div>
@@ -155,6 +177,7 @@ export default function MasterDataView({ user, onToast }: Props) {
                 <tr className="bg-[#F8F4EC] border-b border-[#E6DDD1] text-[#6e5543]">
                   <th className="py-2.5 px-3">Barcode</th>
                   <th className="py-2.5 px-3">Tên sản phẩm / Loại</th>
+                  <th className="py-2.5 px-2 text-center">HDBQ / HDLR</th>
                   <th className="py-2.5 px-2 text-right">Giá bán</th>
                   <th className="py-2.5 px-2 text-right">Nặng (kg)</th>
                   <th className="py-2.5 px-2 text-right">P_Handling</th>
@@ -175,6 +198,20 @@ export default function MasterDataView({ user, onToast }: Props) {
                         {p.net_weight_g >= 25000 ? <span className="ml-1.5 px-1.5 py-0.5 rounded bg-red-100 text-[#9A2B26] text-[10px] font-bold">≥25kg (2 KTV)</span> : null}
                       </div>
                       <div className="text-[10px] text-[#6e5543]">{p.item_type} • {p.supplier_name || '—'}</div>
+                    </td>
+                    <td className="py-2 px-2 text-center whitespace-nowrap">
+                      {p.guide_id ? (
+                        <button
+                          type="button"
+                          onClick={() => openGuideById(p.guide_id, 0)}
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-blue-50 text-[#224B85] border border-blue-200 hover:bg-blue-100 text-[10px] font-bold cursor-pointer"
+                          title={`Mở bản vẽ .webp HDBQ & HDLR — ${p.guide_title}`}
+                        >
+                          <ImageIcon className="w-3 h-3" /> {p.guide_image_count} ảnh
+                        </button>
+                      ) : (
+                        <span className="text-[10px] text-[#a38f7e]">—</span>
+                      )}
                     </td>
                     <td className="py-2 px-2 text-right font-medium">{p.retail_price ? fmtVnd(p.retail_price) : '—'}</td>
                     <td className="py-2 px-2 text-right">{p.net_weight_g ? (p.net_weight_g / 1000).toFixed(1) : '—'}</td>
@@ -208,36 +245,136 @@ export default function MasterDataView({ user, onToast }: Props) {
           )}
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {guides.map(g => {
-            const isOpen = expandedGuides[g.id] !== undefined;
-            const isLoading = loadingGuideId === g.id;
-            return (
-              <div key={g.id} className="bg-white rounded-xl p-4 border border-[#E6DDD1] space-y-2">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="px-2 py-0.5 rounded bg-[#F8F4EC] border border-[#D6BCA5] text-[10px] font-bold text-[#3B281A]">
-                    {g.product_line || 'Chung'} • {g.guide_type || 'HDLR'}
-                  </span>
-                  <button
-                    onClick={() => toggleGuide(g.id)}
-                    disabled={isLoading}
-                    className="text-[11px] font-semibold text-[#224B85] hover:underline flex items-center gap-1 cursor-pointer"
-                  >
-                    {isLoading ? 'Đang tải...' : isOpen ? <>Thu gọn <ChevronUp className="w-3.5 h-3.5" /></> : <>Xem chi tiết <ChevronDown className="w-3.5 h-3.5" /></>}
-                  </button>
+        <div className="space-y-4">
+          {/* Category Filter Pills for Official .webp Guides */}
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            {([
+              ['ALL', `Tất cả bản vẽ (${catCounts.ALL})`],
+              ['TABLE', `Bàn (${catCounts.TABLE})`],
+              ['CHAIR', `Ghế & Đôn (${catCounts.CHAIR})`],
+              ['SOFA', `Sofa (${catCounts.SOFA})`],
+              ['SHELF', `Kệ (${catCounts.SHELF})`],
+              ['MIRROR', `Gương (${catCounts.MIRROR})`],
+              ['LAMP', `Đèn (${catCounts.LAMP})`],
+            ] as [GuideCategory, string][]).map(([k, lbl]) => (
+              <button
+                key={k}
+                type="button"
+                onClick={() => setGuideCat(k)}
+                className={`px-3 py-1.5 rounded-lg font-semibold cursor-pointer border transition-colors ${
+                  guideCat === k
+                    ? 'bg-[#3B281A] text-[#F8F4EC] border-[#3B281A]'
+                    : 'bg-white text-[#3B281A] border-[#D6BCA5] hover:bg-[#F8F4EC]'
+                }`}
+              >
+                {lbl}
+              </button>
+            ))}
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {filteredGuides.map(g => (
+              <div key={g.id} className="bg-white rounded-xl p-4 border border-[#E6DDD1] space-y-2.5 flex flex-col justify-between">
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="px-2 py-0.5 rounded bg-[#F8F4EC] border border-[#D6BCA5] text-[10px] font-bold text-[#3B281A]">
+                        {g.product_line || 'benom'} • {g.guide_type || 'HDBQ & HDLR'}
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-blue-50 border border-blue-200 text-[10px] font-bold text-[#224B85] inline-flex items-center gap-1">
+                        <ImageIcon className="w-3 h-3" /> {g.images.length} ảnh .webp
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {g.source_url && (
+                        <a
+                          href={g.source_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-[11px] text-[#6e5543] hover:text-[#3B281A]"
+                          title="Mở trên benom.com.vn"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                        </a>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setLightboxGuide({ ...g, initialIndex: 0 })}
+                        className="text-[11px] font-semibold text-[#224B85] hover:underline cursor-pointer"
+                      >
+                        Phóng to
+                      </button>
+                    </div>
+                  </div>
+
+                  <h3 className="font-bold text-sm text-[#3B281A]">{g.title}</h3>
+
+                  {g.barcodes && g.barcodes.length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {g.barcodes.slice(0, 6).map((bc: string) => (
+                        <span key={bc} className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#FAF7F2] border border-[#EFE7DC] text-[#6e5543]">
+                          {bc}
+                        </span>
+                      ))}
+                      {g.barcodes.length > 6 && (
+                        <span className="text-[10px] text-[#6e5543] px-1">+{g.barcodes.length - 6} mã</span>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-2 gap-2 pt-1">
+                    {g.images.slice(0, 4).map((im: any, idx: number) => (
+                      <button
+                        key={idx}
+                        type="button"
+                        onClick={() => setLightboxGuide({ ...g, initialIndex: idx })}
+                        className="group relative rounded-lg overflow-hidden border border-[#E6DDD1] bg-[#FAF7F2] hover:border-[#224B85] text-left cursor-pointer"
+                      >
+                        <img
+                          src={im.cdn_url}
+                          alt={`${g.title} - ${im.label}`}
+                          loading="lazy"
+                          onError={(e) => {
+                            const el = e.currentTarget;
+                            if (im.local_path && !el.dataset.fb) {
+                              el.dataset.fb = '1';
+                              el.src = im.local_path;
+                            }
+                          }}
+                          className="w-full h-32 object-cover object-top group-hover:scale-[1.02] transition-transform"
+                        />
+                        <div className="px-2 py-1 bg-white/95 border-t border-[#EFE7DC] text-[10px] font-semibold text-[#3B281A] truncate">
+                          {String(idx + 1).padStart(2, '0')}. {im.label}
+                        </div>
+                      </button>
+                    ))}
+                    {g.images.length > 4 && (
+                      <button
+                        type="button"
+                        onClick={() => setLightboxGuide({ ...g, initialIndex: 4 })}
+                        className="col-span-2 py-1.5 rounded-lg bg-[#F8F4EC] text-[11px] font-semibold text-[#224B85] hover:bg-[#EFE7DC] cursor-pointer"
+                      >
+                        + Xem thêm {g.images.length - 4} ảnh hướng dẫn khác
+                      </button>
+                    )}
+                  </div>
                 </div>
-                <h3 className="font-bold text-sm text-[#3B281A]">{g.title}</h3>
-                {!isOpen ? (
-                  <p className="text-xs text-[#6e5543] line-clamp-2">{g.preview}</p>
-                ) : (
-                  <pre className="whitespace-pre-wrap font-sans text-xs text-[#4a392d] bg-[#FAF7F2] p-3 rounded-lg max-h-64 overflow-y-auto border border-[#EFE7DC]">
-                    {expandedGuides[g.id]}
-                  </pre>
-                )}
               </div>
-            );
-          })}
+            ))}
+            {filteredGuides.length === 0 && (
+              <div className="col-span-full py-10 text-center text-xs text-[#6e5543] bg-white rounded-xl border border-[#E6DDD1]">
+                Không tìm thấy bản vẽ hướng dẫn nào khớp từ khóa.
+              </div>
+            )}
+          </div>
         </div>
+      )}
+
+      {/* Lazy-loaded Visual Guide Lightbox Modal */}
+      {lightboxGuide && (
+        <Suspense fallback={null}>
+          <GuideLightboxModal guide={lightboxGuide} onClose={() => setLightboxGuide(null)} />
+        </Suspense>
       )}
 
       {/* Edit Modal */}

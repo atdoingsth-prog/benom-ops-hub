@@ -325,7 +325,11 @@ const SCHEMA_STATEMENTS = [
     title TEXT NOT NULL,
     product_line TEXT DEFAULT '',
     guide_type TEXT DEFAULT 'HDLR',
-    content_md TEXT NOT NULL
+    content_md TEXT NOT NULL,
+    handle TEXT DEFAULT '',
+    source_url TEXT DEFAULT '',
+    barcodes_json TEXT DEFAULT '[]',
+    images_json TEXT DEFAULT '[]'
   )`,
   `CREATE TABLE IF NOT EXISTS pos_slips (
     slip_no TEXT PRIMARY KEY,
@@ -480,6 +484,7 @@ const SCHEMA_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_warranty_invoice ON warranty_tickets(invoice_no)`,
   `CREATE INDEX IF NOT EXISTS idx_products_type_top ON products(item_type, is_top_50 DESC, net_weight_g DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_spare_part_logs_part ON spare_part_logs(part_id, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_product_guides_line ON product_guides(product_line)`,
 ];
 
 export async function initDb() {
@@ -493,7 +498,12 @@ export async function initDb() {
     `ALTER TABLE order_items ADD COLUMN source_warehouse TEXT DEFAULT ''`,
     `ALTER TABLE order_items ADD COLUMN moving_no TEXT DEFAULT ''`,
     `ALTER TABLE qc_factory_returns ADD COLUMN defect_category TEXT DEFAULT 'Khác'`,
+    `ALTER TABLE product_guides ADD COLUMN handle TEXT DEFAULT ''`,
+    `ALTER TABLE product_guides ADD COLUMN source_url TEXT DEFAULT ''`,
+    `ALTER TABLE product_guides ADD COLUMN barcodes_json TEXT DEFAULT '[]'`,
+    `ALTER TABLE product_guides ADD COLUMN images_json TEXT DEFAULT '[]'`,
   ].map(alterSql => dbRun(alterSql).catch(() => { /* column already exists */ })));
+  await dbRun(`CREATE INDEX IF NOT EXISTS idx_product_guides_handle ON product_guides(handle)`).catch(() => {});
 
   // Check seed status in 1 parallel batch instead of 4 sequential round-trips
   const [userCount, whCount, stCount, spCount] = await Promise.all([

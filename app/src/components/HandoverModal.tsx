@@ -63,7 +63,8 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
       setLoadingGuides(true);
       try {
         const names = (handover.items || []).map((it: any) => it.product_name || '').join(' ');
-        setMatchedGuides(await apiGet(`/api/guides/match?names=${encodeURIComponent(names)}`));
+        const barcodes = (handover.items || []).map((it: any) => String(it.barcode || '').trim()).filter(Boolean).join(',');
+        setMatchedGuides(await apiGet(`/api/guides/match?barcodes=${encodeURIComponent(barcodes)}&names=${encodeURIComponent(names)}`));
       } catch { /* ignore */ } finally {
         setLoadingGuides(false);
       }
@@ -320,9 +321,41 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
                             {g.guide_type || 'HDLR'} {g.product_line ? `• ${g.product_line}` : ''}
                           </span>
                         </summary>
-                        <pre className="mt-2 pt-2 border-t border-[#F0E9DF] whitespace-pre-wrap font-sans text-[11px] text-[#3B281A] leading-relaxed max-h-44 overflow-y-auto">
-                          {g.content_md}
-                        </pre>
+                        {Array.isArray(g.images) && g.images.length > 0 ? (
+                          <div className="mt-2 pt-2 border-t border-[#F0E9DF] grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            {g.images.map((im: any, iIdx: number) => (
+                              <a
+                                key={iIdx}
+                                href={im.cdn_url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="block rounded-lg overflow-hidden border border-[#E6DDD1] bg-[#FAF7F2] hover:border-[#224B85]"
+                                title="Nhấn để mở ảnh bản vẽ kích thước lớn"
+                              >
+                                <img
+                                  src={im.cdn_url}
+                                  alt={im.label}
+                                  loading="lazy"
+                                  onError={(e) => {
+                                    const el = e.currentTarget;
+                                    if (im.local_path && !el.dataset.fb) {
+                                      el.dataset.fb = '1';
+                                      el.src = im.local_path;
+                                    }
+                                  }}
+                                  className="w-full h-36 object-cover object-top"
+                                />
+                                <div className="px-2 py-1 bg-white text-[10px] font-semibold text-[#224B85] truncate">
+                                  {String(iIdx + 1).padStart(2, '0')}. {im.label} (Nhấn để phóng to ↗)
+                                </div>
+                              </a>
+                            ))}
+                          </div>
+                        ) : (
+                          <pre className="mt-2 pt-2 border-t border-[#F0E9DF] whitespace-pre-wrap font-sans text-[11px] text-[#3B281A] leading-relaxed max-h-44 overflow-y-auto">
+                            {g.content_md}
+                          </pre>
+                        )}
                       </details>
                     ))
                   )}

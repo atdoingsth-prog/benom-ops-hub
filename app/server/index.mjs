@@ -19,12 +19,16 @@ setAuthUserLoader(id =>
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.resolve(__dirname, '../dist');
+const GUIDE_MEDIA_DIR = path.resolve(__dirname, '../../03_data/product_guides_webp');
 const PORT = process.env.PORT || 3005;
 
 const app = express();
 app.disable('x-powered-by');
 app.use(cors({ exposedHeaders: ['X-Total-Count', 'Content-Disposition'] }));
 app.use(express.json({ limit: '15mb' }));
+if (fs.existsSync(GUIDE_MEDIA_DIR)) {
+  app.use('/guide-media', express.static(GUIDE_MEDIA_DIR, { maxAge: '7d', immutable: true }));
+}
 
 // Zero-dependency Gzip compression for JSON API payloads >= 1 KB (cuts mobile 4G wire size 75-85%)
 app.use((req, res, next) => {
@@ -931,6 +935,27 @@ app.get('/api/dashboard/best-sellers', wrap(async (req, res) => {
   res.json(setServerCache(cacheKey, { days, sort, months: [...months].reverse(), total: total || { count: 0, total_qty: 0, total_sales_amt: 0 }, items }, 45000));
 }));
 
+async function getGuideBarcodeMap() {
+  const cached = getServerCache('guides:barcode-map');
+  if (cached) return cached;
+  const rows = await dbAll(`SELECT id, title, handle, barcodes_json, images_json FROM product_guides WHERE images_json IS NOT NULL AND images_json != '' AND images_json != '[]'`);
+  const map = new Map();
+  for (const r of rows) {
+    let bcs = [];
+    let imgs = [];
+    try { bcs = JSON.parse(r.barcodes_json || '[]'); } catch { bcs = []; }
+    try { imgs = JSON.parse(r.images_json || '[]'); } catch { imgs = []; }
+    if (!Array.isArray(imgs) || imgs.length === 0) continue;
+    for (const bc of (Array.isArray(bcs) ? bcs : [])) {
+      const clean = String(bc || '').trim();
+      if (clean && !map.has(clean)) {
+        map.set(clean, { guide_id: r.id, guide_title: r.title, guide_handle: r.handle || '', guide_image_count: imgs.length });
+      }
+    }
+  }
+  return setServerCache('guides:barcode-map', map, 120000);
+}
+
 // ─── 2. MASTER DATA & GUIDES (PAGINATED + LEAN PROJECTION) ─────
 app.get('/api/master/products', wrap(async (req, res) => {
   const q = (req.query.q || '').trim();
@@ -967,12 +992,17 @@ app.get('/api/master/products', wrap(async (req, res) => {
        ${where} ORDER BY p.is_top_50 DESC, p.net_weight_g DESC, p.name_vn ASC LIMIT ? OFFSET ?`
     : `SELECT ${cols} FROM products p ${where} ORDER BY p.is_top_50 DESC, p.net_weight_g DESC, p.name_vn ASC LIMIT ? OFFSET ?`;
 
-  const [countRow, prods] = await Promise.all([
+  const [countRow, prods, guideMap] = await Promise.all([
     dbGet(`SELECT COUNT(*) as c FROM products p ${where}`, filterParams),
     dbAll(selectSql, includeStock ? [latest9005, ...filterParams, limit, offset] : [...filterParams, limit, offset]),
+    getGuideBarcodeMap(),
   ]);
   res.setHeader('X-Total-Count', String(countRow?.c || prods.length));
-  if (!includeAllStock || prods.length === 0) return res.json(prods);
+  const attachGuide = (p) => {
+    const g = guideMap.get(String(p.barcode || '').trim());
+    return g ? { ...p, ...g } : p;
+  };
+  if (!includeAllStock || prods.length === 0) return res.json(prods.map(attachGuide));
 
   const latestByStore = await dbAll(`SELECT store_code, MAX(target_month) as m FROM erp_snapshots WHERE store_code IN ('9005','3001','1001') GROUP BY store_code`);
   const stockMap = new Map();
@@ -1001,7 +1031,7 @@ app.get('/api/master/products', wrap(async (req, res) => {
   }
   res.json(prods.map(p => {
     const st = stockMap.get(p.barcode) || { s9005: 0, s3001: 0, s1001: 0 };
-    return { ...p, stock_9005: st.s9005, stock_3001: st.s3001, stock_1001: st.s1001 };
+    return attachGuide({ ...p, stock_9005: st.s9005, stock_3001: st.s3001, stock_1001: st.s1001 });
   }));
 }));
 
@@ -1091,41 +1121,74 @@ function normalizeKtvInput(b, fallbackRow = null) {
   };
 }
 
+function parseJsonArraySafe(raw) {
+  try {
+    const arr = JSON.parse(raw || '[]');
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
 app.get('/api/guides', wrap(async (req, res) => {
   const q = (req.query.q || '').trim();
   const summary = req.query.summary === '1';
+  const cacheKey = `guides:list:${summary ? '1' : '0'}:${q.toLowerCase()}`;
+  const cached = getServerCache(cacheKey);
+  if (cached) return res.json(cached);
+
+  const selectCols = summary
+    ? `id, title, product_line, guide_type, handle, source_url, barcodes_json, images_json, substr(content_md, 1, 220) as content_md`
+    : `id, title, product_line, guide_type, handle, source_url, barcodes_json, images_json, content_md`;
+  const orderSql = `ORDER BY CASE WHEN images_json IS NOT NULL AND images_json != '' AND images_json != '[]' THEN 0 ELSE 1 END, product_line ASC, title ASC, id ASC`;
+
   const rows = q
     ? await dbAll(
-        summary
-          ? `SELECT id, title, product_line, guide_type, substr(content_md, 1, 220) as content_md FROM product_guides WHERE title LIKE ? OR product_line LIKE ? OR content_md LIKE ? ORDER BY product_line, id`
-          : `SELECT * FROM product_guides WHERE title LIKE ? OR product_line LIKE ? OR content_md LIKE ? ORDER BY product_line, id`,
-        [`%${q}%`, `%${q}%`, `%${q}%`]
+        `SELECT ${selectCols} FROM product_guides WHERE title LIKE ? OR product_line LIKE ? OR handle LIKE ? OR barcodes_json LIKE ? OR content_md LIKE ? ${orderSql}`,
+        [`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`]
       )
-    : await dbAll(
-        summary
-          ? `SELECT id, title, product_line, guide_type, substr(content_md, 1, 220) as content_md FROM product_guides ORDER BY product_line, id`
-          : `SELECT * FROM product_guides ORDER BY product_line, id`
-      );
-  if (!summary) return res.json(rows);
-  res.json(rows.map(g => {
+    : await dbAll(`SELECT ${selectCols} FROM product_guides ${orderSql}`);
+
+  const formatted = rows.map(g => {
+    const images = parseJsonArraySafe(g.images_json);
+    const barcodes = parseJsonArraySafe(g.barcodes_json);
     const cleanText = String(g.content_md || '').replace(/[#*_\\!]|\[.*?\]/g, ' ').replace(/\s+/g, ' ').trim();
     const title = String(g.title || '').trim() || cleanText.slice(0, 80) || `Tài liệu ${g.guide_type || 'HDLR'} #${g.id}`;
+    if (!summary) {
+      return { ...g, title, images, barcodes, image_count: images.length };
+    }
     return {
       id: g.id,
       title,
       product_line: g.product_line || 'Chung',
       guide_type: g.guide_type || 'HDLR',
+      handle: g.handle || '',
+      source_url: g.source_url || '',
+      barcodes,
+      images,
+      image_count: images.length,
       preview: cleanText.slice(0, 160),
     };
-  }));
+  });
+  res.json(setServerCache(cacheKey, formatted, 60000));
 }));
 
-// Quick HDLR/HDBQ matcher for KTV on-site inside BM-01 HandoverModal (TASK-14)
+// Quick HDLR/HDBQ matcher for KTV on-site inside BM-01 HandoverModal (TASK-14 + official benom.com.vn .webp sheets)
 app.get('/api/guides/match', wrap(async (req, res) => {
   const names = String(req.query.names || '').trim().toLowerCase();
-  const all = await dbAll(`SELECT id, title, product_line, guide_type, content_md FROM product_guides ORDER BY product_line, id`);
+  const barcodesParam = String(req.query.barcodes || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  const barcodeSet = new Set(barcodesParam);
 
-  const normalizeGuide = (g) => {
+  const all = await dbAll(`
+    SELECT id, title, product_line, guide_type, handle, source_url, barcodes_json, images_json, content_md
+    FROM product_guides
+    ORDER BY CASE WHEN images_json IS NOT NULL AND images_json != '' AND images_json != '[]' THEN 0 ELSE 1 END, product_line, id
+  `);
+
+  const normalized = all.map(g => {
     let title = String(g.title || '').trim();
     if (!title) {
       const firstLine = String(g.content_md || '')
@@ -1134,13 +1197,25 @@ app.get('/api/guides/match', wrap(async (req, res) => {
         .find(l => l.length > 2);
       title = firstLine ? firstLine.slice(0, 90) : `Tài liệu ${g.guide_type || 'HDLR'} #${g.id}`;
     }
-    return { ...g, title };
-  };
+    const images = parseJsonArraySafe(g.images_json);
+    const barcodes = parseJsonArraySafe(g.barcodes_json);
+    return {
+      id: g.id,
+      title,
+      product_line: g.product_line || 'Chung',
+      guide_type: g.guide_type || 'HDLR',
+      handle: g.handle || '',
+      source_url: g.source_url || '',
+      barcodes,
+      images,
+      image_count: images.length,
+      content_md: g.content_md || '',
+    };
+  });
 
-  const normalized = all.map(normalizeGuide);
-  if (!names) return res.json(normalized.slice(0, 6));
+  if (!names && barcodeSet.size === 0) return res.json(normalized.slice(0, 6));
 
-  const stopWords = new Set(['benom', 'màu', 'trắng', 'nâu', 'đen', 'xám', 'nhiên', 'kích', 'thước', 'loại', 'chiếc', 'thùng']);
+  const stopWords = new Set(['benom', 'màu', 'trắng', 'nâu', 'đen', 'xám', 'nhiên', 'kích', 'thước', 'loại', 'chiếc', 'thùng', 'chân', 'vải', 'xanh', 'cam', 'tầng']);
   const tokens = Array.from(
     new Set(
       names
@@ -1153,26 +1228,32 @@ app.get('/api/guides/match', wrap(async (req, res) => {
   const scored = normalized
     .map(g => {
       let score = 0;
+      // 1. Exact ERP barcode match (highest confidence!)
+      if (barcodeSet.size > 0 && g.barcodes.some(bc => barcodeSet.has(String(bc).trim()))) {
+        score += 120;
+      }
       const line = String(g.product_line || '').toLowerCase();
       const titleLow = String(g.title || '').toLowerCase();
+      const handleLow = String(g.handle || '').toLowerCase();
       const contentLow = String(g.content_md || '').toLowerCase();
 
-      if (line && line !== 'chung' && names.includes(line)) score += 20;
+      if (line && line !== 'chung' && names.includes(line)) score += 25;
       for (const tok of tokens) {
-        if (titleLow.includes(tok)) score += tok.length >= 4 ? 8 : 4;
-        if (contentLow.includes(tok)) score += tok.length >= 4 ? 5 : 2;
+        if (titleLow.includes(tok) || handleLow.includes(tok)) score += tok.length >= 4 ? 10 : 5;
+        if (contentLow.includes(tok)) score += tok.length >= 4 ? 4 : 2;
       }
+      if (score > 0 && g.image_count > 0) score += 20;
       return { guide: g, score };
     })
     .filter(x => x.score > 0)
     .sort((a, b) => b.score - a.score);
 
-  const seenContent = new Set();
+  const seen = new Set();
   const deduped = [];
   for (const x of scored) {
-    const key = String(x.guide.content_md || '').trim().slice(0, 120);
-    if (seenContent.has(key)) continue;
-    seenContent.add(key);
+    const key = x.guide.handle || String(x.guide.content_md || '').trim().slice(0, 120);
+    if (seen.has(key)) continue;
+    seen.add(key);
     deduped.push(x.guide);
     if (deduped.length >= 6) break;
   }
@@ -1181,9 +1262,11 @@ app.get('/api/guides/match', wrap(async (req, res) => {
 }));
 
 app.get('/api/guides/:id', wrap(async (req, res) => {
-  const row = await dbGet('SELECT id, title, product_line, guide_type, content_md FROM product_guides WHERE id = ?', [req.params.id]);
+  const row = await dbGet('SELECT id, title, product_line, guide_type, handle, source_url, barcodes_json, images_json, content_md FROM product_guides WHERE id = ?', [req.params.id]);
   if (!row) return res.status(404).json({ error: 'Không tìm thấy tài liệu hướng dẫn' });
-  res.json(row);
+  const images = parseJsonArraySafe(row.images_json);
+  const barcodes = parseJsonArraySafe(row.barcodes_json);
+  res.json({ ...row, images, barcodes, image_count: images.length });
 }));
 
 // ─── 2B. SPARE PARTS / KHO NGŨ KIM KTV (TASK-15) ──────────────
