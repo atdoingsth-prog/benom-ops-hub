@@ -2714,6 +2714,40 @@ app.get('/api/delivery-tracking/lookup-pos', wrap(async (req, res) => {
   res.json(rows);
 }));
 
+app.get('/api/delivery-tracking/:slipNo/detail', wrap(async (req, res) => {
+  const slipNo = String(req.params.slipNo || '').trim();
+  if (!slipNo) return res.status(400).json({ error: 'Thiếu mã hóa đơn (Slip No.)' });
+
+  const [tracking, pos, order, handovers, warehouseSlips, warrantyTickets] = await Promise.all([
+    dbGet(`SELECT * FROM delivery_tracking WHERE slip_no = ?`, [slipNo]),
+    dbGet(`SELECT * FROM pos_slips WHERE slip_no = ?`, [slipNo]),
+    dbGet(`SELECT * FROM orders WHERE invoice_no = ? ORDER BY CASE WHEN status = 'Cancelled' THEN 1 ELSE 0 END, id DESC LIMIT 1`, [slipNo]),
+    dbAll(`SELECT id, doc_no, doc_type, handover_date, warehouse_code, customer_name, carrier, ktv1_name, ktv1_code, ktv2_name, ktv2_code, ktvs_json, csat_rating, csat_comment, status FROM handovers WHERE invoice_no = ? ORDER BY id DESC`, [slipNo]),
+    dbAll(`SELECT id, slip_no, slip_type, slip_date, expected_date, warehouse_code, carrier, purpose, status, notes FROM warehouse_slips WHERE ref_invoice = ? ORDER BY id DESC`, [slipNo]),
+    dbAll(`SELECT id, ticket_no, created_at, product_name, service_level, issue_desc, status FROM warranty_tickets WHERE invoice_no = ? ORDER BY id DESC`, [slipNo]),
+  ]);
+
+  let orderItems = [];
+  if (order) {
+    orderItems = await dbAll(`SELECT * FROM order_items WHERE order_id = ? ORDER BY id ASC`, [order.id]);
+  }
+
+  if (!tracking && !pos && !order) {
+    return res.status(404).json({ error: `Không tìm thấy thông tin cho hóa đơn ${slipNo}` });
+  }
+
+  res.json({
+    slip_no: slipNo,
+    tracking: tracking || null,
+    pos: pos || null,
+    order: order || null,
+    order_items: orderItems,
+    handovers,
+    warehouse_slips: warehouseSlips,
+    warranty_tickets: warrantyTickets,
+  });
+}));
+
 app.post('/api/delivery-tracking/:slipNo/push-to-order', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
   const slipNo = String(req.params.slipNo || '').trim();
   const existingOrder = await dbGet(`SELECT id, status FROM orders WHERE invoice_no = ? ORDER BY id DESC LIMIT 1`, [slipNo]);

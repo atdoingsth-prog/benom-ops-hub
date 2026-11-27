@@ -6,6 +6,7 @@ import {
   Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis
 } from 'recharts';
 import { apiDownload, apiGet, apiSend, apiUpload, AuthUser, fmtMonth, fmtVnd } from '../api';
+import SlipDetailModal from '../components/SlipDetailModal';
 
 interface Props {
   user: AuthUser;
@@ -13,11 +14,12 @@ interface Props {
   onNavigate?: (tab: string) => void;
 }
 
-const CARRIERS = ['', 'Ahamove', 'Xanh SM', '247 Express', 'Sagawa', 'Benom staff', 'Lalamove', 'Viettel Post', 'Khác'];
+const CARRIERS = ['', 'Ahamove', 'Xanh SM', '247 Express', 'Sagawa', 'Toàn Nhất Logistics', 'Nhất Tín Logistics', 'Kỹ thuật Benom', 'Benom staff', 'Lalamove', 'Viettel Post', 'Khác'];
 
 export default function DeliveryTrackingView({ user, onToast, onNavigate }: Props) {
   const canEdit = user.role === 'ADMIN' || user.role === 'EDITOR';
   const [pushingSlip, setPushingSlip] = useState<string | null>(null);
+  const [detailSlipNo, setDetailSlipNo] = useState<string | null>(null);
   const [month, setMonthState] = useState<string>(() => localStorage.getItem('benom_3pl_month') || 'LATEST');
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
@@ -417,7 +419,15 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
                     return (
                       <tr key={r.slip_no} className={`hover:bg-[#FAF7F2] ${ed.dirty ? 'bg-amber-50/40' : ''}`}>
                         <td className="py-2 px-3 max-w-[230px]">
-                          <div className="font-mono font-bold text-[#3B281A]">{r.slip_no}</div>
+                          <button
+                            type="button"
+                            onClick={() => setDetailSlipNo(r.slip_no)}
+                            className="font-mono font-bold text-[#224B85] hover:text-[#3B281A] hover:underline cursor-pointer text-left inline-flex items-center gap-1"
+                            title="Nhấn để xem thông tin chi tiết đơn hàng"
+                          >
+                            {r.slip_no}
+                            <ArrowUpRight className="w-3 h-3 opacity-70 shrink-0" />
+                          </button>
                           <div className="text-[10px] text-[#6e5543]">{r.sales_day}</div>
                           {r.items_summary && <div className="text-[10px] text-[#6e5543] truncate" title={r.items_summary}>{r.items_summary}</div>}
                         </td>
@@ -538,6 +548,16 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
           </div>
         </>
       )}
+
+      {/* Slip No. Detail Pop-up Modal */}
+      <SlipDetailModal
+        slipNo={detailSlipNo}
+        canEdit={canEdit}
+        onClose={() => setDetailSlipNo(null)}
+        onPushToDispatch={pushToDispatch}
+        onNavigateOrders={onNavigate ? () => onNavigate('orders') : undefined}
+        onToast={onToast}
+      />
 
       {/* Add Freeship / Manual Slip Modal */}
       {showAdd && (
