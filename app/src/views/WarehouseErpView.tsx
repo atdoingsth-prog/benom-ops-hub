@@ -415,7 +415,7 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
               <div className="font-bold text-sm text-[#3B281A]">
                 {erpUploading ? 'Đang xử lý & lọc SKU benom...' : 'Nhấn để chọn file InventoryPLU_*.csv'}
               </div>
-              <div className="text-xs text-[#6e5543] mt-1">Hỗ trợ file dung lượng lớn (tối đa 50 MB)</div>
+              <div className="text-xs text-[#6e5543] mt-1">Hỗ trợ file dung lượng lớn (tối đa 150 MB — đọc stream chống tràn RAM)</div>
               <input type="file" accept=".csv" className="hidden" onChange={e => handleErpFile(e.target.files?.[0])} />
             </label>
           ) : (

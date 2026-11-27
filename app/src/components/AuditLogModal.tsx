@@ -11,14 +11,17 @@ const ENTITY_OPTIONS = [
   ['', 'Tất cả phân hệ'],
   ['ALLOWANCE', 'Chốt / Mở khóa Phụ cấp KTV'],
   ['DELIVERY_3PL', 'Phí 3PL (POS)'],
+  ['3PL', 'Gộp / Nạp POS 3PL'],
   ['ORDER', 'Đơn hàng & Điều phối'],
   ['WAREHOUSE_SLIP', 'Phiếu Kho 9005 (NK/XK)'],
+  ['ERP', 'Nạp ERP CSV'],
   ['PRODUCT', 'Định mức Master SKU'],
   ['BM03', 'BM-03 Thu hồi Cấp 3'],
   ['BM04', 'BM-04 Sự cố / Claim 3PL'],
   ['QC_RETURN', 'QC Trả xưởng NCC'],
   ['SPARE_PART', 'Kho Ngũ Kim KTV'],
   ['USER', 'Tài khoản & Phân quyền'],
+  ['SYSTEM', 'Hệ thống / Sao lưu'],
 ];
 
 export default function AuditLogModal({ onClose, onToast }: Props) {
