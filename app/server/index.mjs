@@ -233,13 +233,23 @@ async function getLockedAllowanceMonth(dateStr) {
 async function calcWarehouse9005Footprint() {
   const latestRow = await dbGet(`SELECT MAX(target_month) as m FROM erp_snapshots WHERE store_code = '9005'`);
   const latest = latestRow?.m || '202611';
+  const latest3001Row = await dbGet(`SELECT MAX(target_month) as m FROM erp_snapshots WHERE store_code = '3001'`);
+  const latest3001 = latest3001Row?.m || '202611';
+  const latest1001Row = await dbGet(`SELECT MAX(target_month) as m FROM erp_snapshots WHERE store_code = '1001'`);
+  const latest1001 = latest1001Row?.m || '';
+
   const rows = await dbAll(`
     SELECT e.barcode, e.product_name, e.supplier_code, e.close_qty, e.close_cst,
-           p.supplier_name, p.box_w_cm, p.box_d_cm, p.box_h_cm, p.qty_per_pcs, p.qty_per_box, p.max_stack, p.retail_price
+           p.supplier_name, p.category, p.product_family, p.unit,
+           p.box_w_cm, p.box_d_cm, p.box_h_cm, p.qty_per_pcs, p.qty_per_box, p.max_stack, p.retail_price,
+           COALESCE(s3.close_qty, 0) as stock_3001,
+           COALESCE(s1.close_qty, 0) as stock_1001
     FROM erp_snapshots e
     LEFT JOIN products p ON p.barcode = e.barcode
+    LEFT JOIN erp_snapshots s3 ON s3.barcode = e.barcode AND s3.store_code = '3001' AND s3.target_month = ?
+    LEFT JOIN erp_snapshots s1 ON s1.barcode = e.barcode AND s1.store_code = '1001' AND s1.target_month = ?
     WHERE e.store_code = '9005' AND e.target_month = ? AND e.close_qty > 0
-  `, [latest]);
+  `, [latest3001, latest1001, latest]);
 
   let totalArea = 0;
   let totalQty = 0;
@@ -250,6 +260,7 @@ async function calcWarehouse9005Footprint() {
   for (const r of rows) {
     const w = r.box_w_cm || 0;
     const d = r.box_d_cm || 0;
+    const h = r.box_h_cm || 0;
     const baseArea = (w * d) / 10000;
     const denom = (r.qty_per_pcs || 1) * (r.qty_per_box || 1);
     const maxStack = Math.max(1, r.max_stack || 1);
@@ -261,7 +272,8 @@ async function calcWarehouse9005Footprint() {
     totalQty += r.close_qty;
     totalCost += r.close_cst || 0;
 
-    const cur = bySupplier.get(supName) || { supplier: supName, qty: 0, area_m2: 0, cost: 0 };
+    const cur = bySupplier.get(supName) || { supplier: supName, supplier_code: r.supplier_code || '', sku_count: 0, qty: 0, area_m2: 0, cost: 0 };
+    cur.sku_count += 1;
     cur.qty += r.close_qty;
     cur.area_m2 += footprint;
     cur.cost += r.close_cst || 0;
@@ -271,10 +283,22 @@ async function calcWarehouse9005Footprint() {
       barcode: r.barcode,
       product_name: r.product_name,
       supplier: supName,
-      close_qty: r.close_qty,
+      supplier_code: r.supplier_code || '',
+      category: r.category || '',
+      product_family: r.product_family || '',
+      unit: r.unit || 'Cái',
+      close_qty: Math.round(r.close_qty),
+      stock_3001: Math.round(r.stock_3001 || 0),
+      stock_1001: Math.round(r.stock_1001 || 0),
+      close_cst: Math.round(r.close_cst || 0),
+      box_w_cm: w,
+      box_d_cm: d,
+      box_h_cm: h,
+      max_stack: maxStack,
       base_area_m2: Number(baseArea.toFixed(4)),
       positions,
       footprint_m2: Number(footprint.toFixed(2)),
+      est_monthly_cost: Math.round(footprint * 109000),
     });
   }
 
@@ -282,6 +306,8 @@ async function calcWarehouse9005Footprint() {
     .sort((a, b) => b.area_m2 - a.area_m2)
     .map(s => ({
       ...s,
+      qty: Math.round(s.qty),
+      cost: Math.round(s.cost),
       area_m2: Number(s.area_m2.toFixed(2)),
       share_pct: totalArea > 0 ? Number(((s.area_m2 / totalArea) * 100).toFixed(1)) : 0,
       est_monthly_cost: Math.round(s.area_m2 * 109000),
