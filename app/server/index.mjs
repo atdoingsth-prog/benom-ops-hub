@@ -1574,15 +1574,21 @@ app.post('/api/orders/:id/generate-handover', requireRoles('ADMIN', 'EDITOR', 'K
     return res.status(409).json({ error: `Đơn ${o.invoice_no} đã có phiếu ${existing.doc_no}!` });
   }
   const docNo = await nextHandoverNo(docType);
-  const ktvsJson = JSON.stringify(parseKtvs(o));
+  const installMode = req.body.install_mode || (docType === 'BM-01' ? 'Kỹ thuật Benom lắp đặt' : 'Khách hàng tự lắp đặt');
+  const isSelfInstall = installMode === 'Khách hàng tự lắp đặt';
+  const ktvsJson = isSelfInstall ? '[]' : JSON.stringify(parseKtvs(o));
   const r = await dbRun(`
     INSERT INTO handovers (doc_no, doc_type, order_id, invoice_no, handover_date, warehouse_code, customer_name, customer_phone, address, carrier, install_mode, ktv1_name, ktv1_code, ktv2_name, ktv2_code, ktvs_json, status)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `, [
     docNo, docType, o.id, o.invoice_no, o.delivery_date || getVnIsoDate(),
     o.source_warehouse || '9005', o.customer_name, o.customer_phone, o.address, o.carrier,
-    req.body.install_mode || (docType === 'BM-01' ? 'Kỹ thuật Benom lắp đặt' : 'Khách hàng tự lắp đặt'),
-    o.ktv1_name, o.ktv1_code, o.ktv2_name, o.ktv2_code, ktvsJson, 'Pending'
+    installMode,
+    isSelfInstall ? '' : o.ktv1_name,
+    isSelfInstall ? '' : o.ktv1_code,
+    isSelfInstall ? '' : o.ktv2_name,
+    isSelfInstall ? '' : o.ktv2_code,
+    ktvsJson, 'Pending'
   ]);
   res.json({ id: r.lastInsertRowid, doc_no: docNo, doc_type: docType });
 }));
@@ -1626,8 +1632,11 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
   if (!h) return res.status(404).json({ error: 'Không tìm thấy biên bản' });
 
   const newDate = b.handover_date || h.handover_date || '';
-  const ktvNorm = normalizeKtvInput(b, h);
   const newInstallMode = b.install_mode ?? h.install_mode ?? '';
+  const isSelfInstall = newInstallMode === 'Khách hàng tự lắp đặt';
+  const ktvNorm = isSelfInstall
+    ? { ktv1_name: '', ktv1_code: '', ktv2_name: '', ktv2_code: '', json: '[]' }
+    : normalizeKtvInput(b, h);
   const newStatus = b.status || h.status;
 
   await dbRun(`
@@ -1659,7 +1668,7 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
 
   // Always sync ALL KTVs (1..N), delivery_date & require_install back to the linked Order!
   if (targetOrderId) {
-    const isBenomInstall = h.doc_type === 'BM-01' || /benom lắp/i.test(newInstallMode);
+    const isBenomInstall = !isSelfInstall && (h.doc_type === 'BM-01' || /benom lắp/i.test(newInstallMode));
     await dbRun(`
       UPDATE orders SET
         ktv1_name = ?,
@@ -1668,11 +1677,12 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
         ktv2_code = ?,
         ktvs_json = ?,
         delivery_date = CASE WHEN ? != '' THEN ? ELSE delivery_date END,
-        require_install = CASE WHEN ? = 1 THEN 1 ELSE require_install END
+        require_install = CASE WHEN ? = 1 THEN 0 WHEN ? = 1 THEN 1 ELSE require_install END,
+        install_status = CASE WHEN ? = 1 THEN 'Không yêu cầu' ELSE install_status END
       WHERE id = ?
     `, [
       ktvNorm.ktv1_name, ktvNorm.ktv1_code, ktvNorm.ktv2_name, ktvNorm.ktv2_code, ktvNorm.json,
-      newDate, newDate, isBenomInstall ? 1 : 0, targetOrderId
+      newDate, newDate, isSelfInstall ? 1 : 0, isBenomInstall ? 1 : 0, isSelfInstall ? 1 : 0, targetOrderId
     ]);
 
     if (newStatus === 'Completed') {

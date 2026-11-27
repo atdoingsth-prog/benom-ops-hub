@@ -25,14 +25,17 @@ function initKtvsFromHandover(h: any): KtvEntry[] {
 }
 
 export default function HandoverModal({ handover, staffList, readOnly = false, onStaffAdded, onClose, onSaved, onPrint }: Props) {
+  const initialInstallMode = handover.install_mode || (handover.doc_type === 'BM-05' ? 'Khách hàng tự lắp đặt' : 'Kỹ thuật Benom lắp đặt');
   const [staff, setStaff] = useState<StaffItem[]>(staffList || []);
-  const [ktvs, setKtvs] = useState<KtvEntry[]>(() => initKtvsFromHandover(handover));
+  const [ktvs, setKtvs] = useState<KtvEntry[]>(() =>
+    initialInstallMode === 'Khách hàng tự lắp đặt' ? [] : initKtvsFromHandover(handover)
+  );
   const [form, setForm] = useState({
     handover_date: handover.handover_date || new Date().toISOString().slice(0, 10),
     driver_name: handover.driver_name || '',
     driver_phone: handover.driver_phone || '',
     vehicle_plate: handover.vehicle_plate || '',
-    install_mode: handover.install_mode || (handover.doc_type === 'BM-05' ? 'Khách hàng tự lắp đặt' : 'Kỹ thuật Benom lắp đặt'),
+    install_mode: initialInstallMode,
     check_1: Boolean(handover.check_1 ?? 1),
     check_2: Boolean(handover.check_2 ?? 1),
     check_3: Boolean(handover.check_3 ?? 1),
@@ -173,17 +176,20 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
     }
   };
 
+  const isCustomerSelfInstall = form.install_mode === 'Khách hàng tự lắp đặt';
+
   const handleSave = async (markCompleted: boolean) => {
     setSaving(true);
     try {
       const sigData = hasSig && canvasRef.current ? canvasRef.current.toDataURL('image/png') : '';
+      const effectiveKtvs = isCustomerSelfInstall ? [] : ktvs;
       const payload = {
         ...form,
-        ktvs,
-        ktv1_code: ktvs[0]?.code || '',
-        ktv1_name: ktvs[0]?.name || '',
-        ktv2_code: ktvs[1]?.code || '',
-        ktv2_name: ktvs[1]?.name || '',
+        ktvs: effectiveKtvs,
+        ktv1_code: effectiveKtvs[0]?.code || '',
+        ktv1_name: effectiveKtvs[0]?.name || '',
+        ktv2_code: effectiveKtvs[1]?.code || '',
+        ktv2_name: effectiveKtvs[1]?.name || '',
         status: markCompleted ? 'Completed' : form.status,
         signature_data: sigData,
         photos_json: JSON.stringify(photos),
@@ -339,7 +345,11 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
               <select
                 disabled={readOnly}
                 value={form.install_mode}
-                onChange={e => setForm({ ...form, install_mode: e.target.value })}
+                onChange={e => {
+                  const nextMode = e.target.value;
+                  setForm({ ...form, install_mode: nextMode });
+                  if (nextMode === 'Khách hàng tự lắp đặt') setKtvs([]);
+                }}
                 className="w-full px-3 py-2 rounded-lg border border-[#D6BCA5] text-sm bg-white disabled:bg-gray-50"
               >
                 <option value="Kỹ thuật Benom lắp đặt">Kỹ thuật Benom lắp đặt</option>
@@ -349,11 +359,17 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
             </div>
           </div>
 
-          {/* Auto-expanding KTV Dropdown Picker */}
+          {/* Auto-expanding KTV Dropdown Picker (locked when customer self-installs) */}
           <KtvListPicker
             staff={staff}
-            value={ktvs}
-            onChange={v => !readOnly && setKtvs(v)}
+            value={isCustomerSelfInstall ? [] : ktvs}
+            disabled={readOnly || isCustomerSelfInstall}
+            disabledReason={
+              isCustomerSelfInstall
+                ? 'Khách hàng tự lắp đặt — Không cần gán Kỹ thuật viên và không được chọn danh sách KTV tham gia.'
+                : 'Chế độ chỉ xem — Không thể chỉnh sửa danh sách Kỹ thuật viên.'
+            }
+            onChange={v => !readOnly && !isCustomerSelfInstall && setKtvs(v)}
             onStaffAdded={s => {
               setStaff(prev => [...prev.filter(x => x.emp_code !== s.emp_code), s].sort((a, b) => a.emp_code.localeCompare(b.emp_code)));
               if (onStaffAdded) onStaffAdded(s);

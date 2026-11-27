@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { UserPlus, Users, X } from 'lucide-react';
+import { Lock, UserPlus, Users, X } from 'lucide-react';
 import { apiSend } from '../api';
 
 export interface KtvEntry {
@@ -21,6 +21,8 @@ interface Props {
   onStaffAdded?: (newStaff: StaffItem) => void;
   label?: string;
   hint?: string;
+  disabled?: boolean;
+  disabledReason?: string;
 }
 
 export default function KtvListPicker({
@@ -30,6 +32,8 @@ export default function KtvListPicker({
   onStaffAdded,
   label = 'Danh sách Kỹ thuật viên tham gia (ID — Họ tên)',
   hint = 'Chọn xong KTV 1 sẽ tự động mở dòng KTV 2, KTV 3, KTV 4... (hỗ trợ không giới hạn số lượng KTV).',
+  disabled = false,
+  disabledReason = 'Khách hàng tự lắp đặt — Không cần gán Kỹ thuật viên và không được chọn danh sách KTV tham gia.',
 }: Props) {
   const [addingAtIndex, setAddingAtIndex] = useState<number | null>(null);
   const [newCode, setNewCode] = useState('');
@@ -116,6 +120,23 @@ export default function KtvListPicker({
   };
 
   const selectedKeys = new Set(value.map(v => resolveOptionKey(v)));
+
+  if (disabled) {
+    return (
+      <div className="space-y-1.5 bg-[#F8F4EC]/80 p-3.5 rounded-xl border border-dashed border-[#D6BCA5] select-none">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="font-semibold text-[#6e5543] text-xs flex items-center gap-1.5">
+            <Users className="w-3.5 h-3.5 text-[#6e5543]" />
+            <span>{label}</span>
+          </div>
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[#EFE7DC] text-[#6e5543] text-[10px] font-bold">
+            <Lock className="w-3 h-3" /> Không cần gán KTV
+          </span>
+        </div>
+        <div className="text-xs text-[#6e5543] italic">{disabledReason}</div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-2.5 bg-[#FAF7F2] p-3.5 rounded-xl border border-[#E6DDD1]">

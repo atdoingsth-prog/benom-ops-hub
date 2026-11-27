@@ -105,6 +105,11 @@ export default function SlipDetailModal({
   const feeRatio = netSales > 0 ? Number(((fee3pl / netSales) * 100).toFixed(2)) : 0;
   const ktvList = parseKtvs(ord);
   const carrierLabel = tr?.carrier_3pl || ord?.carrier || 'Chưa chọn 3PL';
+  const latestHandoverMode = handovers[0]?.install_mode || '';
+  const isCustomerSelfInstall = Boolean(
+    latestHandoverMode === 'Khách hàng tự lắp đặt' ||
+    (ord && !ord.require_install && (!ord.install_status || ord.install_status === 'Không yêu cầu'))
+  );
 
   const handlePush = async () => {
     setPushing(true);
@@ -256,7 +261,9 @@ export default function SlipDetailModal({
                       <div className="flex items-start justify-between gap-2">
                         <span className="text-[#6e5543] shrink-0 flex items-center gap-1"><Wrench className="w-3 h-3" /> KTV phụ trách:</span>
                         <div className="text-right">
-                          {ktvList.length > 0 ? (
+                          {isCustomerSelfInstall ? (
+                            <span className="text-[#6e5543] italic">Không cần gán (KH tự lắp đặt)</span>
+                          ) : ktvList.length > 0 ? (
                             <div className="flex flex-wrap justify-end gap-1">
                               {ktvList.map((k, i) => (
                                 <span key={i} className="px-2 py-0.5 rounded bg-[#F8F4EC] border border-[#D6BCA5] text-[11px] font-medium text-[#3B281A]">
@@ -272,7 +279,9 @@ export default function SlipDetailModal({
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-[#6e5543]">Lắp đặt (BM-01):</span>
                         <span className="font-medium text-[#3B281A]">
-                          {ord.install_status || (ord.require_install ? 'Yêu cầu lắp đặt' : 'Không yêu cầu')}
+                          {isCustomerSelfInstall
+                            ? 'Khách hàng tự lắp đặt'
+                            : (ord.install_status || (ord.require_install ? 'Yêu cầu lắp đặt' : 'Không yêu cầu'))}
                         </span>
                       </div>
                     </div>

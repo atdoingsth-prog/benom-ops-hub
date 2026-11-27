@@ -11,13 +11,14 @@ const HandoverModal = lazy(() => import('../components/HandoverModal'));
 const ORDER_PAGE_SIZE = 60;
 
 function formatKtvList(row: any): string {
+  const isSelfInstall = row.install_mode === 'Khách hàng tự lắp đặt' || (row.require_install !== undefined && !row.require_install);
   const arr: KtvEntry[] = Array.isArray(row.ktvs) && row.ktvs.length > 0
     ? row.ktvs
     : [
         ...(row.ktv1_name ? [{ code: row.ktv1_code || '', name: row.ktv1_name }] : []),
         ...(row.ktv2_name ? [{ code: row.ktv2_code || '', name: row.ktv2_name }] : []),
       ];
-  if (arr.length === 0) return 'Chưa gán';
+  if (arr.length === 0) return isSelfInstall ? 'Không cần gán (KH tự lắp)' : 'Chưa gán';
   return arr.map(k => (k.code ? `[${k.code}] ${k.name}` : k.name)).join(', ');
 }
 
@@ -830,17 +831,17 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                 </div>
               </div>
 
-              <KtvListPicker
-                staff={staff}
-                value={editingOrder.ktvs || []}
-                onChange={ktvs => setEditingOrder({ ...editingOrder, ktvs })}
-                onStaffAdded={s => setStaff(prev => [...prev.filter(x => x.emp_code !== s.emp_code), s])}
-                label={`Phân công Kỹ thuật viên ${editingOrder.requires_two_ktv ? '(Tối thiểu 2 KTV)' : ''}`}
-              />
-
               <div className="flex flex-wrap gap-4">
                 <label className="flex items-center gap-2 cursor-pointer">
-                  <input type="checkbox" checked={editingOrder.require_install} onChange={e => setEditingOrder({ ...editingOrder, require_install: e.target.checked })} className="accent-[#3B281A]" />
+                  <input
+                    type="checkbox"
+                    checked={editingOrder.require_install}
+                    onChange={e => {
+                      const checked = e.target.checked;
+                      setEditingOrder({ ...editingOrder, require_install: checked, ktvs: checked ? (editingOrder.ktvs || []) : [] });
+                    }}
+                    className="accent-[#3B281A]"
+                  />
                   <span>Cần KTV benom lắp đặt</span>
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer">
@@ -852,6 +853,16 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                   <span>Đơn Freeship khuyến mãi</span>
                 </label>
               </div>
+
+              <KtvListPicker
+                staff={staff}
+                value={editingOrder.require_install ? (editingOrder.ktvs || []) : []}
+                disabled={!editingOrder.require_install}
+                disabledReason="Khách hàng tự lắp đặt (không tích 'Cần KTV benom lắp đặt') — Không cần gán Kỹ thuật viên."
+                onChange={ktvs => setEditingOrder({ ...editingOrder, ktvs })}
+                onStaffAdded={s => setStaff(prev => [...prev.filter(x => x.emp_code !== s.emp_code), s])}
+                label={`Phân công Kỹ thuật viên ${editingOrder.requires_two_ktv ? '(Tối thiểu 2 KTV)' : ''}`}
+              />
 
               <div>
                 <label className="font-semibold text-[#6e5543]">Ghi chú vận hành</label>
@@ -1053,17 +1064,17 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                 </div>
               </div>
 
-              <KtvListPicker
-                staff={staff}
-                value={newOrder.ktvs || []}
-                onChange={ktvs => setNewOrder({ ...newOrder, ktvs })}
-                onStaffAdded={s => setStaff(prev => [...prev.filter(x => x.emp_code !== s.emp_code), s])}
-                label={`Phân công Kỹ thuật viên ${requiresTwoKtv ? '(Tối thiểu 2 KTV)' : ''}`}
-              />
-
               <div className="flex flex-wrap gap-4 pt-1">
                 <label className="flex items-center gap-2 cursor-pointer">
-                  <input type="checkbox" checked={newOrder.require_install} onChange={e => setNewOrder({ ...newOrder, require_install: e.target.checked })} className="accent-[#3B281A]" />
+                  <input
+                    type="checkbox"
+                    checked={newOrder.require_install}
+                    onChange={e => {
+                      const checked = e.target.checked;
+                      setNewOrder({ ...newOrder, require_install: checked, ktvs: checked ? (newOrder.ktvs || []) : [] });
+                    }}
+                    className="accent-[#3B281A]"
+                  />
                   <span>Cần KTV benom lắp đặt</span>
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer">
@@ -1075,6 +1086,16 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                   <span>Đơn Freeship khuyến mãi</span>
                 </label>
               </div>
+
+              <KtvListPicker
+                staff={staff}
+                value={newOrder.require_install ? (newOrder.ktvs || []) : []}
+                disabled={!newOrder.require_install}
+                disabledReason="Khách hàng tự lắp đặt (không tích 'Cần KTV benom lắp đặt') — Không cần gán Kỹ thuật viên."
+                onChange={ktvs => setNewOrder({ ...newOrder, ktvs })}
+                onStaffAdded={s => setStaff(prev => [...prev.filter(x => x.emp_code !== s.emp_code), s])}
+                label={`Phân công Kỹ thuật viên ${requiresTwoKtv ? '(Tối thiểu 2 KTV)' : ''}`}
+              />
             </div>
 
             <div className="px-5 py-3 bg-[#F8F4EC] border-t border-[#E6DDD1] flex justify-end gap-2">
