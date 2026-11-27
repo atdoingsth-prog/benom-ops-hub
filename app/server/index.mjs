@@ -1312,13 +1312,22 @@ app.get('/api/orders', wrap(async (req, res) => {
 app.post('/api/orders', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
   const b = req.body;
   const items = Array.isArray(b.items) ? b.items : [];
-  const ktvNorm = normalizeKtvInput(b);
-  let requiresTwo = false;
-  for (const it of items) {
-    const prod = await dbGet('SELECT net_weight_g FROM products WHERE barcode = ?', [it.barcode || '']);
-    if ((prod?.net_weight_g || num(it.net_weight_g)) >= 25000) requiresTwo = true;
-  }
-  if (b.require_install && requiresTwo && ktvNorm.list.length < 2) {
+  const reqInstall = b.require_install ? 1 : 0;
+  // SOP guardrail: customer self-install (require_install=0) must never carry KTV assignments
+  const ktvNorm = reqInstall
+    ? normalizeKtvInput(b)
+    : { list: [], json: '[]', ktv1_code: '', ktv1_name: '', ktv2_code: '', ktv2_name: '' };
+
+  // Batch-lookup all item barcodes in 1 query instead of N sequential DB round-trips
+  const barcodes = Array.from(new Set(items.map(it => String(it.barcode || '').trim()).filter(Boolean)));
+  const prodRows = await batchQueryByIds('SELECT * FROM products WHERE barcode IN', barcodes);
+  const prodByBarcode = new Map(prodRows.map(p => [p.barcode, p]));
+
+  const requiresTwo = items.some(it => {
+    const prod = prodByBarcode.get(String(it.barcode || '').trim());
+    return (prod?.net_weight_g || num(it.net_weight_g)) >= 25000;
+  });
+  if (reqInstall && requiresTwo && ktvNorm.list.length < 2) {
     return res.status(400).json({
       error: 'Quy tắc an toàn Benom: Đơn có sản phẩm ≥ 25 kg bắt buộc phân công tối thiểu 2 KTV!',
     });
@@ -1355,25 +1364,27 @@ app.post('/api/orders', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) =
     num(b.distance_km), b.carrier || 'Ahamove', b.tracking_no || '', summaryWh,
     b.moving_no || '', b.pic_sales || '', b.channel || '',
     num(b.shipping_fee_3pl), num(b.customer_paid_fee), b.is_promo_free_ship ? 1 : 0,
-    b.require_install ? 1 : 0, b.is_stairs ? 1 : 0,
+    reqInstall, b.is_stairs ? 1 : 0,
     ktvNorm.ktv1_name, ktvNorm.ktv1_code, ktvNorm.ktv2_name, ktvNorm.ktv2_code, ktvNorm.json,
-    b.status || 'New', b.require_install ? 'Chờ lắp đặt' : '', b.notes || ''
+    b.status || 'New', reqInstall ? 'Chờ lắp đặt' : 'Không yêu cầu', b.notes || ''
   ]);
   const oid = r.lastInsertRowid;
 
-  for (const it of items) {
-    const p = await dbGet('SELECT * FROM products WHERE barcode = ?', [it.barcode || '']);
-    await dbRun(`
-      INSERT INTO order_items (order_id, barcode, product_name, unit, qty, net_weight_g, warranty_months, warranty_policy, p_handling_unit, p_installation_unit, source_warehouse, moving_no)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-    `, [
-      oid, it.barcode || '', it.product_name || p?.name_vn || '', it.unit || p?.unit || 'Cái',
-      num(it.qty) || 1, p?.net_weight_g || num(it.net_weight_g),
-      p?.warranty_months || 0, p?.warranty_policy || 'Không bảo hành',
-      p ? p.p_handling : 15000, p ? p.p_installation : 0,
-      (it.source_warehouse || defaultWh).trim(),
-      String(it.moving_no || b.moving_no || '').trim(),
-    ]);
+  if (items.length > 0) {
+    await dbBatch(items.map(it => {
+      const p = prodByBarcode.get(String(it.barcode || '').trim());
+      return {
+        sql: `INSERT INTO order_items (order_id, barcode, product_name, unit, qty, net_weight_g, warranty_months, warranty_policy, p_handling_unit, p_installation_unit, source_warehouse, moving_no) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        args: [
+          oid, it.barcode || '', it.product_name || p?.name_vn || '', it.unit || p?.unit || 'Cái',
+          num(it.qty) || 1, p?.net_weight_g || num(it.net_weight_g),
+          p?.warranty_months || 0, p?.warranty_policy || 'Không bảo hành',
+          p ? p.p_handling : 15000, p ? p.p_installation : 0,
+          (it.source_warehouse || defaultWh).trim(),
+          String(it.moving_no || b.moving_no || '').trim(),
+        ],
+      };
+    }));
   }
 
   // Sync carrier & 3PL fee to delivery_tracking if this POS slip already exists there
@@ -1395,8 +1406,11 @@ app.put('/api/orders/:id', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res
   const existing = await dbGet('SELECT * FROM orders WHERE id = ?', [id]);
   if (!existing) return res.status(404).json({ error: 'Không tìm thấy đơn hàng' });
 
-  const ktvNorm = normalizeKtvInput(b, existing);
   const nextRequireInstall = b.require_install !== undefined ? (b.require_install ? 1 : 0) : existing.require_install;
+  // SOP guardrail: customer self-install (require_install=0) clears KTV assignment so no allowance leaks
+  const ktvNorm = nextRequireInstall
+    ? normalizeKtvInput(b, existing)
+    : { list: [], json: '[]', ktv1_code: '', ktv1_name: '', ktv2_code: '', ktv2_name: '' };
   const nextStatus = b.status ?? existing.status;
 
   // Guardrail (TASK-13): Block edits to allowance-affecting fields on orders in a LOCKED allowance month
@@ -1416,13 +1430,21 @@ app.put('/api/orders/:id', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res
     }
   }
 
-  // Enforce >= 25kg safety lock on updates as well (unless order is Cancelled)
+  // Batch-lookup updated item barcodes once (eliminates N+1 queries on Turso Cloud)
   const hasItemsUpdate = Array.isArray(b.items);
+  const prodByBarcode = new Map();
+  if (hasItemsUpdate && b.items.length > 0) {
+    const bcs = Array.from(new Set(b.items.map(it => String(it.barcode || '').trim()).filter(Boolean)));
+    const prodRows = await batchQueryByIds('SELECT * FROM products WHERE barcode IN', bcs);
+    for (const p of prodRows) prodByBarcode.set(p.barcode, p);
+  }
+
+  // Enforce >= 25kg safety lock on updates as well (unless order is Cancelled)
   if (nextRequireInstall && nextStatus !== 'Cancelled') {
     let maxWeight = 0;
     if (hasItemsUpdate) {
       for (const it of b.items) {
-        const prod = await dbGet('SELECT net_weight_g FROM products WHERE barcode = ?', [it.barcode || '']);
+        const prod = prodByBarcode.get(String(it.barcode || '').trim());
         maxWeight = Math.max(maxWeight, prod?.net_weight_g || num(it.net_weight_g));
       }
     } else {
@@ -1443,6 +1465,9 @@ app.put('/api/orders/:id', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res
     ? Array.from(new Set(b.items.map(it => (it.source_warehouse || '9005').trim()).filter(Boolean)))
     : [];
   const nextSourceWh = distinctWhs.length > 0 ? distinctWhs.join(' + ') : defaultWh;
+  const nextInstallStatus = !nextRequireInstall
+    ? 'Không yêu cầu'
+    : (b.install_status ?? existing.install_status);
 
   await dbRun(`
     UPDATE orders SET
@@ -1469,29 +1494,32 @@ app.put('/api/orders/:id', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res
     b.is_stairs !== undefined ? (b.is_stairs ? 1 : 0) : existing.is_stairs,
     nextRequireInstall,
     ktvNorm.ktv1_name, ktvNorm.ktv1_code, ktvNorm.ktv2_name, ktvNorm.ktv2_code, ktvNorm.json,
-    b.install_status ?? existing.install_status,
+    nextInstallStatus,
     b.delivery_date ?? existing.delivery_date,
     b.notes ?? existing.notes,
     id
   ]);
 
   if (hasItemsUpdate) {
-    await dbRun('DELETE FROM order_items WHERE order_id = ?', [id]);
-    for (const it of b.items) {
-      const p = await dbGet('SELECT * FROM products WHERE barcode = ?', [it.barcode || '']);
-      await dbRun(`
-        INSERT INTO order_items (order_id, barcode, product_name, unit, qty, net_weight_g, warranty_months, warranty_policy, p_handling_unit, p_installation_unit, source_warehouse, moving_no)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-      `, [
-        id, it.barcode || '', it.product_name || p?.name_vn || '', it.unit || p?.unit || 'Cái',
-        num(it.qty) || 1, p?.net_weight_g || num(it.net_weight_g),
-        p?.warranty_months || 0, p?.warranty_policy || 'Không bảo hành',
-        p ? p.p_handling : num(it.p_handling_unit) || 15000,
-        p ? p.p_installation : num(it.p_installation_unit) || 0,
-        (it.source_warehouse || '9005').trim(),
-        String(it.moving_no || '').trim(),
-      ]);
-    }
+    const itemStmts = [
+      { sql: 'DELETE FROM order_items WHERE order_id = ?', args: [id] },
+      ...b.items.map(it => {
+        const p = prodByBarcode.get(String(it.barcode || '').trim());
+        return {
+          sql: `INSERT INTO order_items (order_id, barcode, product_name, unit, qty, net_weight_g, warranty_months, warranty_policy, p_handling_unit, p_installation_unit, source_warehouse, moving_no) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+          args: [
+            id, it.barcode || '', it.product_name || p?.name_vn || '', it.unit || p?.unit || 'Cái',
+            num(it.qty) || 1, p?.net_weight_g || num(it.net_weight_g),
+            p?.warranty_months || 0, p?.warranty_policy || 'Không bảo hành',
+            p ? p.p_handling : num(it.p_handling_unit) || 15000,
+            p ? p.p_installation : num(it.p_installation_unit) || 0,
+            (it.source_warehouse || '9005').trim(),
+            String(it.moving_no || '').trim(),
+          ],
+        };
+      }),
+    ];
+    await dbBatch(itemStmts);
   }
 
   // 2-way sync carrier & 3PL fee to delivery_tracking if linked by invoice_no
@@ -1688,8 +1716,8 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
     if (newStatus === 'Completed') {
       if (h.doc_type === 'BM-01') {
         await dbRun(
-          `UPDATE orders SET status='Done', install_status='Đã lắp & Nghiệm thu', delivery_date=COALESCE(NULLIF(?,''), NULLIF(delivery_date,''), ?) WHERE id=?`,
-          [newDate, getVnIsoDate(), targetOrderId]
+          `UPDATE orders SET status='Done', install_status=?, delivery_date=COALESCE(NULLIF(?,''), NULLIF(delivery_date,''), ?) WHERE id=?`,
+          [isSelfInstall ? 'Không yêu cầu' : 'Đã lắp & Nghiệm thu', newDate, getVnIsoDate(), targetOrderId]
         );
       } else if (h.doc_type === 'BM-05') {
         if (newInstallMode === 'Hẹn kỹ thuật Benom lắp sau') {
@@ -2732,7 +2760,7 @@ app.get('/api/delivery-tracking/:slipNo/detail', wrap(async (req, res) => {
     dbGet(`SELECT * FROM delivery_tracking WHERE slip_no = ?`, [slipNo]),
     dbGet(`SELECT * FROM pos_slips WHERE slip_no = ?`, [slipNo]),
     dbGet(`SELECT * FROM orders WHERE invoice_no = ? ORDER BY CASE WHEN status = 'Cancelled' THEN 1 ELSE 0 END, id DESC LIMIT 1`, [slipNo]),
-    dbAll(`SELECT id, doc_no, doc_type, handover_date, warehouse_code, customer_name, carrier, ktv1_name, ktv1_code, ktv2_name, ktv2_code, ktvs_json, csat_rating, csat_comment, status FROM handovers WHERE invoice_no = ? ORDER BY id DESC`, [slipNo]),
+    dbAll(`SELECT id, doc_no, doc_type, handover_date, warehouse_code, customer_name, carrier, install_mode, ktv1_name, ktv1_code, ktv2_name, ktv2_code, ktvs_json, csat_rating, csat_comment, status FROM handovers WHERE invoice_no = ? ORDER BY id DESC`, [slipNo]),
     dbAll(`SELECT id, slip_no, slip_type, slip_date, expected_date, warehouse_code, carrier, purpose, status, notes FROM warehouse_slips WHERE ref_invoice = ? ORDER BY id DESC`, [slipNo]),
     dbAll(`SELECT id, ticket_no, created_at, product_name, service_level, issue_desc, status FROM warranty_tickets WHERE invoice_no = ? ORDER BY id DESC`, [slipNo]),
   ]);

@@ -58,10 +58,10 @@ export default function SlipDetailModal({
   const [loading, setLoading] = useState(false);
   const [pushing, setPushing] = useState(false);
 
-  const loadDetail = async (no: string) => {
+  const loadDetail = async (no: string, force = false) => {
     setLoading(true);
     try {
-      const res = await apiGet(`/api/delivery-tracking/${encodeURIComponent(no)}/detail`, { force: true });
+      const res = await apiGet(`/api/delivery-tracking/${encodeURIComponent(no)}/detail`, { cacheMs: 20000, force });
       setDetail(res);
     } catch (e: any) {
       onToast(e.message, 'err');
@@ -115,7 +115,7 @@ export default function SlipDetailModal({
     setPushing(true);
     try {
       await onPushToDispatch(slipNo);
-      await loadDetail(slipNo);
+      await loadDetail(slipNo, true);
     } finally {
       setPushing(false);
     }

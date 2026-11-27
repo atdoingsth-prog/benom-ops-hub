@@ -475,7 +475,9 @@ const SCHEMA_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_handovers_order ON handovers(order_id)`,
   `CREATE INDEX IF NOT EXISTS idx_handovers_doctype ON handovers(doc_type, status)`,
   `CREATE INDEX IF NOT EXISTS idx_slips_type_date ON warehouse_slips(slip_type, slip_date DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_slips_ref_invoice ON warehouse_slips(ref_invoice)`,
   `CREATE INDEX IF NOT EXISTS idx_slip_items_slip ON warehouse_slip_items(slip_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_warranty_invoice ON warranty_tickets(invoice_no)`,
   `CREATE INDEX IF NOT EXISTS idx_products_type_top ON products(item_type, is_top_50 DESC, net_weight_g DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_spare_part_logs_part ON spare_part_logs(part_id, id DESC)`,
 ];

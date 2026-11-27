@@ -217,16 +217,19 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => onPrint({
-                ...handover,
-                ...form,
-                ktvs,
-                ktv1_code: ktvs[0]?.code || '',
-                ktv1_name: ktvs[0]?.name || '',
-                ktv2_code: ktvs[1]?.code || '',
-                ktv2_name: ktvs[1]?.name || '',
-                signature_data: hasSig && canvasRef.current ? canvasRef.current.toDataURL('image/png') : sigUrl,
-              })}
+              onClick={() => {
+                const printKtvs = isCustomerSelfInstall ? [] : ktvs;
+                onPrint({
+                  ...handover,
+                  ...form,
+                  ktvs: printKtvs,
+                  ktv1_code: printKtvs[0]?.code || '',
+                  ktv1_name: printKtvs[0]?.name || '',
+                  ktv2_code: printKtvs[1]?.code || '',
+                  ktv2_name: printKtvs[1]?.name || '',
+                  signature_data: hasSig && canvasRef.current ? canvasRef.current.toDataURL('image/png') : sigUrl,
+                });
+              }}
               className="px-3 py-1.5 rounded-lg bg-[#563C28] text-xs font-medium flex items-center gap-1 hover:bg-[#6a4b33] cursor-pointer"
             >
               <Printer className="w-3.5 h-3.5" /> In PDF

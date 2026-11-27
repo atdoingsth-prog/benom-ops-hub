@@ -4,9 +4,9 @@ import {
   Plus, Printer, Search, Smartphone, Star, Trash2, Truck, X
 } from 'lucide-react';
 import { apiGet, apiGetPage, apiSend, AuthUser, fmtVnd, PrintDoc } from '../api';
-import KtvFieldBoard from '../components/KtvFieldBoard';
 import KtvListPicker, { KtvEntry } from '../components/KtvListPicker';
 
+const KtvFieldBoard = lazy(() => import('../components/KtvFieldBoard'));
 const HandoverModal = lazy(() => import('../components/HandoverModal'));
 const ORDER_PAGE_SIZE = 60;
 
@@ -422,16 +422,18 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
       </div>
 
       {(subTab === 'ktv_today' || subTab === 'schedule') ? (
-        <KtvFieldBoard
-          mode={subTab}
-          user={user}
-          orders={orders}
-          handovers={handovers}
-          canManageOrders={canManageOrders}
-          canHandover={canHandover}
-          onEditOrder={openEditOrder}
-          onOpenHandover={openOrCreateHandoverForOrder}
-        />
+        <Suspense fallback={<div className="p-8 text-center text-xs text-[#6e5543]">Đang tải lịch điều phối KTV...</div>}>
+          <KtvFieldBoard
+            mode={subTab}
+            user={user}
+            orders={orders}
+            handovers={handovers}
+            canManageOrders={canManageOrders}
+            canHandover={canHandover}
+            onEditOrder={openEditOrder}
+            onOpenHandover={openOrCreateHandoverForOrder}
+          />
+        </Suspense>
       ) : subTab === 'orders' ? (
         <>
           {/* Filter Bar */}

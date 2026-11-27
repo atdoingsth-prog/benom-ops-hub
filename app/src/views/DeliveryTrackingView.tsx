@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import {
   ArrowUpRight, BarChart3, Check, Download, Plus, Search, Trash2, Truck, UploadCloud, X
 } from 'lucide-react';
@@ -6,7 +6,8 @@ import {
   Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis
 } from 'recharts';
 import { apiDownload, apiGet, apiSend, apiUpload, AuthUser, fmtMonth, fmtVnd } from '../api';
-import SlipDetailModal from '../components/SlipDetailModal';
+
+const SlipDetailModal = lazy(() => import('../components/SlipDetailModal'));
 
 interface Props {
   user: AuthUser;
@@ -549,15 +550,19 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
         </>
       )}
 
-      {/* Slip No. Detail Pop-up Modal */}
-      <SlipDetailModal
-        slipNo={detailSlipNo}
-        canEdit={canEdit}
-        onClose={() => setDetailSlipNo(null)}
-        onPushToDispatch={pushToDispatch}
-        onNavigateOrders={onNavigate ? () => onNavigate('orders') : undefined}
-        onToast={onToast}
-      />
+      {/* Slip No. Detail Pop-up Modal (lazy-loaded on-demand only when clicked) */}
+      {detailSlipNo && (
+        <Suspense fallback={null}>
+          <SlipDetailModal
+            slipNo={detailSlipNo}
+            canEdit={canEdit}
+            onClose={() => setDetailSlipNo(null)}
+            onPushToDispatch={pushToDispatch}
+            onNavigateOrders={onNavigate ? () => onNavigate('orders') : undefined}
+            onToast={onToast}
+          />
+        </Suspense>
+      )}
 
       {/* Add Freeship / Manual Slip Modal */}
       {showAdd && (
