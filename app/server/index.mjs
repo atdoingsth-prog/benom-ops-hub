@@ -3,6 +3,7 @@ import cors from 'cors';
 import multer from 'multer';
 import path from 'node:path';
 import fs from 'node:fs';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import * as XLSX from 'xlsx';
 import { initDb, dbAll, dbGet, dbRun, dbBatch, isCloudDb } from './db.mjs';
@@ -21,8 +22,54 @@ const DIST_DIR = path.resolve(__dirname, '../dist');
 const PORT = process.env.PORT || 3005;
 
 const app = express();
-app.use(cors());
+app.disable('x-powered-by');
+app.use(cors({ exposedHeaders: ['X-Total-Count', 'Content-Disposition'] }));
 app.use(express.json({ limit: '15mb' }));
+
+// Zero-dependency Gzip compression for JSON API payloads >= 1 KB (cuts mobile 4G wire size 75-85%)
+app.use((req, res, next) => {
+  const acceptsGzip = /\bgzip\b/i.test(req.headers['accept-encoding'] || '');
+  if (!acceptsGzip) return next();
+  const origJson = res.json.bind(res);
+  res.json = (body) => {
+    const raw = Buffer.from(JSON.stringify(body), 'utf8');
+    if (raw.length < 1024) {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      return res.send(raw);
+    }
+    const gz = zlib.gzipSync(raw, { level: 6 });
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Encoding', 'gzip');
+    res.setHeader('Vary', 'Accept-Encoding');
+    res.setHeader('Content-Length', String(gz.length));
+    return res.end(gz);
+  };
+  next();
+});
+
+// Lightweight server-side TTL cache for read-heavy analytics, auto-cleared on any write mutation
+const _serverCache = new Map();
+function getServerCache(key) {
+  const hit = _serverCache.get(key);
+  if (hit && hit.exp > Date.now()) return hit.val;
+  if (hit) _serverCache.delete(key);
+  return undefined;
+}
+function setServerCache(key, val, ttlMs = 45000) {
+  _serverCache.set(key, { exp: Date.now() + ttlMs, val });
+  return val;
+}
+function clearServerCache() {
+  _serverCache.clear();
+}
+app.use('/api', (req, res, next) => {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.on('finish', () => {
+      if (res.statusCode < 400) clearServerCache();
+    });
+  }
+  next();
+});
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
@@ -230,18 +277,20 @@ async function getLockedAllowanceMonth(dateStr) {
   return dbGet('SELECT * FROM allowance_locks WHERE month_ym = ?', [ym]);
 }
 
-async function calcWarehouse9005Footprint() {
-  const latestRow = await dbGet(`SELECT MAX(target_month) as m FROM erp_snapshots WHERE store_code = '9005'`);
-  const latest = latestRow?.m || '202611';
-  const latest3001Row = await dbGet(`SELECT MAX(target_month) as m FROM erp_snapshots WHERE store_code = '3001'`);
-  const latest3001 = latest3001Row?.m || '202611';
-  const latest1001Row = await dbGet(`SELECT MAX(target_month) as m FROM erp_snapshots WHERE store_code = '1001'`);
-  const latest1001 = latest1001Row?.m || '';
+async function calcWarehouse9005Footprint(includeItems = false, latestByStoreMap = null) {
+  let latestMap = latestByStoreMap;
+  if (!latestMap) {
+    const rowsM = await dbAll(`SELECT store_code, MAX(target_month) as m FROM erp_snapshots WHERE store_code IN ('9005','3001','1001') GROUP BY store_code`);
+    latestMap = new Map(rowsM.map(r => [r.store_code, r.m]));
+  }
+  const latest = latestMap.get('9005') || '202611';
+  const latest3001 = latestMap.get('3001') || '202611';
+  const latest1001 = latestMap.get('1001') || '';
 
-  const rows = await dbAll(`
+  const rows = await dbAll(includeItems ? `
     SELECT e.barcode, e.product_name, e.supplier_code, e.close_qty, e.close_cst,
            p.supplier_name, p.category, p.product_family, p.unit,
-           p.box_w_cm, p.box_d_cm, p.box_h_cm, p.qty_per_pcs, p.qty_per_box, p.max_stack, p.retail_price,
+           p.box_w_cm, p.box_d_cm, p.box_h_cm, p.qty_per_pcs, p.qty_per_box, p.max_stack,
            COALESCE(s3.close_qty, 0) as stock_3001,
            COALESCE(s1.close_qty, 0) as stock_1001
     FROM erp_snapshots e
@@ -249,7 +298,13 @@ async function calcWarehouse9005Footprint() {
     LEFT JOIN erp_snapshots s3 ON s3.barcode = e.barcode AND s3.store_code = '3001' AND s3.target_month = ?
     LEFT JOIN erp_snapshots s1 ON s1.barcode = e.barcode AND s1.store_code = '1001' AND s1.target_month = ?
     WHERE e.store_code = '9005' AND e.target_month = ? AND e.close_qty > 0
-  `, [latest3001, latest1001, latest]);
+  ` : `
+    SELECT e.barcode, e.supplier_code, e.close_qty, e.close_cst,
+           p.supplier_name, p.box_w_cm, p.box_d_cm, p.qty_per_pcs, p.qty_per_box, p.max_stack
+    FROM erp_snapshots e
+    LEFT JOIN products p ON p.barcode = e.barcode
+    WHERE e.store_code = '9005' AND e.target_month = ? AND e.close_qty > 0
+  `, includeItems ? [latest3001, latest1001, latest] : [latest]);
 
   let totalArea = 0;
   let totalQty = 0;
@@ -279,27 +334,29 @@ async function calcWarehouse9005Footprint() {
     cur.cost += r.close_cst || 0;
     bySupplier.set(supName, cur);
 
-    items.push({
-      barcode: r.barcode,
-      product_name: r.product_name,
-      supplier: supName,
-      supplier_code: r.supplier_code || '',
-      category: r.category || '',
-      product_family: r.product_family || '',
-      unit: r.unit || 'Cái',
-      close_qty: Math.round(r.close_qty),
-      stock_3001: Math.round(r.stock_3001 || 0),
-      stock_1001: Math.round(r.stock_1001 || 0),
-      close_cst: Math.round(r.close_cst || 0),
-      box_w_cm: w,
-      box_d_cm: d,
-      box_h_cm: h,
-      max_stack: maxStack,
-      base_area_m2: Number(baseArea.toFixed(4)),
-      positions,
-      footprint_m2: Number(footprint.toFixed(2)),
-      est_monthly_cost: Math.round(footprint * 109000),
-    });
+    if (includeItems) {
+      items.push({
+        barcode: r.barcode,
+        product_name: r.product_name,
+        supplier: supName,
+        supplier_code: r.supplier_code || '',
+        category: r.category || '',
+        product_family: r.product_family || '',
+        unit: r.unit || 'Cái',
+        close_qty: Math.round(r.close_qty),
+        stock_3001: Math.round(r.stock_3001 || 0),
+        stock_1001: Math.round(r.stock_1001 || 0),
+        close_cst: Math.round(r.close_cst || 0),
+        box_w_cm: w,
+        box_d_cm: d,
+        box_h_cm: h,
+        max_stack: maxStack,
+        base_area_m2: Number(baseArea.toFixed(4)),
+        positions,
+        footprint_m2: Number(footprint.toFixed(2)),
+        est_monthly_cost: Math.round(footprint * 109000),
+      });
+    }
   }
 
   const suppliers = Array.from(bySupplier.values())
@@ -316,13 +373,136 @@ async function calcWarehouse9005Footprint() {
   return {
     target_month: latest,
     cap_m2: 300,
+    sku_count: rows.length,
     total_area_m2: Number(totalArea.toFixed(2)),
     utilization_pct: Number(((totalArea / 300) * 100).toFixed(1)),
     overflow_blocks_50m2: totalArea > 300 ? Math.ceil((totalArea - 300) / 50) : 0,
     total_qty: Math.round(totalQty),
     total_cost: Math.round(totalCost),
     suppliers,
-    items: items.sort((a, b) => b.footprint_m2 - a.footprint_m2),
+    ...(includeItems ? { items: items.sort((a, b) => b.footprint_m2 - a.footprint_m2) } : {}),
+  };
+}
+
+async function calcStore3001Inventory(includeItems = false, latestByStoreMap = null, last3Months = null) {
+  let latestMap = latestByStoreMap;
+  if (!latestMap) {
+    const rowsM = await dbAll(`SELECT store_code, MAX(target_month) as m FROM erp_snapshots WHERE store_code IN ('9005','3001','1001') GROUP BY store_code`);
+    latestMap = new Map(rowsM.map(r => [r.store_code, r.m]));
+  }
+  const latest3001 = latestMap.get('3001') || '202611';
+  const latest9005 = latestMap.get('9005') || '202611';
+  const latest1001 = latestMap.get('1001') || '';
+
+  let m3 = last3Months;
+  if (includeItems && (!m3 || !m3.length)) {
+    const months = await dbAll(`SELECT DISTINCT target_month FROM erp_snapshots WHERE store_code = '3001' ORDER BY target_month DESC LIMIT 3`);
+    m3 = months.map(r => r.target_month);
+  }
+  const ph3 = m3 && m3.length ? m3.map(() => '?').join(',') : '?';
+  const mArgs3 = m3 && m3.length ? m3 : [latest3001];
+
+  const rows = await dbAll(includeItems ? `
+    SELECT e.barcode, e.product_name, e.supplier_code, e.close_qty, e.close_cst, e.sales_qty, e.sales_amt,
+           p.supplier_name, p.category, p.product_family, p.unit, p.retail_price,
+           COALESCE(s9.close_qty, 0) as stock_9005,
+           COALESCE(s1.close_qty, 0) as stock_1001,
+           COALESCE(r3.sold_3m, 0) as sold_3m
+    FROM erp_snapshots e
+    LEFT JOIN products p ON p.barcode = e.barcode
+    LEFT JOIN erp_snapshots s9 ON s9.barcode = e.barcode AND s9.store_code = '9005' AND s9.target_month = ?
+    LEFT JOIN erp_snapshots s1 ON s1.barcode = e.barcode AND s1.store_code = '1001' AND s1.target_month = ?
+    LEFT JOIN (
+      SELECT barcode, SUM(sales_qty) as sold_3m
+      FROM erp_snapshots WHERE store_code = '3001' AND target_month IN (${ph3})
+      GROUP BY barcode
+    ) r3 ON r3.barcode = e.barcode
+    WHERE e.store_code = '3001' AND e.target_month = ? AND e.close_qty > 0
+  ` : `
+    SELECT e.barcode, e.supplier_code, e.close_qty, e.close_cst, e.sales_qty, e.sales_amt,
+           p.supplier_name
+    FROM erp_snapshots e
+    LEFT JOIN products p ON p.barcode = e.barcode
+    WHERE e.store_code = '3001' AND e.target_month = ? AND e.close_qty > 0
+  `, includeItems ? [latest9005, latest1001, ...mArgs3, latest3001] : [latest3001]);
+
+  let totalQty = 0;
+  let totalCost = 0;
+  let totalSalesAmt = 0;
+  let totalSalesQty = 0;
+  const bySupplier = new Map();
+  const items = [];
+
+  for (const r of rows) {
+    const qty = Number(r.close_qty || 0);
+    const cost = Number(r.close_cst || 0);
+    const salesAmt = Number(r.sales_amt || 0);
+    const salesQty = Number(r.sales_qty || 0);
+    const supName = r.supplier_name || r.supplier_code || 'Khác';
+
+    totalQty += qty;
+    totalCost += cost;
+    totalSalesAmt += salesAmt;
+    totalSalesQty += salesQty;
+
+    const cur = bySupplier.get(supName) || {
+      supplier: supName,
+      supplier_code: r.supplier_code || '',
+      sku_count: 0,
+      qty: 0,
+      cost: 0,
+      sales_amt: 0,
+      sales_qty: 0,
+    };
+    cur.sku_count += 1;
+    cur.qty += qty;
+    cur.cost += cost;
+    cur.sales_amt += salesAmt;
+    cur.sales_qty += salesQty;
+    bySupplier.set(supName, cur);
+
+    if (includeItems) {
+      items.push({
+        barcode: r.barcode,
+        product_name: r.product_name,
+        supplier: supName,
+        supplier_code: r.supplier_code || '',
+        category: r.category || '',
+        product_family: r.product_family || '',
+        unit: r.unit || 'Cái',
+        close_qty: Math.round(qty),
+        stock_9005: Math.round(r.stock_9005 || 0),
+        stock_1001: Math.round(r.stock_1001 || 0),
+        close_cst: Math.round(cost),
+        sales_qty: Math.round(salesQty),
+        sales_amt: Math.round(salesAmt),
+        sold_3m: Math.round(r.sold_3m || 0),
+        retail_price: Math.round(r.retail_price || 0),
+      });
+    }
+  }
+
+  const suppliers = Array.from(bySupplier.values())
+    .sort((a, b) => b.cost - a.cost)
+    .map(s => ({
+      ...s,
+      qty: Math.round(s.qty),
+      cost: Math.round(s.cost),
+      cost_m: Number((s.cost / 1e6).toFixed(1)),
+      sales_amt: Math.round(s.sales_amt),
+      sales_qty: Math.round(s.sales_qty),
+      share_pct: totalCost > 0 ? Number(((s.cost / totalCost) * 100).toFixed(1)) : 0,
+    }));
+
+  return {
+    target_month: latest3001,
+    sku_count: rows.length,
+    total_qty: Math.round(totalQty),
+    total_cost: Math.round(totalCost),
+    total_sales_amt: Math.round(totalSalesAmt),
+    total_sales_qty: Math.round(totalSalesQty),
+    suppliers,
+    ...(includeItems ? { items: items.sort((a, b) => b.close_cst - a.close_cst) } : {}),
   };
 }
 
@@ -470,92 +650,154 @@ app.delete('/api/users/:id', requireRoles('ADMIN'), wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// ─── 1. DASHBOARD & ERP ANALYTICS ─────────────────────────────
+// ─── 1. DASHBOARD & ERP ANALYTICS (PARALLELIZED + ON-DEMAND DRILLDOWN) ───
 app.get('/api/dashboard', wrap(async (req, res) => {
-  const orderStats = await dbGet(`
-    SELECT COUNT(*) as total_orders,
-           COALESCE(SUM(CASE WHEN require_install = 1 THEN 1 ELSE 0 END), 0) as install_orders,
-           COALESCE(SUM(CASE WHEN status = 'Done' THEN 1 ELSE 0 END), 0) as done_orders,
-           COALESCE(SUM(shipping_fee_3pl), 0) as total_3pl_cost,
-           COALESCE(SUM(customer_paid_fee), 0) as total_cust_fee,
-           COALESCE(SUM(CASE WHEN is_promo_free_ship = 1 THEN 1 ELSE 0 END), 0) as promo_free_orders
-    FROM orders
-  `);
+  const cached = getServerCache('dashboard:summary');
+  if (cached) return res.json(cached);
 
-  const carrierBreakdown = await dbAll(`
-    SELECT COALESCE(NULLIF(carrier,''), 'Chưa chọn') as carrier, COUNT(*) as orders, COALESCE(SUM(shipping_fee_3pl), 0) as total_fee
-    FROM orders GROUP BY carrier ORDER BY orders DESC
-  `);
+  // Batch 1: all independent KPI & trend queries in parallel (1 Turso RTT instead of 8!)
+  const [orderStats, ticketStats, qcStats, csatStats, rawTrend, latestRows] = await Promise.all([
+    dbGet(`
+      SELECT COUNT(*) as total_orders,
+             COALESCE(SUM(CASE WHEN require_install = 1 THEN 1 ELSE 0 END), 0) as install_orders,
+             COALESCE(SUM(CASE WHEN status = 'Done' THEN 1 ELSE 0 END), 0) as done_orders,
+             COALESCE(SUM(shipping_fee_3pl), 0) as total_3pl_cost,
+             COALESCE(SUM(customer_paid_fee), 0) as total_cust_fee,
+             COALESCE(SUM(CASE WHEN is_promo_free_ship = 1 THEN 1 ELSE 0 END), 0) as promo_free_orders
+      FROM orders
+    `),
+    dbGet(`
+      SELECT COUNT(*) as total,
+             COALESCE(SUM(CASE WHEN status NOT IN ('Closed','Resolved') THEN 1 ELSE 0 END), 0) as open_count
+      FROM warranty_tickets
+    `),
+    dbGet(`
+      SELECT COUNT(*) as skus, COALESCE(SUM(defective_qty), 0) as units
+      FROM qc_factory_returns WHERE status != 'Closed'
+    `),
+    dbGet(`
+      SELECT COUNT(*) as count, ROUND(AVG(csat_rating), 2) as avg_rating
+      FROM handovers WHERE csat_rating > 0
+    `),
+    dbAll(`
+      SELECT target_month,
+             COUNT(*) as active_skus,
+             ROUND(SUM(sales_qty), 0) as sales_qty,
+             ROUND(SUM(sales_amt), 0) as sales_amt,
+             ROUND(SUM(cogs), 0) as cogs,
+             ROUND(SUM(close_qty), 0) as close_qty,
+             ROUND(SUM(close_cst), 0) as close_cst,
+             SUM(CASE WHEN close_qty < 0 THEN 1 ELSE 0 END) as neg_skus
+      FROM erp_snapshots
+      WHERE store_code = '3001'
+      GROUP BY target_month ORDER BY target_month ASC
+    `),
+    dbAll(`SELECT store_code, MAX(target_month) as m FROM erp_snapshots WHERE store_code IN ('9005','3001','1001') GROUP BY store_code`),
+  ]);
 
-  const ticketStats = await dbGet(`
-    SELECT COUNT(*) as total,
-           COALESCE(SUM(CASE WHEN status NOT IN ('Closed','Resolved') THEN 1 ELSE 0 END), 0) as open_count
-    FROM warranty_tickets
-  `);
-
-  const qcStats = await dbGet(`
-    SELECT COUNT(*) as skus, COALESCE(SUM(defective_qty), 0) as units
-    FROM qc_factory_returns WHERE status != 'Closed'
-  `);
-
-  const csatStats = await dbGet(`
-    SELECT COUNT(*) as count, ROUND(AVG(csat_rating), 2) as avg_rating
-    FROM handovers WHERE csat_rating > 0
-  `);
-
-  const supportStats = await dbAll(`SELECT category, SUM(hours) as hours FROM support_logs GROUP BY category`);
-  const wh9005 = await calcWarehouse9005Footprint();
-
-  const rawTrend = await dbAll(`
-    SELECT target_month,
-           COUNT(*) as active_skus,
-           ROUND(SUM(sales_qty), 0) as sales_qty,
-           ROUND(SUM(sales_amt), 0) as sales_amt,
-           ROUND(SUM(cogs), 0) as cogs,
-           ROUND(SUM(close_qty), 0) as close_qty,
-           ROUND(SUM(close_cst), 0) as close_cst,
-           SUM(CASE WHEN close_qty < 0 THEN 1 ELSE 0 END) as neg_skus
-    FROM erp_snapshots
-    WHERE store_code = '3001'
-    GROUP BY target_month ORDER BY target_month ASC
-  `);
   const store3001Trend = rawTrend.map(r => ({
     ...r,
     gp_pct: r.sales_amt > 0 ? Number((((r.sales_amt - r.cogs) / r.sales_amt) * 100).toFixed(1)) : 0,
   }));
 
-  const latest3001 = store3001Trend.length ? store3001Trend[store3001Trend.length - 1].target_month : '202611';
+  const latestMap = new Map(latestRows.map(r => [r.store_code, r.m]));
+  const latest3001 = store3001Trend.length ? store3001Trend[store3001Trend.length - 1].target_month : (latestMap.get('3001') || '202611');
+  const latest9005 = latestMap.get('9005') || '202611';
   const last3Months = store3001Trend.slice(-3).map(x => x.target_month);
   const ph = last3Months.length ? last3Months.map(() => '?').join(',') : '?';
   const mArgs = last3Months.length ? last3Months : [latest3001];
 
-  const negativeStock = await dbAll(`
-    SELECT barcode, product_name, close_qty, store_code
-    FROM erp_snapshots
-    WHERE store_code = '3001' AND target_month = ? AND close_qty < 0
-    ORDER BY close_qty ASC
-  `, [latest3001]);
+  // Batch 2: dependent analytics in parallel (skips heavy items[] and Top 50 slow-moving until requested!)
+  const [wh9005, wh3001, negativeStock, replenishAlerts, slowMoving, slowMovingTotal] = await Promise.all([
+    calcWarehouse9005Footprint(false, latestMap),
+    calcStore3001Inventory(false, latestMap, last3Months),
+    dbAll(`
+      SELECT barcode, product_name, close_qty, store_code
+      FROM erp_snapshots
+      WHERE store_code = '3001' AND target_month = ? AND close_qty < 0
+      ORDER BY close_qty ASC
+    `, [latest3001]),
+    dbAll(`
+      SELECT s3.barcode, s3.product_name, s3.close_qty as stock_3001,
+             COALESCE(s9.close_qty, 0) as stock_9005,
+             COALESCE(r3.sold_3m, 0) as sold_3m,
+             COALESCE(p.is_top_50, 0) as is_top_50,
+             COALESCE(p.min_stock_3001, 2) as min_stock
+      FROM erp_snapshots s3
+      LEFT JOIN erp_snapshots s9 ON s9.barcode = s3.barcode AND s9.store_code = '9005' AND s9.target_month = ?
+      LEFT JOIN (
+        SELECT barcode, SUM(sales_qty) as sold_3m
+        FROM erp_snapshots WHERE store_code = '3001' AND target_month IN (${ph})
+        GROUP BY barcode
+      ) r3 ON r3.barcode = s3.barcode
+      LEFT JOIN products p ON p.barcode = s3.barcode
+      WHERE s3.store_code = '3001' AND s3.target_month = ?
+        AND COALESCE(r3.sold_3m, 0) >= 2 AND s3.close_qty <= 1 AND COALESCE(s9.close_qty, 0) > 0
+      ORDER BY r3.sold_3m DESC
+    `, [latest9005, ...mArgs, latest3001]),
+    dbAll(`
+      SELECT s3.barcode, s3.product_name, s3.close_qty, ROUND(s3.close_cst, 0) as close_cst,
+             COALESCE(p.supplier_name, s3.supplier_code) as supplier
+      FROM erp_snapshots s3
+      LEFT JOIN (
+        SELECT barcode, SUM(sales_qty) as sold_3m
+        FROM erp_snapshots WHERE store_code = '3001' AND target_month IN (${ph})
+        GROUP BY barcode
+      ) r3 ON r3.barcode = s3.barcode
+      LEFT JOIN products p ON p.barcode = s3.barcode
+      WHERE s3.store_code = '3001' AND s3.target_month = ?
+        AND s3.close_qty > 0 AND COALESCE(r3.sold_3m, 0) = 0
+      ORDER BY s3.close_cst DESC LIMIT 6
+    `, [...mArgs, latest3001]),
+    dbGet(`
+      SELECT COUNT(*) as count, ROUND(COALESCE(SUM(s3.close_cst), 0), 0) as total_cost
+      FROM erp_snapshots s3
+      LEFT JOIN (
+        SELECT barcode, SUM(sales_qty) as sold_3m
+        FROM erp_snapshots WHERE store_code = '3001' AND target_month IN (${ph})
+        GROUP BY barcode
+      ) r3 ON r3.barcode = s3.barcode
+      WHERE s3.store_code = '3001' AND s3.target_month = ?
+        AND s3.close_qty > 0 AND COALESCE(r3.sold_3m, 0) = 0
+    `, [...mArgs, latest3001]),
+  ]);
 
-  const replenishAlerts = await dbAll(`
-    SELECT s3.barcode, s3.product_name, s3.close_qty as stock_3001,
-           COALESCE(s9.close_qty, 0) as stock_9005,
-           COALESCE(r3.sold_3m, 0) as sold_3m,
-           COALESCE(p.is_top_50, 0) as is_top_50,
-           COALESCE(p.min_stock_3001, 2) as min_stock
-    FROM erp_snapshots s3
-    LEFT JOIN erp_snapshots s9 ON s9.barcode = s3.barcode AND s9.store_code = '9005' AND s9.target_month = ?
-    LEFT JOIN (
-      SELECT barcode, SUM(sales_qty) as sold_3m
-      FROM erp_snapshots WHERE store_code = '3001' AND target_month IN (${ph})
-      GROUP BY barcode
-    ) r3 ON r3.barcode = s3.barcode
-    LEFT JOIN products p ON p.barcode = s3.barcode
-    WHERE s3.store_code = '3001' AND s3.target_month = ?
-      AND COALESCE(r3.sold_3m, 0) >= 2 AND s3.close_qty <= 1 AND COALESCE(s9.close_qty, 0) > 0
-    ORDER BY r3.sold_3m DESC
-  `, [wh9005.target_month, ...mArgs, latest3001]);
+  const payload = {
+    orderStats, ticketStats, qcStats, csatStats,
+    wh9005, wh3001, store3001Trend, latest3001,
+    negativeStock, replenishAlerts, slowMoving, slowMovingTotal,
+  };
+  res.json(setServerCache('dashboard:summary', payload, 45000));
+}));
 
-  const slowMoving = await dbAll(`
+// On-demand Warehouse 9005 per-barcode drilldown (loaded only when user clicks a supplier / opens drilldown)
+app.get('/api/dashboard/wh9005-items', wrap(async (req, res) => {
+  const cached = getServerCache('dashboard:wh9005-items');
+  if (cached) return res.json(cached);
+  const full = await calcWarehouse9005Footprint(true);
+  const payload = { target_month: full.target_month, items: full.items || [] };
+  res.json(setServerCache('dashboard:wh9005-items', payload, 45000));
+}));
+
+// On-demand Store 3001 per-barcode drilldown (loaded only when user clicks a supplier / opens drilldown)
+app.get('/api/dashboard/store3001-items', wrap(async (req, res) => {
+  const cached = getServerCache('dashboard:store3001-items');
+  if (cached) return res.json(cached);
+  const full = await calcStore3001Inventory(true);
+  const payload = { target_month: full.target_month, items: full.items || [] };
+  res.json(setServerCache('dashboard:store3001-items', payload, 45000));
+}));
+
+// On-demand Top 50 Slow-Moving SKUs (loaded only when user clicks "Xem Top 50")
+app.get('/api/dashboard/slow-moving', wrap(async (req, res) => {
+  const cached = getServerCache('dashboard:slow-moving');
+  if (cached) return res.json(cached);
+  const months = await dbAll(`SELECT DISTINCT target_month FROM erp_snapshots WHERE store_code = '3001' ORDER BY target_month DESC LIMIT 3`);
+  const last3 = months.map(r => r.target_month);
+  const latest3001 = last3[0] || '202611';
+  const ph = last3.length ? last3.map(() => '?').join(',') : '?';
+  const mArgs = last3.length ? last3 : [latest3001];
+  const items = await dbAll(`
     SELECT s3.barcode, s3.product_name, s3.close_qty, ROUND(s3.close_cst, 0) as close_cst,
            COALESCE(p.supplier_name, s3.supplier_code) as supplier
     FROM erp_snapshots s3
@@ -569,72 +811,74 @@ app.get('/api/dashboard', wrap(async (req, res) => {
       AND s3.close_qty > 0 AND COALESCE(r3.sold_3m, 0) = 0
     ORDER BY s3.close_cst DESC LIMIT 50
   `, [...mArgs, latest3001]);
-
-  const slowMovingTotal = await dbGet(`
-    SELECT COUNT(*) as count, ROUND(COALESCE(SUM(s3.close_cst), 0), 0) as total_cost
-    FROM erp_snapshots s3
-    LEFT JOIN (
-      SELECT barcode, SUM(sales_qty) as sold_3m
-      FROM erp_snapshots WHERE store_code = '3001' AND target_month IN (${ph})
-      GROUP BY barcode
-    ) r3 ON r3.barcode = s3.barcode
-    WHERE s3.store_code = '3001' AND s3.target_month = ?
-      AND s3.close_qty > 0 AND COALESCE(r3.sold_3m, 0) = 0
-  `, [...mArgs, latest3001]);
-
-  res.json({
-    orderStats, carrierBreakdown, ticketStats, qcStats, csatStats,
-    supportStats, wh9005, store3001Trend, latest3001,
-    negativeStock, replenishAlerts, slowMoving, slowMovingTotal,
-  });
+  res.json(setServerCache('dashboard:slow-moving', { items }, 45000));
 }));
 
-// ─── 2. MASTER DATA & GUIDES ──────────────────────────────────
+// ─── 2. MASTER DATA & GUIDES (PAGINATED + LEAN PROJECTION) ─────
 app.get('/api/master/products', wrap(async (req, res) => {
   const q = (req.query.q || '').trim();
   const type = (req.query.type || '').trim();
   const includeStock = req.query.include_stock_9005 === '1';
   const includeAllStock = req.query.include_all_stock === '1';
+  const defaultLimit = (includeStock || includeAllStock) ? 20 : 50;
+  const limit = Math.max(1, Math.min(300, Number(req.query.limit) || defaultLimit));
+  const offset = Math.max(0, Number(req.query.offset) || 0);
 
   let latest9005 = '';
   if (includeStock) {
     latest9005 = (await dbGet(`SELECT MAX(target_month) as m FROM erp_snapshots WHERE store_code = '9005'`))?.m || '202611';
   }
 
-  let sql = includeStock
-    ? `SELECT p.*, COALESCE(e.close_qty, 0) as stock_9005
-       FROM products p
-       LEFT JOIN erp_snapshots e ON e.barcode = p.barcode AND e.store_code = '9005' AND e.target_month = ?
-       WHERE 1=1`
-    : `SELECT * FROM products p WHERE 1=1`;
-  const params = includeStock ? [latest9005] : [];
+  let where = ` WHERE 1=1`;
+  const filterParams = [];
   if (q) {
-    sql += ` AND (p.barcode LIKE ? OR p.name_vn LIKE ? OR p.supplier_name LIKE ? OR p.product_family LIKE ?)`;
-    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+    where += ` AND (p.barcode LIKE ? OR p.name_vn LIKE ? OR p.supplier_name LIKE ? OR p.product_family LIKE ?)`;
+    filterParams.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
   if (type) {
-    sql += ` AND p.item_type = ?`;
-    params.push(type);
+    where += ` AND p.item_type = ?`;
+    filterParams.push(type);
   }
-  sql += ` ORDER BY p.is_top_50 DESC, p.net_weight_g DESC, p.name_vn ASC LIMIT 300`;
-  const prods = await dbAll(sql, params);
+
+  const cols = `p.barcode, p.name_vn, p.item_type, p.supplier_name, p.unit, p.retail_price, p.cost_price,
+                p.net_weight_g, p.p_handling, p.install_level, p.p_installation,
+                p.warranty_policy, p.warranty_months, p.min_stock_3001, p.is_top_50`;
+  const selectSql = includeStock
+    ? `SELECT ${cols}, COALESCE(e.close_qty, 0) as stock_9005
+       FROM products p
+       LEFT JOIN erp_snapshots e ON e.barcode = p.barcode AND e.store_code = '9005' AND e.target_month = ?
+       ${where} ORDER BY p.is_top_50 DESC, p.net_weight_g DESC, p.name_vn ASC LIMIT ? OFFSET ?`
+    : `SELECT ${cols} FROM products p ${where} ORDER BY p.is_top_50 DESC, p.net_weight_g DESC, p.name_vn ASC LIMIT ? OFFSET ?`;
+
+  const [countRow, prods] = await Promise.all([
+    dbGet(`SELECT COUNT(*) as c FROM products p ${where}`, filterParams),
+    dbAll(selectSql, includeStock ? [latest9005, ...filterParams, limit, offset] : [...filterParams, limit, offset]),
+  ]);
+  res.setHeader('X-Total-Count', String(countRow?.c || prods.length));
   if (!includeAllStock || prods.length === 0) return res.json(prods);
 
   const latestByStore = await dbAll(`SELECT store_code, MAX(target_month) as m FROM erp_snapshots WHERE store_code IN ('9005','3001','1001') GROUP BY store_code`);
   const stockMap = new Map();
   const barcodes = prods.map(p => p.barcode);
   const ph = barcodes.map(() => '?').join(',');
-  for (const row of latestByStore) {
-    if (!row.store_code || !row.m) continue;
-    const snaps = await dbAll(
-      `SELECT barcode, close_qty FROM erp_snapshots WHERE store_code = ? AND target_month = ? AND barcode IN (${ph})`,
-      [row.store_code, row.m, ...barcodes]
-    );
-    for (const s of snaps) {
+  // Parallelize 3 store stock lookups instead of sequential loop
+  const snapBatches = await Promise.all(
+    latestByStore
+      .filter(row => row.store_code && row.m)
+      .map(async row => ({
+        store: row.store_code,
+        rows: await dbAll(
+          `SELECT barcode, close_qty FROM erp_snapshots WHERE store_code = ? AND target_month = ? AND barcode IN (${ph})`,
+          [row.store_code, row.m, ...barcodes]
+        ),
+      }))
+  );
+  for (const batch of snapBatches) {
+    for (const s of batch.rows) {
       const cur = stockMap.get(s.barcode) || { s9005: 0, s3001: 0, s1001: 0 };
-      if (row.store_code === '9005') cur.s9005 = s.close_qty || 0;
-      else if (row.store_code === '3001') cur.s3001 = s.close_qty || 0;
-      else if (row.store_code === '1001') cur.s1001 = s.close_qty || 0;
+      if (batch.store === '9005') cur.s9005 = s.close_qty || 0;
+      else if (batch.store === '3001') cur.s3001 = s.close_qty || 0;
+      else if (batch.store === '1001') cur.s1001 = s.close_qty || 0;
       stockMap.set(s.barcode, cur);
     }
   }
@@ -666,12 +910,14 @@ app.put('/api/master/products/:barcode', requireRoles('ADMIN'), wrap(async (req,
 }));
 
 app.get('/api/master/lookups', wrap(async (req, res) => {
+  const cached = getServerCache('master:lookups');
+  if (cached) return res.json(cached);
   const [staff, warehouses, partners] = await Promise.all([
     dbAll('SELECT * FROM staff WHERE active = 1 ORDER BY emp_code, full_name'),
     dbAll('SELECT * FROM warehouses ORDER BY code'),
     dbAll('SELECT * FROM partners ORDER BY partner_type, name'),
   ]);
-  res.json({ staff, warehouses, partners });
+  res.json(setServerCache('master:lookups', { staff, warehouses, partners }, 120000));
 }));
 
 app.post('/api/master/staff', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
@@ -730,10 +976,31 @@ function normalizeKtvInput(b, fallbackRow = null) {
 
 app.get('/api/guides', wrap(async (req, res) => {
   const q = (req.query.q || '').trim();
-  if (q) {
-    return res.json(await dbAll(`SELECT * FROM product_guides WHERE title LIKE ? OR product_line LIKE ? OR content_md LIKE ?`, [`%${q}%`, `%${q}%`, `%${q}%`]));
-  }
-  res.json(await dbAll(`SELECT * FROM product_guides ORDER BY product_line, title`));
+  const summary = req.query.summary === '1';
+  const rows = q
+    ? await dbAll(
+        summary
+          ? `SELECT id, title, product_line, guide_type, substr(content_md, 1, 220) as content_md FROM product_guides WHERE title LIKE ? OR product_line LIKE ? OR content_md LIKE ? ORDER BY product_line, id`
+          : `SELECT * FROM product_guides WHERE title LIKE ? OR product_line LIKE ? OR content_md LIKE ? ORDER BY product_line, id`,
+        [`%${q}%`, `%${q}%`, `%${q}%`]
+      )
+    : await dbAll(
+        summary
+          ? `SELECT id, title, product_line, guide_type, substr(content_md, 1, 220) as content_md FROM product_guides ORDER BY product_line, id`
+          : `SELECT * FROM product_guides ORDER BY product_line, id`
+      );
+  if (!summary) return res.json(rows);
+  res.json(rows.map(g => {
+    const cleanText = String(g.content_md || '').replace(/[#*_\\!]|\[.*?\]/g, ' ').replace(/\s+/g, ' ').trim();
+    const title = String(g.title || '').trim() || cleanText.slice(0, 80) || `Tài liệu ${g.guide_type || 'HDLR'} #${g.id}`;
+    return {
+      id: g.id,
+      title,
+      product_line: g.product_line || 'Chung',
+      guide_type: g.guide_type || 'HDLR',
+      preview: cleanText.slice(0, 160),
+    };
+  }));
 }));
 
 // Quick HDLR/HDBQ matcher for KTV on-site inside BM-01 HandoverModal (TASK-14)
@@ -794,6 +1061,12 @@ app.get('/api/guides/match', wrap(async (req, res) => {
   }
 
   res.json(deduped.length > 0 ? deduped : normalized.slice(0, 4));
+}));
+
+app.get('/api/guides/:id', wrap(async (req, res) => {
+  const row = await dbGet('SELECT id, title, product_line, guide_type, content_md FROM product_guides WHERE id = ?', [req.params.id]);
+  if (!row) return res.status(404).json({ error: 'Không tìm thấy tài liệu hướng dẫn' });
+  res.json(row);
 }));
 
 // ─── 2B. SPARE PARTS / KHO NGŨ KIM KTV (TASK-15) ──────────────
@@ -865,23 +1138,30 @@ async function batchQueryByIds(sqlPrefix, ids) {
 app.get('/api/orders', wrap(async (req, res) => {
   const q = (req.query.q || '').trim();
   const status = (req.query.status || '').trim();
-  let sql = `SELECT * FROM orders WHERE 1=1`;
+  const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 60));
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+
+  let where = ` WHERE 1=1`;
   const params = [];
   if (q) {
-    sql += ` AND (invoice_no LIKE ? OR customer_name LIKE ? OR customer_phone LIKE ? OR tracking_no LIKE ?)`;
+    where += ` AND (invoice_no LIKE ? OR customer_name LIKE ? OR customer_phone LIKE ? OR tracking_no LIKE ?)`;
     params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
   if (status) {
-    sql += ` AND status = ?`;
+    where += ` AND status = ?`;
     params.push(status);
   }
-  sql += ` ORDER BY order_date DESC, id DESC LIMIT 200`;
-  const orders = await dbAll(sql, params);
+  const [countRow, orders] = await Promise.all([
+    dbGet(`SELECT COUNT(*) as c FROM orders${where}`, params),
+    dbAll(`SELECT * FROM orders${where} ORDER BY order_date DESC, id DESC LIMIT ? OFFSET ?`, [...params, limit, offset]),
+  ]);
+  res.setHeader('X-Total-Count', String(countRow?.c || orders.length));
+
   const orderIds = orders.map(o => o.id);
   const invoiceNos = Array.from(new Set(orders.map(o => o.invoice_no).filter(Boolean)));
 
   const [allItems, allHos] = await Promise.all([
-    batchQueryByIds(`SELECT * FROM order_items WHERE order_id IN`, orderIds),
+    batchQueryByIds(`SELECT id, order_id, barcode, product_name, unit, qty, net_weight_g, source_warehouse, moving_no FROM order_items WHERE order_id IN`, orderIds),
     batchQueryByIds(`SELECT id, doc_no, doc_type, invoice_no, status, csat_rating FROM handovers WHERE invoice_no IN`, invoiceNos),
   ]);
 
@@ -1310,14 +1590,18 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
 async function computeAllowance(monthInput, scopeInput = 'completed') {
   const scope = ['completed', 'bm01_only', 'all'].includes(scopeInput) ? scopeInput : 'completed';
 
-  const monthsRows = await dbAll(`
-    SELECT DISTINCT substr(COALESCE(NULLIF(delivery_date,''), order_date), 1, 7) as ym
-    FROM orders
-    WHERE require_install = 1
-      AND (ktv1_name != '' OR ktv2_name != '' OR (ktvs_json IS NOT NULL AND ktvs_json != '' AND ktvs_json != '[]'))
-      AND length(COALESCE(NULLIF(delivery_date,''), order_date)) >= 7
-    ORDER BY ym DESC
-  `);
+  const [monthsRows, bm01Rows, allLocks] = await Promise.all([
+    dbAll(`
+      SELECT DISTINCT substr(COALESCE(NULLIF(delivery_date,''), order_date), 1, 7) as ym
+      FROM orders
+      WHERE require_install = 1
+        AND (ktv1_name != '' OR ktv2_name != '' OR (ktvs_json IS NOT NULL AND ktvs_json != '' AND ktvs_json != '[]'))
+        AND length(COALESCE(NULLIF(delivery_date,''), order_date)) >= 7
+      ORDER BY ym DESC
+    `),
+    dbAll(`SELECT id, order_id, invoice_no, doc_no, status FROM handovers WHERE doc_type = 'BM-01' AND status != 'Cancelled'`),
+    dbAll('SELECT month_ym, locked_by, locked_at, grand_total, order_count, notes FROM allowance_locks ORDER BY month_ym DESC'),
+  ]);
   const available_months = monthsRows.map(r => r.ym).filter(Boolean);
   const currentVnMonth = getVnYearMonth();
   if (!available_months.includes(currentVnMonth)) {
@@ -1339,8 +1623,7 @@ async function computeAllowance(monthInput, scopeInput = 'completed') {
     ORDER BY COALESCE(NULLIF(delivery_date,''), order_date) ASC, id ASC
   `, [effectiveMonth, `${effectiveMonth}%`]);
 
-  // Fetch BM-01 handovers to verify SOP compliance (BEN-PRO-TechnicianAllowance Bước 4 & 6)
-  const bm01Rows = await dbAll(`SELECT id, order_id, invoice_no, doc_no, status FROM handovers WHERE doc_type = 'BM-01' AND status != 'Cancelled'`);
+  // Map BM-01 handovers to verify SOP compliance (BEN-PRO-TechnicianAllowance Bước 4 & 6)
   const bm01ByOrderId = new Map();
   const bm01ByInvoice = new Map();
   for (const h of bm01Rows) {
@@ -1456,7 +1739,6 @@ async function computeAllowance(monthInput, scopeInput = 'completed') {
     .map(x => ({ ktv_code: x.code, ktv_name: x.name, order_count: x.orders.size, total_allowance: Math.round(x.total) }))
     .sort((a, b) => b.total_allowance - a.total_allowance);
 
-  const allLocks = await dbAll('SELECT month_ym, locked_by, locked_at, grand_total, order_count, notes FROM allowance_locks ORDER BY month_ym DESC');
   const lockInfo = effectiveMonth ? (allLocks.find(l => l.month_ym === effectiveMonth) || null) : null;
 
   return {
@@ -1544,16 +1826,22 @@ app.get('/api/allowance/export', requireRoles('ADMIN', 'EDITOR'), wrap(async (re
   res.send(buf);
 }));
 
-// ─── 6. WAREHOUSE SLIPS (NK / XK) & CUT-OFF CHECK ─────────────
+// ─── 6. WAREHOUSE SLIPS (NK / XK, PAGINATED) & CUT-OFF CHECK ──
 app.get('/api/slips', wrap(async (req, res) => {
   const type = (req.query.type || '').trim();
-  let sql = `SELECT * FROM warehouse_slips WHERE 1=1`;
-  const params = [];
-  if (type) { sql += ` AND slip_type = ?`; params.push(type); }
-  sql += ` ORDER BY slip_date DESC, id DESC LIMIT 150`;
-  const slips = await dbAll(sql, params);
+  const limit = Math.max(1, Math.min(150, Number(req.query.limit) || 40));
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+  const where = type ? ` WHERE slip_type = ?` : '';
+  const params = type ? [type] : [];
+
+  const [countRow, slips] = await Promise.all([
+    dbGet(`SELECT COUNT(*) as c FROM warehouse_slips${where}`, params),
+    dbAll(`SELECT * FROM warehouse_slips${where} ORDER BY slip_date DESC, id DESC LIMIT ? OFFSET ?`, [...params, limit, offset]),
+  ]);
+  res.setHeader('X-Total-Count', String(countRow?.c || slips.length));
+
   const slipIds = slips.map(s => s.id);
-  const allItems = await batchQueryByIds(`SELECT * FROM warehouse_slip_items WHERE slip_id IN`, slipIds);
+  const allItems = await batchQueryByIds(`SELECT id, slip_id, barcode, product_name, unit, qty, actual_qty, note FROM warehouse_slip_items WHERE slip_id IN`, slipIds);
   const itemMap = new Map();
   for (const it of allItems) {
     const arr = itemMap.get(it.slip_id) || [];
@@ -1790,6 +2078,26 @@ app.get('/api/warranty/lookup', wrap(async (req, res) => {
     }
     return { ...r, days_left: daysLeft, warranty_status: status };
   }));
+}));
+
+// Lightweight badge counts for WarrantyQcView so only active sub-tab loads rows
+app.get('/api/warranty/counts', wrap(async (req, res) => {
+  const cached = getServerCache('warranty:counts');
+  if (cached) return res.json(cached);
+  const [w, b3, b4, qc, sup] = await Promise.all([
+    dbGet('SELECT COUNT(*) as c FROM warranty_tickets'),
+    dbGet('SELECT COUNT(*) as c FROM bm03_inspections'),
+    dbGet('SELECT COUNT(*) as c FROM bm04_incidents'),
+    dbGet(`SELECT COALESCE(SUM(defective_qty), 0) as u FROM qc_factory_returns WHERE status != 'Closed'`),
+    dbGet('SELECT COALESCE(SUM(hours), 0) as h FROM support_logs'),
+  ]);
+  res.json(setServerCache('warranty:counts', {
+    warranty: w?.c || 0,
+    bm03: b3?.c || 0,
+    bm04: b4?.c || 0,
+    qc_units: qc?.u || 0,
+    support_hours: Number((sup?.h || 0).toFixed(1)),
+  }, 30000));
 }));
 
 app.get('/api/warranty', wrap(async (req, res) => {
@@ -2532,12 +2840,54 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message || 'Lỗi hệ thống nội bộ' });
 });
 
-// Serve built frontend in production
+// Serve built frontend in production with in-memory gzip & immutable long-term asset caching
 if (fs.existsSync(DIST_DIR)) {
-  app.use(express.static(DIST_DIR));
+  const gzStaticCache = new Map();
+  const MIME_BY_EXT = {
+    '.js': 'application/javascript; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.html': 'text/html; charset=utf-8',
+    '.svg': 'image/svg+xml',
+  };
+  const sendGzippedFile = (req, res, filePath, isImmutable) => {
+    const ext = path.extname(filePath).toLowerCase();
+    const mime = MIME_BY_EXT[ext];
+    if (!mime || !/\bgzip\b/i.test(req.headers['accept-encoding'] || '')) return false;
+    try {
+      const stat = fs.statSync(filePath);
+      const cacheKey = `${filePath}:${stat.mtimeMs}`;
+      let gz = gzStaticCache.get(cacheKey);
+      if (!gz) {
+        gz = zlib.gzipSync(fs.readFileSync(filePath), { level: 9 });
+        gzStaticCache.set(cacheKey, gz);
+      }
+      res.setHeader('Content-Type', mime);
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Vary', 'Accept-Encoding');
+      res.setHeader('Cache-Control', isImmutable ? 'public, max-age=31536000, immutable' : 'no-cache');
+      res.setHeader('Content-Length', String(gz.length));
+      res.end(gz);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  app.get('/assets/*', (req, res, next) => {
+    const rel = path.normalize(req.path).replace(/^([/\\])+/, '');
+    const full = path.join(DIST_DIR, rel);
+    if (full.startsWith(DIST_DIR) && fs.existsSync(full) && sendGzippedFile(req, res, full, true)) return;
+    next();
+  });
+
+  app.use('/assets', express.static(path.join(DIST_DIR, 'assets'), { maxAge: '1y', immutable: true }));
+  app.use(express.static(DIST_DIR, { index: false, maxAge: '1h' }));
   app.get('*', (req, res) => {
     if (!req.path.startsWith('/api')) {
-      res.sendFile(path.join(DIST_DIR, 'index.html'));
+      const indexPath = path.join(DIST_DIR, 'index.html');
+      if (sendGzippedFile(req, res, indexPath, false)) return;
+      res.setHeader('Cache-Control', 'no-cache');
+      res.sendFile(indexPath);
     }
   });
 }
