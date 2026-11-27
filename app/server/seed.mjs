@@ -342,98 +342,105 @@ export async function runSeed(force = false, confirmCloudReset = false) {
   );
   console.log(`[Seed] Products: ${productMap.size}`);
 
-  // 5. ORDERS & ORDER ITEMS from shipments_tracking.csv
+  // 5. ORDERS & ORDER ITEMS from shipments_tracking.csv (positional columns to avoid duplicate 'Trạng thái' header)
   const shipRaw = readCsv(path.join(DATA, 'shipments_tracking.csv'));
   const shipHeaderIdx = shipRaw.findIndex(r => r.some(c => String(c || '').includes('Mã hoá đơn')));
-  const shipHeaders = shipHeaderIdx >= 0 ? shipRaw[shipHeaderIdx] : [];
-  const shipRows = shipHeaderIdx >= 0
-    ? shipRaw.slice(shipHeaderIdx + 1).map(r => {
-        const obj = {};
-        shipHeaders.forEach((h, i) => { obj[h] = r[i] ?? ''; });
-        return obj;
-      })
-    : [];
+  const shipRows = shipHeaderIdx >= 0 ? shipRaw.slice(shipHeaderIdx + 1) : [];
 
   const orderGroups = new Map();
   let autoInvIdx = 1;
   for (const r of shipRows) {
-    const rawInv = (r['Mã hoá đơn'] || '').trim();
-    const cust = (r['Tên KH'] || '').trim();
-    const bc = (r['Barcode'] || '').trim();
+    const rawInv = (r[13] || '').trim();
+    const cust = (r[6] || '').trim();
+    const bc = (r[15] || '').trim();
     if (!rawInv && !cust && !bc) continue;
     const inv = rawInv || `NOINV-${String(autoInvIdx++).padStart(4, '0')}`;
+    const itemWh = (r[12] || '').trim() || '9005';
+    const rawMv = (r[14] || '').trim();
+    const itemMv = /không làm moving/i.test(rawMv) ? '' : rawMv;
+    const trk = String(r[2] || '').replace(/\r?\n/g, '').trim();
+    let car = normalizeCarrier(r[11]);
+    if (!car && /^893195\d{6,}$/.test(trk)) car = 'Sagawa';
+    else if (!car && /^26[A-Z0-9]{6,}$/i.test(trk)) car = 'Ahamove';
+
     if (!orderGroups.has(inv)) {
-      let ktv1Code = String(r['Mã Nhân viên 1'] || '').replace(/[^\d]/g, '');
-      let ktv2Code = String(r['Mã Nhân Viên 2'] || '').replace(/[^\d]/g, '');
+      let ktv1Code = String(r[27] || '').replace(/[^\d]/g, '');
+      let ktv2Code = String(r[29] || '').replace(/[^\d]/g, '');
       if (ktv1Code === '260153') ktv1Code = '260135';
       if (ktv2Code === '260153') ktv2Code = '260135';
-      const ktv1Name = (r['Kỹ thuật viên \nphụ trách 1'] || r['Kỹ thuật viên phụ trách 1'] || '').trim();
-      const ktv2Name = (r['Kỹ thuật viên phụ trách 2'] || '').trim();
-      const note = (r['Note for sales'] || r['Ghi chú'] || '').trim();
-      const addr = (r['Địa chỉ giao hàng'] || '').trim();
-      const isStairs = /thang bộ|khiêng bộ|lầu bộ|không có thang máy/i.test(addr + ' ' + note) ? 1 : 0;
+      const ktv1Name = /^sagawa$/i.test((r[28] || '').trim()) ? '' : (r[28] || '').trim();
+      const ktv2Name = (r[30] || '').trim();
+      const note = (r[23] || r[3] || '').trim();
+      const addr = (r[8] || '').trim();
+      const isStairs = /thang bộ|khiêng bộ|lầu bộ|không có thang máy|không thang máy/i.test(addr + ' ' + note) ? 1 : 0;
       orderGroups.set(inv, {
         invoice_no: inv,
-        order_date: parseDateIso(r['Ngày nhập data (d/m/y)']),
-        delivery_date: parseDateIso(r['Ngày KH nhận hàng thực tế (d/m/y)'] || r['Ngày hẹn lắp đặt \n(dd/mm/yyyy)']),
+        order_date: parseDateIso(r[5]),
+        delivery_date: parseDateIso(r[1] || r[26]),
         customer_name: cust,
-        customer_phone: cleanPhone(r['SĐT KH']),
+        customer_phone: cleanPhone(r[7]),
         address: addr,
-        region: normalizeRegion(r['Khu vực']),
-        distance_km: num(r['Số Km']),
-        carrier: normalizeCarrier(r['Vận chuyển']),
-        tracking_no: (r['Mã vận đơn'] || '').trim(),
-        source_warehouse: (r['Điểm lấy hàng'] || '9005').trim() || '9005',
-        moving_no: (r['Mã moving'] || '').trim(),
-        pic_sales: (r['PIC sales'] || '').trim(),
-        channel: (r['Khách hàng biết đến benom qua đâu?\n(nếu có)'] || '').trim(),
-        shipping_fee_3pl: num(r['Chi phí vận chuyển']),
+        region: normalizeRegion(r[10]),
+        distance_km: num(r[9]),
+        carrier: car,
+        tracking_no: trk,
+        source_warehouse: itemWh,
+        _whSet: new Set([itemWh]),
+        moving_no: itemMv,
+        pic_sales: (r[22] || '').trim(),
+        channel: (r[24] || '').trim(),
+        shipping_fee_3pl: num(r[25]),
         customer_paid_fee: 0,
         is_promo_free_ship: /free|miễn phí/i.test(note) ? 1 : 0,
-        require_install: String(r['Yêu cầu lắp đặt'] || '').toLowerCase().includes('có') ? 1 : 0,
+        require_install: String(r[21] || '').toLowerCase().includes('có') ? 1 : 0,
         is_stairs: isStairs,
         ktv1_name: ktv1Name,
         ktv1_code: ktv1Code,
         ktv2_name: ktv2Name,
         ktv2_code: ktv2Code,
         ktvs_json: buildKtvsJson(ktv1Code, ktv1Name, ktv2Code, ktv2Name),
-        status: (r['Trạng thái'] || 'Done').trim() || 'New',
-        install_status: (r['Trạng thái\nlắp đặt (BM-01)'] || '').trim(),
+        status: (r[0] || 'New').trim() || 'New',
+        install_status: (r[31] || '').trim(),
         notes: note,
         items: [],
         tickets: [],
       });
     }
     const og = orderGroups.get(inv);
-    if (og.shipping_fee_3pl === 0 && num(r['Chi phí vận chuyển']) > 0) {
-      og.shipping_fee_3pl = num(r['Chi phí vận chuyển']);
+    og._whSet.add(itemWh);
+    og.source_warehouse = [...og._whSet].join(' + ');
+    if (!og.moving_no && itemMv) og.moving_no = itemMv;
+    if (og.shipping_fee_3pl === 0 && num(r[25]) > 0) {
+      og.shipping_fee_3pl = num(r[25]);
     }
-    if (String(r['Yêu cầu lắp đặt'] || '').toLowerCase().includes('có')) og.require_install = 1;
+    if (String(r[21] || '').toLowerCase().includes('có')) og.require_install = 1;
     const p = productMap.get(bc);
     og.items.push({
       barcode: bc,
-      product_name: (r['Tên sản phẩm'] || p?.name_vn || bc).trim(),
-      unit: (r['Đơn vị'] || 'Cái').trim() || 'Cái',
-      qty: num(r['Số lượng']) || 1,
-      net_weight_g: p?.net_weight_g || num(r['Trọng lượng (kg)']) * 1000,
-      warranty_months: p?.warranty_months || warrantyMonthsFromText(r['Thời hạn bảo hành']),
-      warranty_policy: p?.warranty_policy || (r['Thời hạn bảo hành'] || 'Không bảo hành').trim(),
+      product_name: (r[16] || p?.name_vn || bc).trim(),
+      unit: (r[17] || 'Cái').trim() || 'Cái',
+      qty: num(r[18]) || 1,
+      net_weight_g: p?.net_weight_g || num(r[19]) * 1000,
+      warranty_months: p?.warranty_months || warrantyMonthsFromText(r[33]),
+      warranty_policy: p?.warranty_policy || (r[33] || 'Không bảo hành').trim(),
       p_handling_unit: p ? p.p_handling : 15000,
       p_installation_unit: p ? p.p_installation : 0,
+      source_warehouse: itemWh,
+      moving_no: itemMv,
     });
 
-    const tkNo = (r['Mã Ticket dịch vụ\n (BM-02)'] || r['Mã Ticket dịch vụ (BM-02)'] || '').trim();
+    const tkNo = (r[37] || '').trim();
     if (tkNo) {
       og.tickets.push({
         ticket_no: tkNo,
         invoice_no: inv,
         customer_name: cust,
-        customer_phone: cleanPhone(r['SĐT KH']),
-        address: (r['Địa chỉ giao hàng'] || '').trim(),
+        customer_phone: cleanPhone(r[7]),
+        address: (r[8] || '').trim(),
         barcode: bc,
-        product_name: (r['Tên sản phẩm'] || '').trim(),
-        service_level: String(r['Phân cấp xử lý'] || '').includes('3') ? 'C3' : (String(r['Phân cấp xử lý'] || '').includes('2') ? 'C2' : 'C1'),
-        status: String(r['Trạng thái xử lý BH'] || '').toLowerCase().includes('hoàn tất') ? 'Closed' : 'In Progress',
+        product_name: (r[16] || '').trim(),
+        service_level: String(r[38] || '').includes('3') ? 'C3' : (String(r[38] || '').includes('2') ? 'C2' : 'C1'),
+        status: String(r[39] || '').toLowerCase().includes('hoàn tất') ? 'Closed' : 'In Progress',
       });
     }
   }
@@ -463,7 +470,7 @@ export async function runSeed(force = false, confirmCloudReset = false) {
     orderIdByInv.set(og.invoice_no, oid);
     orderCount++;
     for (const it of og.items) {
-      orderItemRows.push([oid, it.barcode, it.product_name, it.unit, it.qty, it.net_weight_g, it.warranty_months, it.warranty_policy, it.p_handling_unit, it.p_installation_unit]);
+      orderItemRows.push([oid, it.barcode, it.product_name, it.unit, it.qty, it.net_weight_g, it.warranty_months, it.warranty_policy, it.p_handling_unit, it.p_installation_unit, it.source_warehouse || '9005', it.moving_no || '']);
       itemCount++;
     }
     for (const tk of og.tickets) {
@@ -471,7 +478,7 @@ export async function runSeed(force = false, confirmCloudReset = false) {
     }
   }
   await batchInsert(
-    `INSERT INTO order_items (order_id, barcode, product_name, unit, qty, net_weight_g, warranty_months, warranty_policy, p_handling_unit, p_installation_unit) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    `INSERT INTO order_items (order_id, barcode, product_name, unit, qty, net_weight_g, warranty_months, warranty_policy, p_handling_unit, p_installation_unit, source_warehouse, moving_no) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
     orderItemRows
   );
   await batchInsert(
