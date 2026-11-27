@@ -3,6 +3,8 @@ import cors from 'cors';
 import multer from 'multer';
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
+import readline from 'node:readline';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import * as XLSX from 'xlsx';
@@ -75,7 +77,18 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+const UPLOAD_TMP_DIR = path.join(os.tmpdir(), 'benom-ops-uploads');
+fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+// Disk-backed upload for large ERP/POS CSV files (up to 150 MB) streamed line-by-line to stay safely under Render Free 512 MB RAM
+const uploadDisk = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => {
+      fs.mkdir(UPLOAD_TMP_DIR, { recursive: true }, err => cb(err, UPLOAD_TMP_DIR));
+    },
+  }),
+  limits: { fileSize: 150 * 1024 * 1024 },
+});
 
 // Async error wrapper
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -511,8 +524,15 @@ async function calcStore3001Inventory(includeItems = false, latestByStoreMap = n
 }
 
 // ─── 0. PUBLIC HEALTH & AUTH ROUTES ───────────────────────────
+// Zero-DB lightweight health probe for Render & free keep-alive pings (burns 0 Turso row reads!)
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, mode: isCloudDb() ? 'turso-cloud' : 'local-sqlite' });
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    mode: isCloudDb() ? 'turso-cloud' : 'local-sqlite',
+    vn_time: getVnDateTime(),
+    uptime_s: Math.round(process.uptime()),
+  });
 });
 
 app.post('/api/auth/login', wrap(async (req, res) => {
@@ -669,6 +689,7 @@ app.get('/api/dashboard', wrap(async (req, res) => {
              COALESCE(SUM(customer_paid_fee), 0) as total_cust_fee,
              COALESCE(SUM(CASE WHEN is_promo_free_ship = 1 THEN 1 ELSE 0 END), 0) as promo_free_orders
       FROM orders
+      WHERE status != 'Merged'
     `),
     dbGet(`
       SELECT COUNT(*) as total,
@@ -1343,13 +1364,15 @@ app.get('/api/orders', wrap(async (req, res) => {
 
   let where = ` WHERE 1=1`;
   const params = [];
-  if (q) {
-    where += ` AND (invoice_no LIKE ? OR customer_name LIKE ? OR customer_phone LIKE ? OR tracking_no LIKE ?)`;
-    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
-  }
   if (status) {
     where += ` AND status = ?`;
     params.push(status);
+  } else {
+    where += ` AND status != 'Merged' AND merged_into_order_id IS NULL`;
+  }
+  if (q) {
+    where += ` AND (invoice_no LIKE ? OR merged_invoices LIKE ? OR customer_name LIKE ? OR customer_phone LIKE ? OR tracking_no LIKE ?)`;
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
   }
   const [countRow, orders] = await Promise.all([
     dbGet(`SELECT COUNT(*) as c FROM orders${where}`, params),
@@ -1360,9 +1383,10 @@ app.get('/api/orders', wrap(async (req, res) => {
   const orderIds = orders.map(o => o.id);
   const invoiceNos = Array.from(new Set(orders.map(o => o.invoice_no).filter(Boolean)));
 
-  const [allItems, allHos] = await Promise.all([
-    batchQueryByIds(`SELECT id, order_id, barcode, product_name, unit, qty, net_weight_g, source_warehouse, moving_no FROM order_items WHERE order_id IN`, orderIds),
+  const [allItems, allHos, mergedChildren] = await Promise.all([
+    batchQueryByIds(`SELECT id, order_id, barcode, product_name, unit, qty, net_weight_g, source_warehouse, moving_no, orig_order_id, orig_invoice FROM order_items WHERE order_id IN`, orderIds),
     batchQueryByIds(`SELECT id, doc_no, doc_type, invoice_no, status, csat_rating FROM handovers WHERE invoice_no IN`, invoiceNos),
+    batchQueryByIds(`SELECT id, invoice_no, customer_name, customer_paid_fee, shipping_fee_3pl, merged_into_order_id FROM orders WHERE merged_into_order_id IN`, orderIds),
   ]);
 
   const itemMap = new Map();
@@ -1377,6 +1401,12 @@ app.get('/api/orders', wrap(async (req, res) => {
     arr.push(h);
     hoMap.set(h.invoice_no, arr);
   }
+  const mergedMap = new Map();
+  for (const mc of mergedChildren) {
+    const arr = mergedMap.get(mc.merged_into_order_id) || [];
+    arr.push(mc);
+    mergedMap.set(mc.merged_into_order_id, arr);
+  }
 
   const result = orders.map(o => {
     const items = itemMap.get(o.id) || [];
@@ -1386,6 +1416,7 @@ app.get('/api/orders', wrap(async (req, res) => {
       ktvs: parseKtvs(o),
       items,
       handovers: hoMap.get(o.invoice_no) || [],
+      merged_children: mergedMap.get(o.id) || [],
       requires_two_ktv: maxWeightG >= 25000,
     };
   });
@@ -1589,7 +1620,7 @@ app.put('/api/orders/:id', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res
       ...b.items.map(it => {
         const p = prodByBarcode.get(String(it.barcode || '').trim());
         return {
-          sql: `INSERT INTO order_items (order_id, barcode, product_name, unit, qty, net_weight_g, warranty_months, warranty_policy, p_handling_unit, p_installation_unit, source_warehouse, moving_no) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+          sql: `INSERT INTO order_items (order_id, barcode, product_name, unit, qty, net_weight_g, warranty_months, warranty_policy, p_handling_unit, p_installation_unit, source_warehouse, moving_no, orig_order_id, orig_invoice) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
           args: [
             id, it.barcode || '', it.product_name || p?.name_vn || '', it.unit || p?.unit || 'Cái',
             num(it.qty) || 1, p?.net_weight_g || num(it.net_weight_g),
@@ -1598,12 +1629,23 @@ app.put('/api/orders/:id', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res
             p ? p.p_installation : num(it.p_installation_unit) || 0,
             (it.source_warehouse || '9005').trim(),
             String(it.moving_no || '').trim(),
+            it.orig_order_id ?? null,
+            String(it.orig_invoice || '').trim(),
           ],
         };
       }),
     ];
     await dbBatch(itemStmts);
   }
+
+  // Sync edited customer info (name, phone, address, warehouse) to any linked handovers (BM-01 / BM-05)
+  const nextCustName = b.customer_name ?? existing.customer_name;
+  const nextCustPhone = b.customer_phone !== undefined ? String(b.customer_phone).trim() : existing.customer_phone;
+  const nextAddr = b.address ?? existing.address;
+  await dbRun(
+    `UPDATE handovers SET customer_name=?, customer_phone=?, address=?, warehouse_code=? WHERE order_id=? OR invoice_no=?`,
+    [nextCustName, nextCustPhone, nextAddr, nextSourceWh, id, existing.invoice_no]
+  );
 
   // 2-way sync carrier & 3PL fee to delivery_tracking if linked by invoice_no
   if (existing.invoice_no) {
@@ -1676,6 +1718,163 @@ app.post('/api/orders/:id/generate-xk', requireRoles('ADMIN', 'EDITOR'), wrap(as
   res.json({ id: sid, slip_no: slipNo, items_count: items9005.length, total_order_items: allItems.length, cutoff_warning: warning });
 }));
 
+function isNoKtvInstallMode(mode) {
+  const m = String(mode || '').trim();
+  return m === 'Khách hàng tự lắp đặt' || m === 'Sản phẩm không cần lắp đặt';
+}
+
+async function mergeOrdersInDb(req, masterOrderId, childOrderIds, sync3pl = true) {
+  const masterId = Number(masterOrderId);
+  const childIds = Array.from(new Set((childOrderIds || []).map(Number).filter(id => id && id !== masterId)));
+  if (!masterId || childIds.length === 0) {
+    throw Object.assign(new Error('Vui lòng chọn 1 đơn chính và ít nhất 1 đơn phụ cần gộp!'), { statusCode: 400 });
+  }
+  const master = await dbGet('SELECT * FROM orders WHERE id = ?', [masterId]);
+  if (!master) throw Object.assign(new Error('Không tìm thấy đơn hàng chính'), { statusCode: 404 });
+  if (master.status === 'Merged' || master.merged_into_order_id) {
+    throw Object.assign(new Error(`Đơn chính ${master.invoice_no} đã được gộp vào đơn khác — vui lòng chọn đơn gốc!`), { statusCode: 400 });
+  }
+
+  const children = await batchQueryByIds('SELECT * FROM orders WHERE id IN', childIds);
+  if (children.length === 0) throw Object.assign(new Error('Không tìm thấy đơn phụ cần gộp'), { statusCode: 404 });
+
+  // Locked allowance month check across master & all children
+  const allAffected = [master, ...children];
+  for (const o of allAffected) {
+    if (o.require_install) {
+      const locked = await getLockedAllowanceMonth(o.delivery_date || o.order_date);
+      if (locked) {
+        throw Object.assign(new Error(`Kỳ phụ cấp ${locked.month_ym} đã KHÓA — không thể gộp đơn ${o.invoice_no}.`), { statusCode: 423 });
+      }
+    }
+  }
+
+  const existingMerged = String(master.merged_invoices || '').split(',').map(s => s.trim()).filter(Boolean);
+  const mergedSet = new Set(existingMerged);
+  const movingSet = new Set(String(master.moving_no || '').split(',').map(s => s.trim()).filter(Boolean));
+
+  let addCustFee = 0;
+  let addFee3pl = 0;
+  let nextReqInstall = master.require_install ? 1 : 0;
+  const childNotes = [];
+
+  for (const ch of children) {
+    if (ch.status === 'Merged' || ch.merged_into_order_id) continue;
+    mergedSet.add(ch.invoice_no);
+    for (const mInv of String(ch.merged_invoices || '').split(',').map(s => s.trim()).filter(Boolean)) {
+      mergedSet.add(mInv);
+    }
+    for (const mv of String(ch.moving_no || '').split(',').map(s => s.trim()).filter(Boolean)) {
+      movingSet.add(mv);
+    }
+    addCustFee += num(ch.customer_paid_fee);
+    addFee3pl += num(ch.shipping_fee_3pl);
+    if (ch.require_install) nextReqInstall = 1;
+    if (ch.notes) childNotes.push(`${ch.invoice_no}: ${ch.notes}`);
+
+    // Move child order items into master order (preserving orig_order_id & orig_invoice for 100% lossless unmerge!)
+    await dbRun(
+      `UPDATE order_items SET order_id = ?, orig_order_id = COALESCE(orig_order_id, ?), orig_invoice = CASE WHEN orig_invoice = '' THEN ? ELSE orig_invoice END WHERE order_id = ?`,
+      [masterId, ch.id, ch.invoice_no, ch.id]
+    );
+    // Mark child order as Merged (hidden from active dispatch & allowance, fully reversible)
+    await dbRun(
+      `UPDATE orders SET merged_into_order_id = ?, status = 'Merged' WHERE id = ?`,
+      [masterId, ch.id]
+    );
+    // Sync 3PL delivery_tracking consolidation if requested
+    if (sync3pl && master.invoice_no && ch.invoice_no && master.invoice_no !== ch.invoice_no) {
+      await dbRun(
+        `UPDATE delivery_tracking SET merged_into = ?, updated_at = datetime('now', '+7 hours') WHERE slip_no = ?`,
+        [master.invoice_no, ch.invoice_no]
+      );
+    }
+  }
+
+  // Recompute master's combined source_warehouse from all its items
+  const allMasterItems = await dbAll('SELECT source_warehouse FROM order_items WHERE order_id = ?', [masterId]);
+  const whSet = new Set(allMasterItems.map(it => (it.source_warehouse || '').trim()).filter(Boolean));
+  const nextWh = whSet.size > 0 ? Array.from(whSet).join(' + ') : (master.source_warehouse || '9005');
+  const nextCustFee = num(master.customer_paid_fee) + addCustFee;
+  const nextFee3pl = num(master.shipping_fee_3pl) > 0 ? num(master.shipping_fee_3pl) : addFee3pl;
+  const mergedInvStr = Array.from(mergedSet).join(', ');
+  const movingStr = Array.from(movingSet).join(', ');
+  const mergeTag = `[Gộp từ: ${children.map(c => c.invoice_no).join(', ')}]`;
+  const nextNotes = [master.notes, !String(master.notes || '').includes(mergeTag) ? mergeTag : ''].filter(Boolean).join(' | ');
+
+  await dbRun(`
+    UPDATE orders SET
+      merged_invoices = ?,
+      source_warehouse = ?,
+      moving_no = ?,
+      customer_paid_fee = ?,
+      shipping_fee_3pl = ?,
+      require_install = ?,
+      notes = ?
+    WHERE id = ?
+  `, [mergedInvStr, nextWh, movingStr, nextCustFee, nextFee3pl, nextReqInstall, nextNotes, masterId]);
+
+  await logAudit(
+    req,
+    'MERGE_ORDERS',
+    'ORDER',
+    master.invoice_no,
+    `Gộp ${children.length} đơn (${children.map(c => c.invoice_no).join(', ')}) vào ĐH chính ${master.invoice_no} (${master.customer_name})`
+  );
+
+  return { ok: true, master_order_id: masterId, master_invoice_no: master.invoice_no, merged_invoices: mergedInvStr, merged_count: children.length };
+}
+
+app.post('/api/orders/merge', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const { master_order_id, child_order_ids, sync_3pl = true } = req.body || {};
+  try {
+    const out = await mergeOrdersInDb(req, master_order_id, child_order_ids, sync_3pl);
+    res.json(out);
+  } catch (err) {
+    res.status(err.statusCode || 400).json({ error: err.message });
+  }
+}));
+
+app.post('/api/orders/:id/unmerge', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const paramId = Number(req.params.id);
+  const target = await dbGet('SELECT * FROM orders WHERE id = ?', [paramId]);
+  if (!target) return res.status(404).json({ error: 'Không tìm thấy đơn hàng cần tách' });
+
+  // Support calling with either childOrderId OR masterOrderId (+ optional body.child_order_id)
+  const isChildCall = Boolean(target.merged_into_order_id);
+  const masterId = isChildCall ? Number(target.merged_into_order_id) : paramId;
+  const childIdFilter = isChildCall ? paramId : (req.body?.child_order_id ? Number(req.body.child_order_id) : null);
+  const master = isChildCall ? await dbGet('SELECT * FROM orders WHERE id = ?', [masterId]) : target;
+  if (!master) return res.status(404).json({ error: 'Không tìm thấy đơn hàng chính' });
+
+  const children = childIdFilter
+    ? await dbAll('SELECT * FROM orders WHERE id = ? AND merged_into_order_id = ?', [childIdFilter, masterId])
+    : await dbAll('SELECT * FROM orders WHERE merged_into_order_id = ?', [masterId]);
+  if (children.length === 0) return res.status(400).json({ error: 'Không có đơn phụ nào để tách!' });
+
+  let subCustFee = 0;
+  for (const ch of children) {
+    await dbRun('UPDATE order_items SET order_id = ? WHERE order_id = ? AND orig_order_id = ?', [ch.id, masterId, ch.id]);
+    await dbRun(`UPDATE orders SET merged_into_order_id = NULL, status = 'New' WHERE id = ?`, [ch.id]);
+    await dbRun(`UPDATE delivery_tracking SET merged_into = '', updated_at = datetime('now', '+7 hours') WHERE slip_no = ? AND merged_into = ?`, [ch.invoice_no, master.invoice_no]);
+    subCustFee += num(ch.customer_paid_fee);
+  }
+
+  const remainingChildren = await dbAll('SELECT invoice_no FROM orders WHERE merged_into_order_id = ?', [masterId]);
+  const remainingItems = await dbAll('SELECT source_warehouse FROM order_items WHERE order_id = ?', [masterId]);
+  const whSet = new Set(remainingItems.map(it => (it.source_warehouse || '').trim()).filter(Boolean));
+  const nextWh = whSet.size > 0 ? Array.from(whSet).join(' + ') : (master.source_warehouse || '9005');
+  const nextCustFee = Math.max(0, num(master.customer_paid_fee) - subCustFee);
+
+  await dbRun(
+    `UPDATE orders SET merged_invoices = ?, source_warehouse = ?, customer_paid_fee = ? WHERE id = ?`,
+    [remainingChildren.map(c => c.invoice_no).join(', '), nextWh, nextCustFee, masterId]
+  );
+
+  await logAudit(req, 'UNMERGE_ORDERS', 'ORDER', master.invoice_no, `Tách ${children.map(c => c.invoice_no).join(', ')} khỏi ĐH chính ${master.invoice_no}`);
+  res.json({ ok: true, unmerged: children.map(c => c.invoice_no) });
+}));
+
 app.post('/api/orders/:id/generate-handover', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
   const o = await dbGet('SELECT * FROM orders WHERE id = ?', [req.params.id]);
   if (!o) return res.status(404).json({ error: 'Không tìm thấy đơn hàng' });
@@ -1685,9 +1884,9 @@ app.post('/api/orders/:id/generate-handover', requireRoles('ADMIN', 'EDITOR', 'K
     return res.status(409).json({ error: `Đơn ${o.invoice_no} đã có phiếu ${existing.doc_no}!` });
   }
   const docNo = await nextHandoverNo(docType);
-  const installMode = req.body.install_mode || (docType === 'BM-01' ? 'Kỹ thuật Benom lắp đặt' : 'Khách hàng tự lắp đặt');
-  const isSelfInstall = installMode === 'Khách hàng tự lắp đặt';
-  const ktvsJson = isSelfInstall ? '[]' : JSON.stringify(parseKtvs(o));
+  const installMode = req.body.install_mode || (docType === 'BM-01' ? 'Kỹ thuật Benom lắp đặt' : 'Sản phẩm không cần lắp đặt');
+  const noKtv = isNoKtvInstallMode(installMode);
+  const ktvsJson = noKtv ? '[]' : JSON.stringify(parseKtvs(o));
   const r = await dbRun(`
     INSERT INTO handovers (doc_no, doc_type, order_id, invoice_no, handover_date, warehouse_code, customer_name, customer_phone, address, carrier, install_mode, ktv1_name, ktv1_code, ktv2_name, ktv2_code, ktvs_json, status)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -1695,10 +1894,10 @@ app.post('/api/orders/:id/generate-handover', requireRoles('ADMIN', 'EDITOR', 'K
     docNo, docType, o.id, o.invoice_no, o.delivery_date || getVnIsoDate(),
     o.source_warehouse || '9005', o.customer_name, o.customer_phone, o.address, o.carrier,
     installMode,
-    isSelfInstall ? '' : o.ktv1_name,
-    isSelfInstall ? '' : o.ktv1_code,
-    isSelfInstall ? '' : o.ktv2_name,
-    isSelfInstall ? '' : o.ktv2_code,
+    noKtv ? '' : o.ktv1_name,
+    noKtv ? '' : o.ktv1_code,
+    noKtv ? '' : o.ktv2_name,
+    noKtv ? '' : o.ktv2_code,
     ktvsJson, 'Pending'
   ]);
   res.json({ id: r.lastInsertRowid, doc_no: docNo, doc_type: docType });
@@ -1719,21 +1918,35 @@ app.get('/api/handovers', wrap(async (req, res) => {
     ORDER BY id DESC LIMIT 100
   `);
   const orderIds = Array.from(new Set(list.map(h => h.order_id).filter(Boolean)));
-  const allItems = await batchQueryByIds(`SELECT * FROM order_items WHERE order_id IN`, orderIds);
+  const [allItems, linkedOrders] = await Promise.all([
+    batchQueryByIds(`SELECT * FROM order_items WHERE order_id IN`, orderIds),
+    batchQueryByIds(`SELECT id, merged_invoices FROM orders WHERE id IN`, orderIds),
+  ]);
   const itemMap = new Map();
   for (const it of allItems) {
     const arr = itemMap.get(it.order_id) || [];
     arr.push(it);
     itemMap.set(it.order_id, arr);
   }
-  res.json(list.map(h => ({ ...h, ktvs: parseKtvs(h), items: h.order_id ? (itemMap.get(h.order_id) || []) : [] })));
+  const mergedMap = new Map(linkedOrders.map(o => [o.id, o.merged_invoices || '']));
+  res.json(list.map(h => ({
+    ...h,
+    ktvs: parseKtvs(h),
+    merged_invoices: h.order_id ? (mergedMap.get(h.order_id) || '') : '',
+    items: h.order_id ? (itemMap.get(h.order_id) || []) : [],
+  })));
 }));
 
 app.get('/api/handovers/:id', wrap(async (req, res) => {
   const h = await dbGet('SELECT * FROM handovers WHERE id = ?', [req.params.id]);
   if (!h) return res.status(404).json({ error: 'Không tìm thấy biên bản' });
-  const items = h.order_id ? await dbAll('SELECT * FROM order_items WHERE order_id = ? ORDER BY id ASC', [h.order_id]) : [];
-  res.json({ ...h, ktvs: parseKtvs(h), items });
+  const [items, linkedOrder] = h.order_id
+    ? await Promise.all([
+        dbAll('SELECT * FROM order_items WHERE order_id = ? ORDER BY id ASC', [h.order_id]),
+        dbGet('SELECT merged_invoices FROM orders WHERE id = ?', [h.order_id]),
+      ])
+    : [[], null];
+  res.json({ ...h, ktvs: parseKtvs(h), merged_invoices: linkedOrder?.merged_invoices || '', items });
 }));
 
 app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
@@ -1744,21 +1957,26 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
 
   const newDate = b.handover_date || h.handover_date || '';
   const newInstallMode = b.install_mode ?? h.install_mode ?? '';
-  const isSelfInstall = newInstallMode === 'Khách hàng tự lắp đặt';
+  const isSelfInstall = isNoKtvInstallMode(newInstallMode);
   const ktvNorm = isSelfInstall
     ? { ktv1_name: '', ktv1_code: '', ktv2_name: '', ktv2_code: '', json: '[]' }
     : normalizeKtvInput(b, h);
   const newStatus = b.status || h.status;
+  const nextCustName = b.customer_name !== undefined ? String(b.customer_name).trim() : h.customer_name;
+  const nextCustPhone = b.customer_phone !== undefined ? String(b.customer_phone).trim() : h.customer_phone;
+  const nextAddress = b.address !== undefined ? String(b.address).trim() : h.address;
 
   await dbRun(`
     UPDATE handovers SET
-      handover_date=?, ktv1_name=?, ktv1_code=?, ktv2_name=?, ktv2_code=?, ktvs_json=?,
+      handover_date=?, customer_name=?, customer_phone=?, address=?,
+      ktv1_name=?, ktv1_code=?, ktv2_name=?, ktv2_code=?, ktvs_json=?,
       driver_name=?, driver_phone=?, vehicle_plate=?,
       install_mode=?, check_1=?, check_2=?, check_3=?, check_4=?, issue_note=?, due_date=?,
       signature_data=?, photos_json=?, csat_rating=?, csat_comment=?, status=?
     WHERE id=?
   `, [
-    newDate, ktvNorm.ktv1_name, ktvNorm.ktv1_code, ktvNorm.ktv2_name, ktvNorm.ktv2_code, ktvNorm.json,
+    newDate, nextCustName, nextCustPhone, nextAddress,
+    ktvNorm.ktv1_name, ktvNorm.ktv1_code, ktvNorm.ktv2_name, ktvNorm.ktv2_code, ktvNorm.json,
     b.driver_name ?? h.driver_name, b.driver_phone ?? h.driver_phone, b.vehicle_plate ?? h.vehicle_plate,
     newInstallMode,
     b.check_1 ? 1 : 0, b.check_2 ? 1 : 0, b.check_3 ? 1 : 0, b.check_4 ? 1 : 0,
@@ -1777,11 +1995,14 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
     }
   }
 
-  // Always sync ALL KTVs (1..N), delivery_date & require_install back to the linked Order!
+  // Always sync customer info, ALL KTVs (1..N), delivery_date & require_install back to the linked Order!
   if (targetOrderId) {
     const isBenomInstall = !isSelfInstall && (h.doc_type === 'BM-01' || /benom lắp/i.test(newInstallMode));
     await dbRun(`
       UPDATE orders SET
+        customer_name = CASE WHEN ? != '' THEN ? ELSE customer_name END,
+        customer_phone = CASE WHEN ? != '' THEN ? ELSE customer_phone END,
+        address = CASE WHEN ? != '' THEN ? ELSE address END,
         ktv1_name = ?,
         ktv1_code = ?,
         ktv2_name = ?,
@@ -1792,6 +2013,7 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
         install_status = CASE WHEN ? = 1 THEN 'Không yêu cầu' ELSE install_status END
       WHERE id = ?
     `, [
+      nextCustName, nextCustName, nextCustPhone, nextCustPhone, nextAddress, nextAddress,
       ktvNorm.ktv1_name, ktvNorm.ktv1_code, ktvNorm.ktv2_name, ktvNorm.ktv2_code, ktvNorm.json,
       newDate, newDate, isSelfInstall ? 1 : 0, isBenomInstall ? 1 : 0, isSelfInstall ? 1 : 0, targetOrderId
     ]);
@@ -1810,7 +2032,7 @@ app.put('/api/handovers/:id', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async
             await dbRun(`
               INSERT INTO handovers (doc_no, doc_type, order_id, invoice_no, handover_date, warehouse_code, customer_name, customer_phone, address, carrier, install_mode, status)
               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            `, [bm01No, 'BM-01', targetOrderId, h.invoice_no, '', h.warehouse_code, h.customer_name, h.customer_phone, h.address, h.carrier, 'Kỹ thuật Benom lắp đặt (tách từ BM-05)', 'Pending']);
+            `, [bm01No, 'BM-01', targetOrderId, h.invoice_no, '', h.warehouse_code, nextCustName, nextCustPhone, nextAddress, h.carrier, 'Kỹ thuật Benom lắp đặt (tách từ BM-05)', 'Pending']);
           }
         } else {
           await dbRun(
@@ -1833,6 +2055,7 @@ async function computeAllowance(monthInput, scopeInput = 'completed') {
       SELECT DISTINCT substr(COALESCE(NULLIF(delivery_date,''), order_date), 1, 7) as ym
       FROM orders
       WHERE require_install = 1
+        AND status NOT IN ('Cancelled', 'Merged')
         AND (ktv1_name != '' OR ktv2_name != '' OR (ktvs_json IS NOT NULL AND ktvs_json != '' AND ktvs_json != '[]'))
         AND length(COALESCE(NULLIF(delivery_date,''), order_date)) >= 7
       ORDER BY ym DESC
@@ -1856,6 +2079,7 @@ async function computeAllowance(monthInput, scopeInput = 'completed') {
   const orders = await dbAll(`
     SELECT * FROM orders
     WHERE require_install = 1
+      AND status NOT IN ('Cancelled', 'Merged')
       AND (ktv1_name != '' OR ktv2_name != '' OR (ktvs_json IS NOT NULL AND ktvs_json != '' AND ktvs_json != '[]'))
       AND (? = '' OR COALESCE(NULLIF(delivery_date,''), order_date) LIKE ?)
     ORDER BY COALESCE(NULLIF(delivery_date,''), order_date) ASC, id ASC
@@ -2144,53 +2368,91 @@ app.put('/api/slips/:id/status', requireRoles('ADMIN', 'EDITOR'), wrap(async (re
   res.json({ ok: true, cutoff_warning: warning });
 }));
 
-// ─── 7. ERP CSV UPLOAD & TOÀN NHẤT 3-WAY RECONCILIATION ───────
-app.post('/api/erp/upload', requireRoles('ADMIN'), upload.single('file'), wrap(async (req, res) => {
+// ─── 7. ERP CSV UPLOAD (STREAMING, LOW-RAM) & TOÀN NHẤT 3-WAY RECONCILIATION ───
+app.post('/api/erp/upload', requireRoles('ADMIN'), uploadDisk.single('file'), wrap(async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Chưa chọn file CSV' });
-  const raw = req.file.buffer.toString('utf8').replace(/^\uFEFF/, '');
-  const lines = raw.split(/\r?\n/);
-  if (lines.length < 2) return res.status(400).json({ error: 'File CSV trống' });
-  const headers = fastCsvLine(lines[0]);
-  const idx = {};
-  headers.forEach((h, i) => { idx[h.trim()] = i; });
-  if (idx['Barcode'] === undefined || idx['Close Qty'] === undefined) {
-    return res.status(400).json({ error: 'File không đúng chuẩn 69 cột ERP Kohnan (thiếu Barcode / Close Qty)' });
-  }
+  const filePath = req.file.path;
+  const insertSql = `INSERT INTO erp_snapshots (target_month,store_code,barcode,product_name,supplier_code,open_qty,income_qty,sales_qty,sales_amt,cogs,movement_qty,return_qty,adj_qty,close_qty,close_cst,loss_qty) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`;
 
-  let detectedMonth = '';
-  let detectedStore = '';
-  const rowsToInsert = [];
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line) continue;
-    const r = fastCsvLine(line);
-    if (r.length < 25) continue;
-    const oq = num(r[idx['Open Qty']]), iq = num(r[idx['Income Qty']]), sq = num(r[idx['Sales Qty']]),
-          sa = num(r[idx['Sales Amt']]), cq = num(r[idx['Close Qty']]), mq = num(r[idx['Movement Qty']]);
-    if (oq === 0 && iq === 0 && sq === 0 && sa === 0 && cq === 0 && mq === 0) continue;
-    detectedMonth = detectedMonth || (r[idx['Target Month']] || '').trim();
-    detectedStore = detectedStore || (r[idx['Store Code']] || '').trim();
-    rowsToInsert.push([
-      (r[idx['Target Month']] || detectedMonth).trim(),
-      (r[idx['Store Code']] || detectedStore).trim(),
-      (r[idx['Barcode']] || '').trim(),
-      (r[idx['Product Name']] || '').trim(),
-      (r[idx['Supplier Code']] || '').trim(),
-      oq, iq, sq, sa, num(r[idx['COGS']]), mq, num(r[idx['Return Qty']]),
-      num(r[idx['Adj Qty']]), cq, num(r[idx['Close Cst']]), num(r[idx['Loss Qty']]),
-    ]);
-  }
+  try {
+    const rl = readline.createInterface({
+      input: fs.createReadStream(filePath, { encoding: 'utf8', highWaterMark: 64 * 1024 }),
+      crlfDelay: Infinity,
+    });
 
-  if (detectedMonth && detectedStore) {
-    await dbRun(`DELETE FROM erp_snapshots WHERE target_month = ? AND store_code = ?`, [detectedMonth, detectedStore]);
-    const insertSql = `INSERT INTO erp_snapshots (target_month,store_code,barcode,product_name,supplier_code,open_qty,income_qty,sales_qty,sales_amt,cogs,movement_qty,return_qty,adj_qty,close_qty,close_cst,loss_qty) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`;
-    // Batch in chunks of 100 for fast Turso cloud writes
-    for (let i = 0; i < rowsToInsert.length; i += 100) {
-      const chunk = rowsToInsert.slice(i, i + 100).map(args => ({ sql: insertSql, args }));
-      await dbBatch(chunk);
+    let lineNo = 0;
+    let idx = null;
+    let detectedMonth = '';
+    let detectedStore = '';
+    let deletedOld = false;
+    let importedCount = 0;
+    let totalRawLines = 0;
+    let batch = [];
+
+    const flushBatch = async () => {
+      if (batch.length === 0) return;
+      if (!deletedOld && detectedMonth && detectedStore) {
+        await dbRun(`DELETE FROM erp_snapshots WHERE target_month = ? AND store_code = ?`, [detectedMonth, detectedStore]);
+        deletedOld = true;
+      }
+      await dbBatch(batch.map(args => ({ sql: insertSql, args })));
+      importedCount += batch.length;
+      batch = [];
+    };
+
+    for await (const rawLine of rl) {
+      lineNo++;
+      if (lineNo === 1) {
+        const cleanHeader = rawLine.replace(/^\uFEFF/, '');
+        const headers = fastCsvLine(cleanHeader);
+        idx = {};
+        headers.forEach((h, i) => { idx[h.trim()] = i; });
+        if (idx['Barcode'] === undefined || idx['Close Qty'] === undefined) {
+          rl.close();
+          return res.status(400).json({ error: 'File không đúng chuẩn 69 cột ERP Kohnan (thiếu Barcode / Close Qty)' });
+        }
+        continue;
+      }
+      if (!rawLine) continue;
+      totalRawLines++;
+      const r = fastCsvLine(rawLine);
+      if (r.length < 25) continue;
+      const oq = num(r[idx['Open Qty']]), iq = num(r[idx['Income Qty']]), sq = num(r[idx['Sales Qty']]),
+            sa = num(r[idx['Sales Amt']]), cq = num(r[idx['Close Qty']]), mq = num(r[idx['Movement Qty']]);
+      if (oq === 0 && iq === 0 && sq === 0 && sa === 0 && cq === 0 && mq === 0) continue;
+
+      const rowMonth = (r[idx['Target Month']] || detectedMonth).trim();
+      const rowStore = (r[idx['Store Code']] || detectedStore).trim();
+      if (!detectedMonth && rowMonth) detectedMonth = rowMonth;
+      if (!detectedStore && rowStore) detectedStore = rowStore;
+
+      batch.push([
+        rowMonth,
+        rowStore,
+        (r[idx['Barcode']] || '').trim(),
+        (r[idx['Product Name']] || '').trim(),
+        (r[idx['Supplier Code']] || '').trim(),
+        oq, iq, sq, sa, num(r[idx['COGS']]), mq, num(r[idx['Return Qty']]),
+        num(r[idx['Adj Qty']]), cq, num(r[idx['Close Cst']]), num(r[idx['Loss Qty']]),
+      ]);
+
+      if (batch.length >= 100) {
+        await flushBatch();
+      }
     }
+
+    if (lineNo < 2) {
+      return res.status(400).json({ error: 'File CSV trống' });
+    }
+    await flushBatch();
+
+    if (detectedMonth && detectedStore) {
+      await logAudit(req, 'UPLOAD_ERP_CSV', 'ERP', `${detectedStore}-${detectedMonth}`, `Nạp ERP CSV Store ${detectedStore} (${detectedMonth}): ${importedCount} SKU hoạt động / ${totalRawLines} dòng gốc`);
+    }
+    res.json({ ok: true, target_month: detectedMonth, store_code: detectedStore, imported_skus: importedCount, total_raw_lines: totalRawLines });
+  } finally {
+    fs.promises.unlink(filePath).catch(() => {});
   }
-  res.json({ ok: true, target_month: detectedMonth, store_code: detectedStore, imported_skus: rowsToInsert.length, total_raw_lines: lines.length - 1 });
 }));
 
 app.post('/api/toannhat/reconcile', requireRoles('ADMIN', 'EDITOR'), upload.single('file'), wrap(async (req, res) => {
@@ -2666,79 +2928,6 @@ function parseSalesDayToIso(rawDay) {
   return '';
 }
 
-function parseTransactionDetailCsv(rawText) {
-  const lines = rawText.replace(/^\uFEFF/, '').split(/\r?\n/);
-  if (lines.length < 2) throw new Error('File transaction_detail CSV trống');
-  const headers = fastCsvLine(lines[0]).map(h => h.trim());
-  const iSlip = headers.indexOf('Slip No.');
-  const iDay = headers.indexOf('Sales Day');
-  const iStore = headers.indexOf('Store');
-  const iDiv = headers.indexOf('Slip Div');
-  const iL1 = headers.indexOf('Layer1');
-  const iName = headers.indexOf('Item Name');
-  const iQty = headers.indexOf('QTY');
-  const iExcl = headers.indexOf('Amount(Tax excl.)');
-  const iIncl = headers.indexOf('Amount(Tax incl.)');
-  if (iSlip < 0 || iExcl < 0 || iIncl < 0) {
-    throw new Error('File không đúng chuẩn transaction_detail ERP Kohnan (thiếu Slip No. / Amount)');
-  }
-
-  const slipMap = new Map();
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line || !line.trim()) continue;
-    const cols = fastCsvLine(line);
-    const slipNo = (cols[iSlip] || '').trim();
-    const div = (cols[iDiv] || '').trim();
-    if (!slipNo || div === 'Delete') continue;
-
-    const isoDay = parseSalesDayToIso(cols[iDay]);
-    const month = isoDay ? isoDay.slice(0, 7) : '';
-    const store = (cols[iStore] || '3001').trim();
-    const l1 = (cols[iL1] || '').trim();
-    const name = (cols[iName] || '').trim();
-    const qty = num(cols[iQty]);
-    const amtExcl = num(cols[iExcl]);
-    const amtIncl = num(cols[iIncl]);
-
-    let cur = slipMap.get(slipNo);
-    if (!cur) {
-      cur = {
-        slip_no: slipNo,
-        sales_month: month,
-        sales_day: isoDay,
-        store_code: store,
-        delivery_cust_pay: 0,
-        install_cust_pay: 0,
-        net_sales_excl_tax: 0,
-        gross_sales_incl_tax: 0,
-        has_furniture: 0,
-        items: [],
-      };
-      slipMap.set(slipNo, cur);
-    }
-
-    cur.net_sales_excl_tax += amtExcl;
-    cur.gross_sales_incl_tax += amtIncl;
-    if (l1 === 'FURNITURE/STORAGE') cur.has_furniture = 1;
-
-    if (l1 === 'SERVICES') {
-      if (/phí vận chuyển|vận chuyển|giao hàng/i.test(name)) {
-        cur.delivery_cust_pay += amtIncl;
-      } else if (/phí lắp đặt|lắp đặt/i.test(name)) {
-        cur.install_cust_pay += amtIncl;
-      }
-    } else if (name && qty !== 0) {
-      cur.items.push(`${name} (x${qty})`);
-    }
-  }
-
-  return Array.from(slipMap.values()).map(s => ({
-    ...s,
-    items_summary: s.items.slice(0, 4).join(', ') + (s.items.length > 4 ? ` (+${s.items.length - 4})` : ''),
-  }));
-}
-
 async function buildDeliveryReport(monthFilter) {
   const monthsRows = await dbAll(`SELECT DISTINCT sales_month FROM delivery_tracking WHERE sales_month != '' ORDER BY sales_month DESC`);
   const available_months = monthsRows.map(r => r.sales_month);
@@ -2748,17 +2937,71 @@ async function buildDeliveryReport(monthFilter) {
       ? (available_months[0] || getVnYearMonth())
       : monthFilter;
 
-  let rows;
+  let rawRows;
   if (effectiveMonth && effectiveMonth !== 'ALL') {
-    rows = await dbAll(`SELECT * FROM delivery_tracking WHERE sales_month = ? ORDER BY sales_day DESC, slip_no DESC`, [effectiveMonth]);
+    rawRows = await dbAll(`SELECT * FROM delivery_tracking WHERE sales_month = ? ORDER BY sales_day DESC, slip_no DESC`, [effectiveMonth]);
   } else {
-    rows = await dbAll(`SELECT * FROM delivery_tracking ORDER BY sales_month DESC, sales_day DESC, slip_no DESC`);
+    rawRows = await dbAll(`SELECT * FROM delivery_tracking ORDER BY sales_month DESC, sales_day DESC, slip_no DESC`);
+  }
+
+  // Also pull any cross-month child slips merged into a master slip in this view
+  const rawSlipSet = new Set(rawRows.map(r => r.slip_no));
+  const masterCandidates = rawRows.filter(r => !r.merged_into).map(r => r.slip_no);
+  const crossChildren = masterCandidates.length
+    ? await batchQueryByIds(`SELECT * FROM delivery_tracking WHERE merged_into IN`, masterCandidates)
+    : [];
+
+  // Group child slips by their master slip_no
+  const childrenByMaster = new Map();
+  const seenChild = new Set();
+  for (const r of [...rawRows, ...crossChildren]) {
+    const m = String(r.merged_into || '').trim();
+    if (!m || seenChild.has(r.slip_no)) continue;
+    seenChild.add(r.slip_no);
+    const arr = childrenByMaster.get(m) || [];
+    arr.push(r);
+    childrenByMaster.set(m, arr);
+  }
+
+  // Build consolidated rows: hide child rows whose master is present (or exists in DB), roll up their amounts into Master!
+  const consolidatedRows = [];
+  for (const r of rawRows) {
+    const m = String(r.merged_into || '').trim();
+    if (m && (rawSlipSet.has(m) || effectiveMonth === 'ALL')) continue;
+    const kids = childrenByMaster.get(r.slip_no) || [];
+    const sumDel = num(r.delivery_cust_pay) + kids.reduce((a, k) => a + num(k.delivery_cust_pay), 0);
+    const sumInst = num(r.install_cust_pay) + kids.reduce((a, k) => a + num(k.install_cust_pay), 0);
+    const sumFee = num(r.fee_3pl) + kids.reduce((a, k) => a + num(k.fee_3pl), 0);
+    const sumSales = num(r.net_sales_excl_tax) + kids.reduce((a, k) => a + num(k.net_sales_excl_tax), 0);
+    const combinedItems = [r.items_summary, ...kids.map(k => k.items_summary)].filter(Boolean).join(' + ');
+    consolidatedRows.push({
+      ...r,
+      own_fee_3pl: num(r.fee_3pl),
+      own_delivery_cust_pay: num(r.delivery_cust_pay),
+      own_install_cust_pay: num(r.install_cust_pay),
+      own_net_sales_excl_tax: num(r.net_sales_excl_tax),
+      delivery_cust_pay: sumDel,
+      install_cust_pay: sumInst,
+      fee_3pl: sumFee,
+      net_sales_excl_tax: sumSales,
+      items_summary: combinedItems,
+      merged_slips: kids.map(k => ({
+        slip_no: k.slip_no,
+        sales_day: k.sales_day,
+        delivery_cust_pay: num(k.delivery_cust_pay),
+        install_cust_pay: num(k.install_cust_pay),
+        fee_3pl: num(k.fee_3pl),
+        net_sales_excl_tax: num(k.net_sales_excl_tax),
+        items_summary: k.items_summary || '',
+        note: k.note || '',
+      })),
+    });
   }
 
   const pivotMap = new Map();
   let gCount = 0, gFee = 0, gDel = 0, gInst = 0, gSales = 0;
 
-  for (const r of rows) {
+  for (const r of consolidatedRows) {
     const key = (r.carrier_3pl || '').trim() || 'Chưa phân bổ 3PL';
     const p = pivotMap.get(key) || {
       carrier_3pl: key,
@@ -2800,24 +3043,77 @@ async function buildDeliveryReport(monthFilter) {
     net_ship_gap: gDel - gFee,
   };
 
-  // Annotate linked dispatch orders (TASK-08 2-way integration)
-  const slipNos = rows.map(r => r.slip_no).filter(Boolean);
-  const linkedOrders = await batchQueryByIds(`SELECT id, invoice_no, status, require_install FROM orders WHERE invoice_no IN`, slipNos);
+  // Annotate linked dispatch orders (TASK-08 2-way integration + customer name & tracking_no)
+  const slipNos = consolidatedRows.map(r => r.slip_no).filter(Boolean);
+  const linkedOrders = await batchQueryByIds(
+    `SELECT id, invoice_no, customer_name, customer_phone, tracking_no, status, require_install, merged_invoices FROM orders WHERE invoice_no IN`,
+    slipNos
+  );
   const orderBySlip = new Map();
   for (const lo of linkedOrders) {
-    orderBySlip.set(lo.invoice_no, lo);
+    if (!orderBySlip.has(lo.invoice_no) || lo.status !== 'Cancelled') orderBySlip.set(lo.invoice_no, lo);
   }
-  const enrichedRows = rows.map(r => {
+  const enrichedRows = consolidatedRows.map(r => {
     const lo = orderBySlip.get(r.slip_no);
     return {
       ...r,
       linked_order_id: lo?.id || null,
       linked_order_status: lo?.status || '',
       linked_require_install: lo?.require_install || 0,
+      linked_customer_name: lo?.customer_name || '',
+      linked_tracking_no: lo?.tracking_no || '',
     };
   });
 
-  return { month: effectiveMonth, available_months, pivot, grand_total, rows: enrichedRows };
+  // Auto-detect merge suggestions (e.g., fee-only slip referencing another slip in Note, or same tracking_no & customer!)
+  const visibleMap = new Map(enrichedRows.map(r => [r.slip_no, r]));
+  const merge_suggestions = [];
+  const suggestedPairs = new Set();
+
+  for (const r of enrichedRows) {
+    const mRef = String(r.note || '').match(/(3001\d{9})/);
+    if (mRef && mRef[1] !== r.slip_no && visibleMap.has(mRef[1])) {
+      const target = visibleMap.get(mRef[1]);
+      const pairKey = `${target.slip_no}<-${r.slip_no}`;
+      if (!suggestedPairs.has(pairKey)) {
+        suggestedPairs.add(pairKey);
+        merge_suggestions.push({
+          master_slip_no: target.slip_no,
+          child_slip_no: r.slip_no,
+          reason: `Ghi chú bill ${r.slip_no} ghi nhận thu phí cho ĐH ${target.slip_no}${target.linked_customer_name ? ` (${target.linked_customer_name})` : ''}`,
+        });
+      }
+    }
+  }
+
+  const byTracking = new Map();
+  for (const r of enrichedRows) {
+    const trk = String(r.linked_tracking_no || '').trim();
+    if (!trk || trk.length < 5) continue;
+    const arr = byTracking.get(trk) || [];
+    arr.push(r);
+    byTracking.set(trk, arr);
+  }
+  for (const [trk, arr] of byTracking) {
+    if (arr.length < 2) continue;
+    // Sort: slip with fee_3pl > 0 first as Master
+    const sorted = [...arr].sort((a, b) => num(b.fee_3pl) - num(a.fee_3pl) || num(b.net_sales_excl_tax) - num(a.net_sales_excl_tax));
+    const master = sorted[0];
+    for (let i = 1; i < sorted.length; i++) {
+      const ch = sorted[i];
+      const pairKey = `${master.slip_no}<-${ch.slip_no}`;
+      if (!suggestedPairs.has(pairKey)) {
+        suggestedPairs.add(pairKey);
+        merge_suggestions.push({
+          master_slip_no: master.slip_no,
+          child_slip_no: ch.slip_no,
+          reason: `Chung mã vận đơn ${trk}${master.linked_customer_name ? ` — ${master.linked_customer_name}` : ''}`,
+        });
+      }
+    }
+  }
+
+  return { month: effectiveMonth, available_months, pivot, grand_total, rows: enrichedRows, merge_suggestions };
 }
 
 app.get('/api/delivery-tracking', wrap(async (req, res) => {
@@ -2835,17 +3131,103 @@ app.get('/api/delivery-tracking/lookup-pos', wrap(async (req, res) => {
   res.json(rows);
 }));
 
+app.post('/api/delivery-tracking/merge', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const masterSlip = String(req.body?.master_slip_no || '').trim();
+  const childSlips = Array.from(new Set((req.body?.child_slip_nos || []).map(s => String(s || '').trim()).filter(s => s && s !== masterSlip)));
+  const alsoMergeOrders = req.body?.also_merge_orders !== false;
+  if (!masterSlip || childSlips.length === 0) {
+    return res.status(400).json({ error: 'Vui lòng chọn 1 No Slip. chính và ít nhất 1 No Slip. phụ cần gộp!' });
+  }
+  const masterDt = await dbGet('SELECT * FROM delivery_tracking WHERE slip_no = ?', [masterSlip]);
+  if (!masterDt) return res.status(404).json({ error: `Không tìm thấy hóa đơn ${masterSlip} trong Báo cáo 3PL` });
+  if (masterDt.merged_into) {
+    return res.status(400).json({ error: `Hóa đơn ${masterSlip} đang được gộp vào ${masterDt.merged_into} — vui lòng chọn đơn gốc!` });
+  }
+
+  for (const cs of childSlips) {
+    // Re-parent any grandchildren if cs was previously a master
+    await dbRun(`UPDATE delivery_tracking SET merged_into = ?, updated_at = datetime('now', '+7 hours') WHERE merged_into = ?`, [masterSlip, cs]);
+    await dbRun(`UPDATE delivery_tracking SET merged_into = ?, updated_at = datetime('now', '+7 hours') WHERE slip_no = ?`, [masterSlip, cs]);
+  }
+
+  // Optionally consolidate matching dispatch orders as well
+  let ordersMerged = 0;
+  if (alsoMergeOrders) {
+    const masterOrd = await dbGet(`SELECT id FROM orders WHERE invoice_no = ? AND status NOT IN ('Cancelled','Merged') ORDER BY id DESC LIMIT 1`, [masterSlip]);
+    if (masterOrd) {
+      const childOrds = await batchQueryByIds(`SELECT id, invoice_no FROM orders WHERE status NOT IN ('Cancelled','Merged') AND invoice_no IN`, childSlips);
+      const validChildIds = childOrds.map(o => o.id).filter(id => id !== masterOrd.id);
+      if (validChildIds.length > 0) {
+        try {
+          await mergeOrdersInDb(req, masterOrd.id, validChildIds, false);
+          ordersMerged = validChildIds.length;
+        } catch (err) {
+          console.warn('[Merge 3PL -> Orders sync warning]:', err.message);
+        }
+      } else {
+        // Even if child slip was fee-only (no order row in orders), add its customer_paid_fee into master order & annotate merged_invoices!
+        const childDtRows = await batchQueryByIds(`SELECT slip_no, delivery_cust_pay, install_cust_pay FROM delivery_tracking WHERE slip_no IN`, childSlips);
+        const extraCustFee = childDtRows.reduce((a, r) => a + num(r.delivery_cust_pay) + num(r.install_cust_pay), 0);
+        const curMasterOrd = await dbGet('SELECT customer_paid_fee, merged_invoices FROM orders WHERE id = ?', [masterOrd.id]);
+        const invSet = new Set([...String(curMasterOrd?.merged_invoices || '').split(',').map(s => s.trim()).filter(Boolean), ...childSlips]);
+        await dbRun(
+          `UPDATE orders SET merged_invoices = ?, customer_paid_fee = ? WHERE id = ?`,
+          [Array.from(invSet).join(', '), num(curMasterOrd?.customer_paid_fee) + extraCustFee, masterOrd.id]
+        );
+      }
+    }
+  }
+
+  await logAudit(req, 'MERGE_3PL_SLIPS', '3PL', masterSlip, `Gộp ${childSlips.length} bill (${childSlips.join(', ')}) vào No Slip. chính ${masterSlip}`);
+  res.json({ ok: true, master_slip_no: masterSlip, merged_count: childSlips.length, orders_merged: ordersMerged });
+}));
+
+app.post('/api/delivery-tracking/unmerge', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const childSlip = String(req.body?.child_slip_no || '').trim();
+  const masterSlip = String(req.body?.master_slip_no || '').trim();
+  if (!childSlip && !masterSlip) return res.status(400).json({ error: 'Thiếu mã hóa đơn cần tách!' });
+
+  let unmergedSlips = [];
+  if (childSlip) {
+    const ch = await dbGet('SELECT slip_no, merged_into, delivery_cust_pay, install_cust_pay FROM delivery_tracking WHERE slip_no = ?', [childSlip]);
+    if (ch && ch.merged_into) {
+      await dbRun(`UPDATE delivery_tracking SET merged_into = '', updated_at = datetime('now', '+7 hours') WHERE slip_no = ?`, [childSlip]);
+      unmergedSlips = [childSlip];
+      // Also unmerge linked order if it was merged into master order
+      const masterOrd = await dbGet(`SELECT id, merged_invoices, customer_paid_fee FROM orders WHERE invoice_no = ? AND status != 'Cancelled' ORDER BY id DESC LIMIT 1`, [ch.merged_into]);
+      if (masterOrd) {
+        const chOrd = await dbGet(`SELECT id FROM orders WHERE invoice_no = ? AND merged_into_order_id = ?`, [childSlip, masterOrd.id]);
+        if (chOrd) {
+          await dbRun('UPDATE order_items SET order_id = ? WHERE order_id = ? AND orig_order_id = ?', [chOrd.id, masterOrd.id, chOrd.id]);
+          await dbRun(`UPDATE orders SET merged_into_order_id = NULL, status = 'New' WHERE id = ?`, [chOrd.id]);
+        }
+        const nextInvs = String(masterOrd.merged_invoices || '').split(',').map(s => s.trim()).filter(s => s && s !== childSlip);
+        const subFee = num(ch.delivery_cust_pay) + num(ch.install_cust_pay);
+        await dbRun(`UPDATE orders SET merged_invoices = ?, customer_paid_fee = ? WHERE id = ?`, [nextInvs.join(', '), Math.max(0, num(masterOrd.customer_paid_fee) - subFee), masterOrd.id]);
+      }
+    }
+  } else if (masterSlip) {
+    const kids = await dbAll('SELECT slip_no FROM delivery_tracking WHERE merged_into = ?', [masterSlip]);
+    unmergedSlips = kids.map(k => k.slip_no);
+    await dbRun(`UPDATE delivery_tracking SET merged_into = '', updated_at = datetime('now', '+7 hours') WHERE merged_into = ?`, [masterSlip]);
+  }
+
+  await logAudit(req, 'UNMERGE_3PL_SLIPS', '3PL', masterSlip || childSlip, `Tách bill ${unmergedSlips.join(', ')} khỏi đơn gộp`);
+  res.json({ ok: true, unmerged: unmergedSlips });
+}));
+
 app.get('/api/delivery-tracking/:slipNo/detail', wrap(async (req, res) => {
   const slipNo = String(req.params.slipNo || '').trim();
   if (!slipNo) return res.status(400).json({ error: 'Thiếu mã hóa đơn (Slip No.)' });
 
-  const [tracking, pos, order, handovers, warehouseSlips, warrantyTickets] = await Promise.all([
+  const [tracking, pos, order, handovers, warehouseSlips, warrantyTickets, mergedSlips] = await Promise.all([
     dbGet(`SELECT * FROM delivery_tracking WHERE slip_no = ?`, [slipNo]),
     dbGet(`SELECT * FROM pos_slips WHERE slip_no = ?`, [slipNo]),
     dbGet(`SELECT * FROM orders WHERE invoice_no = ? ORDER BY CASE WHEN status = 'Cancelled' THEN 1 ELSE 0 END, id DESC LIMIT 1`, [slipNo]),
     dbAll(`SELECT id, doc_no, doc_type, handover_date, warehouse_code, customer_name, carrier, install_mode, ktv1_name, ktv1_code, ktv2_name, ktv2_code, ktvs_json, csat_rating, csat_comment, status FROM handovers WHERE invoice_no = ? ORDER BY id DESC`, [slipNo]),
     dbAll(`SELECT id, slip_no, slip_type, slip_date, expected_date, warehouse_code, carrier, purpose, status, notes FROM warehouse_slips WHERE ref_invoice = ? ORDER BY id DESC`, [slipNo]),
     dbAll(`SELECT id, ticket_no, created_at, product_name, service_level, issue_desc, status FROM warranty_tickets WHERE invoice_no = ? ORDER BY id DESC`, [slipNo]),
+    dbAll(`SELECT * FROM delivery_tracking WHERE merged_into = ? ORDER BY sales_day ASC, slip_no ASC`, [slipNo]),
   ]);
 
   let orderItems = [];
@@ -2857,15 +3239,31 @@ app.get('/api/delivery-tracking/:slipNo/detail', wrap(async (req, res) => {
     return res.status(404).json({ error: `Không tìm thấy thông tin cho hóa đơn ${slipNo}` });
   }
 
+  // Roll up merged slips into summary totals for the detail popup too
+  const aggTracking = tracking
+    ? {
+        ...tracking,
+        own_delivery_cust_pay: num(tracking.delivery_cust_pay),
+        own_install_cust_pay: num(tracking.install_cust_pay),
+        own_fee_3pl: num(tracking.fee_3pl),
+        own_net_sales_excl_tax: num(tracking.net_sales_excl_tax),
+        delivery_cust_pay: num(tracking.delivery_cust_pay) + mergedSlips.reduce((a, k) => a + num(k.delivery_cust_pay), 0),
+        install_cust_pay: num(tracking.install_cust_pay) + mergedSlips.reduce((a, k) => a + num(k.install_cust_pay), 0),
+        fee_3pl: num(tracking.fee_3pl) + mergedSlips.reduce((a, k) => a + num(k.fee_3pl), 0),
+        net_sales_excl_tax: num(tracking.net_sales_excl_tax) + mergedSlips.reduce((a, k) => a + num(k.net_sales_excl_tax), 0),
+      }
+    : null;
+
   res.json({
     slip_no: slipNo,
-    tracking: tracking || null,
+    tracking: aggTracking,
     pos: pos || null,
     order: order || null,
     order_items: orderItems,
     handovers,
     warehouse_slips: warehouseSlips,
     warranty_tickets: warrantyTickets,
+    merged_slips: mergedSlips,
   });
 }));
 
@@ -2937,51 +3335,140 @@ app.post('/api/delivery-tracking/:slipNo/push-to-order', requireRoles('ADMIN', '
   res.json({ ok: true, existed: false, order_id: oid, items_created: parsedEntries.length });
 }));
 
-app.post('/api/delivery-tracking/upload-pos', requireRoles('ADMIN', 'EDITOR'), upload.single('file'), wrap(async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'Chưa chọn file transaction_detail CSV' });
-  const slips = parseTransactionDetailCsv(req.file.buffer.toString('utf8'));
-  const monthsFound = new Set();
-  const posSql = `INSERT OR REPLACE INTO pos_slips (slip_no,sales_month,sales_day,store_code,delivery_cust_pay,install_cust_pay,net_sales_excl_tax,gross_sales_incl_tax,has_furniture,items_summary) VALUES (?,?,?,?,?,?,?,?,?,?)`;
-
-  for (let i = 0; i < slips.length; i += 100) {
-    const chunk = slips.slice(i, i + 100).map(s => {
-      if (s.sales_month) monthsFound.add(s.sales_month);
-      return {
-        sql: posSql,
-        args: [s.slip_no, s.sales_month, s.sales_day, s.store_code, s.delivery_cust_pay, s.install_cust_pay, s.net_sales_excl_tax, s.gross_sales_incl_tax, s.has_furniture, s.items_summary],
-      };
-    });
-    await dbBatch(chunk);
-  }
-
-  // Upsert slips that have delivery or installation customer payment into delivery_tracking (preserving manual 3PL/Fee/Area/Note!)
-  const deliverySlips = slips.filter(s => s.delivery_cust_pay !== 0 || s.install_cust_pay !== 0);
-  const trackSql = `
-    INSERT INTO delivery_tracking (slip_no,sales_month,sales_day,store_code,delivery_cust_pay,install_cust_pay,net_sales_excl_tax,items_summary)
-    VALUES (?,?,?,?,?,?,?,?)
-    ON CONFLICT(slip_no) DO UPDATE SET
-      sales_month=excluded.sales_month,
-      sales_day=excluded.sales_day,
-      delivery_cust_pay=excluded.delivery_cust_pay,
-      install_cust_pay=excluded.install_cust_pay,
-      net_sales_excl_tax=excluded.net_sales_excl_tax,
-      items_summary=excluded.items_summary,
-      updated_at=datetime('now', '+7 hours')
-  `;
-  for (let i = 0; i < deliverySlips.length; i += 100) {
-    const chunk = deliverySlips.slice(i, i + 100).map(s => ({
-      sql: trackSql,
-      args: [s.slip_no, s.sales_month, s.sales_day, s.store_code, s.delivery_cust_pay, s.install_cust_pay, s.net_sales_excl_tax, s.items_summary],
-    }));
-    await dbBatch(chunk);
-  }
-
-  res.json({
-    ok: true,
-    months: Array.from(monthsFound).sort(),
-    total_pos_slips: slips.length,
-    auto_tracked_delivery_slips: deliverySlips.length,
+async function parseTransactionDetailCsvStream(filePath) {
+  const rl = readline.createInterface({
+    input: fs.createReadStream(filePath, { encoding: 'utf8', highWaterMark: 64 * 1024 }),
+    crlfDelay: Infinity,
   });
+  let lineNo = 0;
+  let iSlip = -1, iDay = -1, iStore = -1, iDiv = -1, iL1 = -1, iName = -1, iQty = -1, iExcl = -1, iIncl = -1;
+  const slipMap = new Map();
+
+  for await (const rawLine of rl) {
+    lineNo++;
+    if (lineNo === 1) {
+      const headers = fastCsvLine(rawLine.replace(/^\uFEFF/, '')).map(h => h.trim());
+      iSlip = headers.indexOf('Slip No.');
+      iDay = headers.indexOf('Sales Day');
+      iStore = headers.indexOf('Store');
+      iDiv = headers.indexOf('Slip Div');
+      iL1 = headers.indexOf('Layer1');
+      iName = headers.indexOf('Item Name');
+      iQty = headers.indexOf('QTY');
+      iExcl = headers.indexOf('Amount(Tax excl.)');
+      iIncl = headers.indexOf('Amount(Tax incl.)');
+      if (iSlip < 0 || iExcl < 0 || iIncl < 0) {
+        rl.close();
+        throw new Error('File không đúng chuẩn transaction_detail ERP Kohnan (thiếu Slip No. / Amount)');
+      }
+      continue;
+    }
+    if (!rawLine || !rawLine.trim()) continue;
+    const cols = fastCsvLine(rawLine);
+    const slipNo = (cols[iSlip] || '').trim();
+    const div = (cols[iDiv] || '').trim();
+    if (!slipNo || div === 'Delete') continue;
+
+    const isoDay = parseSalesDayToIso(cols[iDay]);
+    const month = isoDay ? isoDay.slice(0, 7) : '';
+    const store = (cols[iStore] || '3001').trim();
+    const l1 = (cols[iL1] || '').trim();
+    const name = (cols[iName] || '').trim();
+    const qty = num(cols[iQty]);
+    const amtExcl = num(cols[iExcl]);
+    const amtIncl = num(cols[iIncl]);
+
+    let cur = slipMap.get(slipNo);
+    if (!cur) {
+      cur = {
+        slip_no: slipNo,
+        sales_month: month,
+        sales_day: isoDay,
+        store_code: store,
+        delivery_cust_pay: 0,
+        install_cust_pay: 0,
+        net_sales_excl_tax: 0,
+        gross_sales_incl_tax: 0,
+        has_furniture: 0,
+        items: [],
+      };
+      slipMap.set(slipNo, cur);
+    }
+
+    cur.net_sales_excl_tax += amtExcl;
+    cur.gross_sales_incl_tax += amtIncl;
+    if (l1 === 'FURNITURE/STORAGE') cur.has_furniture = 1;
+
+    if (l1 === 'SERVICES') {
+      if (/phí vận chuyển|vận chuyển|giao hàng/i.test(name)) {
+        cur.delivery_cust_pay += amtIncl;
+      } else if (/phí lắp đặt|lắp đặt/i.test(name)) {
+        cur.install_cust_pay += amtIncl;
+      }
+    } else if (name && qty !== 0) {
+      cur.items.push(`${name} (x${qty})`);
+    }
+  }
+
+  if (lineNo < 2) throw new Error('File transaction_detail CSV trống');
+  return Array.from(slipMap.values()).map(s => ({
+    ...s,
+    items_summary: s.items.slice(0, 4).join(', ') + (s.items.length > 4 ? ` (+${s.items.length - 4})` : ''),
+  }));
+}
+
+app.post('/api/delivery-tracking/upload-pos', requireRoles('ADMIN', 'EDITOR'), uploadDisk.single('file'), wrap(async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Chưa chọn file transaction_detail CSV' });
+  const filePath = req.file.path;
+  try {
+    const slips = await parseTransactionDetailCsvStream(filePath);
+    const monthsFound = new Set();
+    const posSql = `INSERT OR REPLACE INTO pos_slips (slip_no,sales_month,sales_day,store_code,delivery_cust_pay,install_cust_pay,net_sales_excl_tax,gross_sales_incl_tax,has_furniture,items_summary) VALUES (?,?,?,?,?,?,?,?,?,?)`;
+
+    for (let i = 0; i < slips.length; i += 100) {
+      const chunk = slips.slice(i, i + 100).map(s => {
+        if (s.sales_month) monthsFound.add(s.sales_month);
+        return {
+          sql: posSql,
+          args: [s.slip_no, s.sales_month, s.sales_day, s.store_code, s.delivery_cust_pay, s.install_cust_pay, s.net_sales_excl_tax, s.gross_sales_incl_tax, s.has_furniture, s.items_summary],
+        };
+      });
+      await dbBatch(chunk);
+    }
+
+    // Upsert slips that have delivery or installation customer payment into delivery_tracking (preserving manual 3PL/Fee/Area/Note!)
+    const deliverySlips = slips.filter(s => s.delivery_cust_pay !== 0 || s.install_cust_pay !== 0);
+    const trackSql = `
+      INSERT INTO delivery_tracking (slip_no,sales_month,sales_day,store_code,delivery_cust_pay,install_cust_pay,net_sales_excl_tax,items_summary)
+      VALUES (?,?,?,?,?,?,?,?)
+      ON CONFLICT(slip_no) DO UPDATE SET
+        sales_month=excluded.sales_month,
+        sales_day=excluded.sales_day,
+        delivery_cust_pay=excluded.delivery_cust_pay,
+        install_cust_pay=excluded.install_cust_pay,
+        net_sales_excl_tax=excluded.net_sales_excl_tax,
+        items_summary=excluded.items_summary,
+        updated_at=datetime('now', '+7 hours')
+    `;
+    for (let i = 0; i < deliverySlips.length; i += 100) {
+      const chunk = deliverySlips.slice(i, i + 100).map(s => ({
+        sql: trackSql,
+        args: [s.slip_no, s.sales_month, s.sales_day, s.store_code, s.delivery_cust_pay, s.install_cust_pay, s.net_sales_excl_tax, s.items_summary],
+      }));
+      await dbBatch(chunk);
+    }
+
+    const sortedMonths = Array.from(monthsFound).sort();
+    await logAudit(req, 'UPLOAD_POS_CSV', '3PL', sortedMonths.join(',') || 'POS', `Nạp POS CSV: ${slips.length} hóa đơn (${deliverySlips.length} đơn có giao/lắp)`);
+    res.json({
+      ok: true,
+      months: sortedMonths,
+      total_pos_slips: slips.length,
+      auto_tracked_delivery_slips: deliverySlips.length,
+    });
+  } finally {
+    fs.promises.unlink(filePath).catch(() => {});
+  }
 }));
 
 app.post('/api/delivery-tracking', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
@@ -3041,6 +3528,10 @@ app.put('/api/delivery-tracking/:slipNo', requireRoles('ADMIN', 'EDITOR'), wrap(
     b.net_sales_excl_tax !== undefined ? num(b.net_sales_excl_tax) : null,
     slipNo,
   ]);
+  // Prevent double-counting fee_3pl when editing a Master slip that has merged child slips
+  if (b.fee_3pl !== undefined) {
+    await dbRun(`UPDATE delivery_tracking SET fee_3pl = 0 WHERE merged_into = ?`, [slipNo]);
+  }
   // 2-way sync carrier & 3PL fee back to orders if linked
   await dbRun(`
     UPDATE orders
@@ -3088,6 +3579,8 @@ app.get('/api/delivery-tracking/export', requireRoles('ADMIN', 'EDITOR'), wrap(a
   ]);
   const wsDet = XLSX.utils.json_to_sheet(report.rows.map(r => ({
     'No Slip.': r.slip_no,
+    'Merged Slips': (r.merged_slips || []).map(k => k.slip_no).join(', '),
+    'Customer': r.linked_customer_name || '',
     'Sales Day': r.sales_day,
     'Delivery Customer Payment': r.delivery_cust_pay,
     'Installation Customer Payment': r.install_cust_pay,
@@ -3104,6 +3597,135 @@ app.get('/api/delivery-tracking/export', requireRoles('ADMIN', 'EDITOR'), wrap(a
   res.setHeader('Content-Disposition', `attachment; filename="Benom_3PL_Delivery_Report_${month}.xlsx"`);
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.send(buf);
+}));
+
+// ─── 10. ADMIN SYSTEM HEALTH & 1-CLICK DATA BACKUP (0-COST SOVEREIGNTY) ───
+app.get('/api/admin/system-status', requireRoles('ADMIN'), wrap(async (req, res) => {
+  const mem = process.memoryUsage();
+  const tableSpecs = [
+    ['products', 'Master SKU'],
+    ['erp_snapshots', 'ERP Snapshots'],
+    ['orders', 'Đơn giao & lắp'],
+    ['order_items', 'Dòng SP trong đơn'],
+    ['handovers', 'Biên bản BM-01/05'],
+    ['warehouse_slips', 'Phiếu Kho 9005'],
+    ['pos_slips', 'Hóa đơn POS'],
+    ['delivery_tracking', 'Theo dõi 3PL'],
+    ['warranty_tickets', 'Bảo hành BM-02'],
+    ['bm03_inspections', 'Kiểm định BM-03'],
+    ['bm04_incidents', 'Sự cố 3PL BM-04'],
+    ['qc_factory_returns', 'QC Xưởng NCC'],
+    ['spare_parts', 'Kho Ngũ Kim KTV'],
+    ['product_guides', 'Thư viện HDLR/HDBQ'],
+    ['audit_logs', 'Nhật ký kiểm toán'],
+    ['users', 'Tài khoản người dùng'],
+  ];
+  const [counts, lastBackup] = await Promise.all([
+    Promise.all(tableSpecs.map(async ([tbl, label]) => {
+      const r = await dbGet(`SELECT COUNT(*) as c FROM ${tbl}`);
+      return { table: tbl, label, rows: Number(r?.c || 0) };
+    })),
+    dbGet(`SELECT created_at, user_name, summary FROM audit_logs WHERE action = 'EXPORT_FULL_BACKUP' ORDER BY id DESC LIMIT 1`),
+  ]);
+
+  res.json({
+    mode: isCloudDb() ? 'turso-cloud' : 'local-sqlite',
+    vn_time: getVnDateTime(),
+    uptime_s: Math.round(process.uptime()),
+    memory: {
+      rss_mb: Number((mem.rss / 1024 / 1024).toFixed(1)),
+      heap_used_mb: Number((mem.heapUsed / 1024 / 1024).toFixed(1)),
+      render_free_limit_mb: 512,
+    },
+    last_backup: lastBackup || null,
+    tables: counts,
+    total_rows: counts.reduce((s, x) => s + x.rows, 0),
+  });
+}));
+
+app.get('/api/admin/backup', requireRoles('ADMIN'), wrap(async (req, res) => {
+  const includeMedia = req.query.include_media !== '0';
+  const [
+    users, products, staff, warehouses, partners,
+    orders, order_items, warehouse_slips, warehouse_slip_items,
+    handovers, warranty_tickets, qc_factory_returns,
+    bm03_inspections, bm04_incidents, allowance_locks,
+    spare_parts, spare_part_logs, support_logs,
+    product_guides, pos_slips, delivery_tracking,
+    erp_snapshots, audit_logs,
+  ] = await Promise.all([
+    dbAll('SELECT id, email, full_name, role, department, active, created_at FROM users ORDER BY id ASC'),
+    dbAll('SELECT * FROM products ORDER BY barcode ASC'),
+    dbAll('SELECT * FROM staff ORDER BY emp_code ASC'),
+    dbAll('SELECT * FROM warehouses ORDER BY code ASC'),
+    dbAll('SELECT * FROM partners ORDER BY code ASC'),
+    dbAll('SELECT * FROM orders ORDER BY id ASC'),
+    dbAll('SELECT * FROM order_items ORDER BY id ASC'),
+    dbAll('SELECT * FROM warehouse_slips ORDER BY id ASC'),
+    dbAll('SELECT * FROM warehouse_slip_items ORDER BY id ASC'),
+    includeMedia
+      ? dbAll('SELECT * FROM handovers ORDER BY id ASC')
+      : dbAll(`SELECT id, doc_no, doc_type, order_id, invoice_no, handover_date, warehouse_code, customer_name, customer_phone, address, carrier, driver_name, driver_phone, vehicle_plate, install_mode, ktv1_name, ktv1_code, ktv2_name, ktv2_code, ktvs_json, check_1, check_2, check_3, check_4, issue_note, due_date, csat_rating, csat_comment, status, created_at FROM handovers ORDER BY id ASC`),
+    dbAll('SELECT * FROM warranty_tickets ORDER BY id ASC'),
+    dbAll('SELECT * FROM qc_factory_returns ORDER BY id ASC'),
+    includeMedia
+      ? dbAll('SELECT * FROM bm03_inspections ORDER BY id ASC')
+      : dbAll(`SELECT id, doc_no, doc_date, ticket_id, ticket_no, invoice_no, handover_no, location, tech_name, wh_rep, customer_name, customer_phone, barcode, product_name, qty, receive_date, packaging_state, damage_types_json, damage_other, root_cause, customer_resolution, replacement_code, appointment_date, refund_amount, warehouse_disposition, inv_adj_code, status, created_at FROM bm03_inspections ORDER BY id ASC`),
+    includeMedia
+      ? dbAll('SELECT * FROM bm04_incidents ORDER BY id ASC')
+      : dbAll(`SELECT id, doc_no, doc_date, location, ticket_id, ticket_no, invoice_no, carrier, awb_no, route, vehicle_plate, driver_name, driver_phone, driver_cccd, packaging_checks_json, evidence_checks_json, cause_assessment, items_json, goods_disposition, claim_amount, claim_deadline_at, claim_status, notes, created_at FROM bm04_incidents ORDER BY id ASC`),
+    dbAll('SELECT * FROM allowance_locks ORDER BY month_ym ASC'),
+    dbAll('SELECT * FROM spare_parts ORDER BY id ASC'),
+    dbAll('SELECT * FROM spare_part_logs ORDER BY id ASC'),
+    dbAll('SELECT * FROM support_logs ORDER BY id ASC'),
+    dbAll('SELECT * FROM product_guides ORDER BY id ASC'),
+    dbAll('SELECT * FROM pos_slips ORDER BY slip_no ASC'),
+    dbAll('SELECT * FROM delivery_tracking ORDER BY slip_no ASC'),
+    dbAll('SELECT * FROM erp_snapshots ORDER BY id ASC'),
+    dbAll('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 1000'),
+  ]);
+
+  const tables = {
+    users, products, staff, warehouses, partners,
+    orders, order_items, warehouse_slips, warehouse_slip_items,
+    handovers, warranty_tickets, qc_factory_returns,
+    bm03_inspections, bm04_incidents, allowance_locks,
+    spare_parts, spare_part_logs, support_logs,
+    product_guides, pos_slips, delivery_tracking,
+    erp_snapshots, audit_logs,
+  };
+  const rowCounts = Object.fromEntries(Object.entries(tables).map(([k, v]) => [k, v.length]));
+  const totalRows = Object.values(rowCounts).reduce((a, b) => a + b, 0);
+  const dateTag = getVnIsoDate();
+  const fileName = `benom_ops_backup_${dateTag}${includeMedia ? '_full' : '_lite'}.json`;
+
+  const payload = {
+    schema_version: '1.0',
+    app: 'benom Operations Hub',
+    exported_at_vn: getVnDateTime(),
+    exported_by: req.user.email,
+    db_mode: isCloudDb() ? 'turso-cloud' : 'local-sqlite',
+    include_media: includeMedia,
+    total_rows: totalRows,
+    row_counts: rowCounts,
+    tables,
+  };
+
+  await logAudit(req, 'EXPORT_FULL_BACKUP', 'SYSTEM', fileName, `Xuất sao lưu ${includeMedia ? 'đầy đủ (kèm ảnh/chữ ký)' : 'nhanh (không gồm ảnh Base64)'}: ${totalRows.toLocaleString('vi-VN')} dòng dữ liệu`);
+
+  const rawBuf = Buffer.from(JSON.stringify(payload), 'utf8');
+  res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  if (/\bgzip\b/i.test(req.headers['accept-encoding'] || '')) {
+    const gz = zlib.gzipSync(rawBuf, { level: 6 });
+    res.setHeader('Content-Encoding', 'gzip');
+    res.setHeader('Vary', 'Accept-Encoding');
+    res.setHeader('Content-Length', String(gz.length));
+    return res.end(gz);
+  }
+  res.setHeader('Content-Length', String(rawBuf.length));
+  res.end(rawBuf);
 }));
 
 // Global API error handler

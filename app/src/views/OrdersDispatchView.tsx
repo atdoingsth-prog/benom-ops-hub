@@ -1,24 +1,31 @@
 import React, { lazy, Suspense, useEffect, useState } from 'react';
 import {
-  AlertTriangle, Calendar, CheckCircle2, ClipboardCheck, Edit3, FileOutput,
-  Plus, Printer, Search, Smartphone, Star, Trash2, Truck, X
+  AlertTriangle, Calendar, CheckCircle2, ClipboardCheck, Edit3, FileOutput, GitMerge,
+  Plus, Printer, Search, Smartphone, Star, Trash2, Truck, Unlink, X
 } from 'lucide-react';
 import { apiGet, apiGetPage, apiSend, AuthUser, fmtVnd, PrintDoc } from '../api';
 import KtvListPicker, { KtvEntry } from '../components/KtvListPicker';
 
 const KtvFieldBoard = lazy(() => import('../components/KtvFieldBoard'));
 const HandoverModal = lazy(() => import('../components/HandoverModal'));
+const MergeModal = lazy(() => import('../components/MergeModal'));
 const ORDER_PAGE_SIZE = 60;
 
 function formatKtvList(row: any): string {
-  const isSelfInstall = row.install_mode === 'Khách hàng tự lắp đặt' || (row.require_install !== undefined && !row.require_install);
+  const noInstallMode = row.install_mode === 'Sản phẩm không cần lắp đặt';
+  const selfInstallMode = row.install_mode === 'Khách hàng tự lắp đặt';
+  const isNoKtv = noInstallMode || selfInstallMode || (row.require_install !== undefined && !row.require_install);
   const arr: KtvEntry[] = Array.isArray(row.ktvs) && row.ktvs.length > 0
     ? row.ktvs
     : [
         ...(row.ktv1_name ? [{ code: row.ktv1_code || '', name: row.ktv1_name }] : []),
         ...(row.ktv2_name ? [{ code: row.ktv2_code || '', name: row.ktv2_name }] : []),
       ];
-  if (arr.length === 0) return isSelfInstall ? 'Không cần gán (KH tự lắp)' : 'Chưa gán';
+  if (arr.length === 0) {
+    if (noInstallMode) return 'Không cần gán (SP không lắp đặt)';
+    if (selfInstallMode) return 'Không cần gán (KH tự lắp)';
+    return isNoKtv ? 'Không cần gán (Không lắp đặt)' : 'Chưa gán';
+  }
   return arr.map(k => (k.code ? `[${k.code}] ${k.name}` : k.name)).join(', ');
 }
 
@@ -65,6 +72,8 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
   const [q, setQ] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [activeHandover, setActiveHandover] = useState<any>(null);
+  const [showMergeOrders, setShowMergeOrders] = useState(false);
+  const [unmergingOrderId, setUnmergingOrderId] = useState<number | null>(null);
   const [showNewOrder, setShowNewOrder] = useState(false);
   const [savingNew, setSavingNew] = useState(false);
   const [editingOrder, setEditingOrder] = useState<any>(null);
@@ -310,6 +319,21 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
     }
   };
 
+  const unmergeChildOrder = async (childId: number, childInvoice: string) => {
+    if (!confirm(`Tách đơn phụ ${childInvoice} trở lại thành đơn riêng biệt?`)) return;
+    setUnmergingOrderId(childId);
+    try {
+      await apiSend(`/api/orders/${childId}/unmerge`, 'POST', {});
+      onToast(`Đã tách đơn ${childInvoice} thành công!`);
+      setEditingOrder(null);
+      await loadData();
+    } catch (err: any) {
+      onToast(err.message, 'err');
+    } finally {
+      setUnmergingOrderId(null);
+    }
+  };
+
   const genXk = async (o: any) => {
     try {
       const res = await apiSend(`/api/orders/${o.id}/generate-xk`, 'POST', {});
@@ -411,12 +435,21 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
             </button>
           </div>
           {canManageOrders && (
-            <button
-              onClick={() => { ensureStaffLoaded(); setShowNewOrder(true); }}
-              className="px-3.5 py-2 rounded-lg bg-[#3B281A] text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-[#563C28] cursor-pointer"
-            >
-              <Plus className="w-4 h-4" /> Tạo đơn mới
-            </button>
+            <>
+              <button
+                onClick={() => setShowMergeOrders(true)}
+                className="px-3 py-2 rounded-lg border border-purple-700 text-purple-900 bg-purple-50 text-xs font-semibold flex items-center gap-1.5 hover:bg-purple-100 cursor-pointer"
+                title="Gộp nhiều bill của cùng 1 khách giao chung chuyến"
+              >
+                <GitMerge className="w-4 h-4" /> Gộp đơn
+              </button>
+              <button
+                onClick={() => { ensureStaffLoaded(); setShowNewOrder(true); }}
+                className="px-3.5 py-2 rounded-lg bg-[#3B281A] text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-[#563C28] cursor-pointer"
+              >
+                <Plus className="w-4 h-4" /> Tạo đơn mới
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -457,6 +490,7 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
               <option value="In Transit">Đang giao (In Transit)</option>
               <option value="Done">Hoàn tất (Done)</option>
               <option value="Cancelled">Đã hủy (Cancelled)</option>
+              <option value="Merged">Đã gộp vào đơn khác (Merged)</option>
             </select>
             <button type="submit" className="px-4 py-2 rounded-lg bg-[#3B281A] text-white text-xs font-semibold cursor-pointer">Lọc</button>
           </form>
@@ -479,7 +513,22 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                   {orders.map(o => (
                     <tr key={o.id} className={`hover:bg-[#FAF7F2] ${o.status === 'Cancelled' ? 'opacity-60' : ''}`}>
                       <td className="py-2.5 px-3 whitespace-nowrap">
-                        <div className="font-bold text-[#3B281A]">{o.invoice_no}</div>
+                        <div className="font-bold text-[#3B281A] flex items-center gap-1.5">
+                          <span>{o.invoice_no}</span>
+                          {o.merged_invoices && (
+                            <span
+                              className="px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-900 text-[10px] font-bold inline-flex items-center gap-0.5"
+                              title={`Đã gộp bill: ${o.merged_invoices}`}
+                            >
+                              <GitMerge className="w-2.5 h-2.5" /> +{o.merged_invoices.split(',').filter(Boolean).length}
+                            </span>
+                          )}
+                        </div>
+                        {o.merged_invoices && (
+                          <div className="text-[10px] font-mono text-purple-800 truncate max-w-[175px]" title={o.merged_invoices}>
+                            Gộp: {o.merged_invoices}
+                          </div>
+                        )}
                         <div className="text-[11px] text-[#6e5543]">
                           {o.delivery_date || o.order_date} {o.distance_km ? `• ${o.distance_km}km` : ''}
                         </div>
@@ -521,6 +570,7 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                       </td>
                       <td className="py-2.5 px-2 text-center">
                         <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                          o.status === 'Merged' ? 'bg-purple-100 text-purple-900' :
                           o.status === 'Cancelled' ? 'bg-red-50 text-[#9A2B26]' :
                           o.status === 'Done' ? 'bg-emerald-50 text-[#234E36]' :
                           o.status === 'In Transit' ? 'bg-blue-50 text-[#224B85]' : 'bg-amber-50 text-amber-800'
@@ -663,6 +713,19 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
         </Suspense>
       )}
 
+      {/* Merge Orders Modal (lazy-loaded on-demand) */}
+      {showMergeOrders && (
+        <Suspense fallback={null}>
+          <MergeModal
+            mode="orders"
+            rows={orders}
+            onClose={() => setShowMergeOrders(false)}
+            onMerged={() => loadData()}
+            onToast={onToast}
+          />
+        </Suspense>
+      )}
+
       {/* Edit Order Modal (TASK-07) */}
       {editingOrder && (
         <div className="fixed inset-0 z-40 bg-black/50 flex items-center justify-center p-3 overflow-y-auto">
@@ -672,6 +735,36 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
               <button type="button" onClick={() => setEditingOrder(null)} className="cursor-pointer"><X className="w-5 h-5" /></button>
             </div>
             <div className="p-5 overflow-y-auto space-y-4 text-xs">
+              {/* Merged child orders banner + 1-click Unmerge */}
+              {Array.isArray(editingOrder.merged_children) && editingOrder.merged_children.length > 0 && (
+                <div className="bg-purple-50/70 p-3 rounded-xl border border-purple-200 space-y-2">
+                  <div className="font-bold text-purple-950 flex items-center gap-1.5">
+                    <GitMerge className="w-3.5 h-3.5 text-purple-700" />
+                    Các đơn phụ đã gộp vào ĐH {editingOrder.invoice_no} ({editingOrder.merged_children.length} đơn)
+                  </div>
+                  <div className="space-y-1.5">
+                    {editingOrder.merged_children.map((ch: any) => (
+                      <div key={ch.id} className="flex items-center justify-between gap-2 bg-white px-2.5 py-1.5 rounded-lg border border-purple-200/80">
+                        <div>
+                          <span className="font-mono font-bold text-purple-950">{ch.invoice_no}</span>
+                          <span className="ml-2 text-[#6e5543]">
+                            {ch.customer_name} • Phí KH: {fmtVnd(ch.customer_paid_fee)}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={unmergingOrderId === ch.id}
+                          onClick={() => unmergeChildOrder(ch.id, ch.invoice_no)}
+                          className="px-2 py-1 rounded bg-purple-100 text-purple-900 font-semibold text-[11px] hover:bg-purple-200 cursor-pointer inline-flex items-center gap-1 disabled:opacity-50"
+                        >
+                          <Unlink className="w-3 h-3" /> {unmergingOrderId === ch.id ? 'Đang tách...' : 'Tách đơn'}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* Editable Products + Per-Item Pickup Warehouse (9005 / 3001 / 1001) + Moving No */}
               <div className="bg-[#FAF7F2] p-3.5 rounded-xl border border-[#D6BCA5] space-y-2">
                 <div className="font-bold text-[#3B281A]">Sản phẩm & Điểm lấy hàng theo từng món ({editingOrder.items?.length || 0} dòng)</div>
@@ -708,6 +801,11 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                   <div key={idx} className="flex flex-wrap items-center justify-between gap-2 bg-white px-2.5 py-2 rounded-lg border border-[#E6DDD1]">
                     <div className="min-w-[160px] flex-1">
                       <span className="font-semibold text-[#3B281A]">{it.product_name}</span>
+                      {it.orig_invoice && it.orig_invoice !== editingOrder.invoice_no && (
+                        <span className="ml-1.5 px-1.5 py-0.5 rounded bg-purple-50 border border-purple-200 text-purple-800 font-mono text-[9px] font-bold">
+                          Bill {it.orig_invoice}
+                        </span>
+                      )}
                       {it.net_weight_g >= 25000 && <span className="ml-1 px-1 py-0.5 rounded bg-red-100 text-[#9A2B26] text-[9px] font-bold">≥25kg</span>}
                     </div>
                     <div className="flex items-center gap-1.5">
@@ -860,7 +958,7 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                 staff={staff}
                 value={editingOrder.require_install ? (editingOrder.ktvs || []) : []}
                 disabled={!editingOrder.require_install}
-                disabledReason="Khách hàng tự lắp đặt (không tích 'Cần KTV benom lắp đặt') — Không cần gán Kỹ thuật viên."
+                disabledReason="Sản phẩm không cần lắp đặt / KH tự lắp đặt (không tích 'Cần KTV benom lắp đặt') — Không cần gán Kỹ thuật viên."
                 onChange={ktvs => setEditingOrder({ ...editingOrder, ktvs })}
                 onStaffAdded={s => setStaff(prev => [...prev.filter(x => x.emp_code !== s.emp_code), s])}
                 label={`Phân công Kỹ thuật viên ${editingOrder.requires_two_ktv ? '(Tối thiểu 2 KTV)' : ''}`}
@@ -1093,7 +1191,7 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                 staff={staff}
                 value={newOrder.require_install ? (newOrder.ktvs || []) : []}
                 disabled={!newOrder.require_install}
-                disabledReason="Khách hàng tự lắp đặt (không tích 'Cần KTV benom lắp đặt') — Không cần gán Kỹ thuật viên."
+                disabledReason="Sản phẩm không cần lắp đặt / KH tự lắp đặt (không tích 'Cần KTV benom lắp đặt') — Không cần gán Kỹ thuật viên."
                 onChange={ktvs => setNewOrder({ ...newOrder, ktvs })}
                 onStaffAdded={s => setStaff(prev => [...prev.filter(x => x.emp_code !== s.emp_code), s])}
                 label={`Phân công Kỹ thuật viên ${requiresTwoKtv ? '(Tối thiểu 2 KTV)' : ''}`}

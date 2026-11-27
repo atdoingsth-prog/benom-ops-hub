@@ -1,18 +1,21 @@
 import React, { useEffect, useState } from 'react';
 import {
-  ArrowUpRight, ClipboardCheck, FileText, MapPin, Package, Phone,
-  ShieldAlert, Star, Truck, User, Warehouse, Wrench, X
+  ArrowUpRight, Check, ClipboardCheck, Edit3, FileText, GitMerge, MapPin, Package, Phone,
+  ShieldAlert, Star, Truck, Unlink, User, Warehouse, Wrench, X
 } from 'lucide-react';
-import { apiGet, fmtVnd } from '../api';
+import { apiGet, apiSend, fmtVnd } from '../api';
 
 interface Props {
   slipNo: string | null;
   canEdit: boolean;
   onClose: () => void;
   onPushToDispatch: (slipNo: string) => Promise<void>;
+  onChanged?: () => void;
   onNavigateOrders?: () => void;
   onToast: (msg: string, tone?: 'ok' | 'err') => void;
 }
+
+const NO_KTV_MODES = ['Khách hàng tự lắp đặt', 'Sản phẩm không cần lắp đặt'];
 
 function parseKtvs(order: any): Array<{ code: string; name: string }> {
   if (!order) return [];
@@ -51,18 +54,30 @@ export default function SlipDetailModal({
   canEdit,
   onClose,
   onPushToDispatch,
+  onChanged,
   onNavigateOrders,
   onToast,
 }: Props) {
   const [detail, setDetail] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [pushing, setPushing] = useState(false);
+  const [unmergingSlip, setUnmergingSlip] = useState<string | null>(null);
+  const [editingCust, setEditingCust] = useState(false);
+  const [savingCust, setSavingCust] = useState(false);
+  const [custForm, setCustForm] = useState({ customer_name: '', customer_phone: '', address: '', region: 'HCM' });
 
   const loadDetail = async (no: string, force = false) => {
     setLoading(true);
     try {
       const res = await apiGet(`/api/delivery-tracking/${encodeURIComponent(no)}/detail`, { cacheMs: 20000, force });
       setDetail(res);
+      setCustForm({
+        customer_name: res?.order?.customer_name || '',
+        customer_phone: res?.order?.customer_phone || '',
+        address: res?.order?.address || '',
+        region: res?.order?.region || res?.tracking?.area || 'HCM',
+      });
+      setEditingCust(false);
     } catch (e: any) {
       onToast(e.message, 'err');
       onClose();
@@ -95,6 +110,7 @@ export default function SlipDetailModal({
   const handovers: any[] = detail?.handovers || [];
   const slips: any[] = detail?.warehouse_slips || [];
   const tickets: any[] = detail?.warranty_tickets || [];
+  const mergedSlips: any[] = detail?.merged_slips || [];
 
   const netSales = Number(tr?.net_sales_excl_tax ?? pos?.net_sales_excl_tax ?? 0);
   const delCust = Number(tr?.delivery_cust_pay ?? pos?.delivery_cust_pay ?? 0);
@@ -106,18 +122,72 @@ export default function SlipDetailModal({
   const ktvList = parseKtvs(ord);
   const carrierLabel = tr?.carrier_3pl || ord?.carrier || 'Chưa chọn 3PL';
   const latestHandoverMode = handovers[0]?.install_mode || '';
-  const isCustomerSelfInstall = Boolean(
-    latestHandoverMode === 'Khách hàng tự lắp đặt' ||
+  const isNoKtvInstall = Boolean(
+    NO_KTV_MODES.includes(latestHandoverMode) ||
     (ord && !ord.require_install && (!ord.install_status || ord.install_status === 'Không yêu cầu'))
   );
+  const noKtvLabel = latestHandoverMode === 'Sản phẩm không cần lắp đặt'
+    ? 'Sản phẩm không cần lắp đặt'
+    : latestHandoverMode === 'Khách hàng tự lắp đặt'
+      ? 'Khách hàng tự lắp đặt'
+      : 'Không cần lắp đặt';
 
   const handlePush = async () => {
     setPushing(true);
     try {
-      await onPushToDispatch(slipNo);
+      if (custForm.customer_name || custForm.customer_phone || custForm.address) {
+        await apiSend(`/api/delivery-tracking/${encodeURIComponent(slipNo)}/push-to-order`, 'POST', {
+          customer_name: custForm.customer_name || undefined,
+          customer_phone: custForm.customer_phone || '',
+          address: custForm.address || '',
+        });
+        onToast(`Đã đẩy ${slipNo} kèm thông tin KH sang Điều phối & BM-01!`);
+        onChanged?.();
+      } else {
+        await onPushToDispatch(slipNo);
+      }
       await loadDetail(slipNo, true);
+    } catch (e: any) {
+      onToast(e.message, 'err');
     } finally {
       setPushing(false);
+    }
+  };
+
+  const handleSaveCustomer = async () => {
+    if (!ord) return;
+    setSavingCust(true);
+    try {
+      await apiSend(`/api/orders/${ord.id}`, 'PUT', {
+        ...ord,
+        ktvs: parseKtvs(ord),
+        customer_name: custForm.customer_name.trim() || ord.customer_name,
+        customer_phone: custForm.customer_phone.trim(),
+        address: custForm.address.trim(),
+        region: custForm.region.trim() || ord.region || 'HCM',
+      });
+      onToast(`Đã cập nhật thông tin khách hàng cho đơn ${slipNo} & đồng bộ sang Biên bản!`);
+      onChanged?.();
+      await loadDetail(slipNo, true);
+    } catch (e: any) {
+      onToast(e.message, 'err');
+    } finally {
+      setSavingCust(false);
+    }
+  };
+
+  const handleUnmergeChild = async (childSlipNo: string) => {
+    if (!confirm(`Tách bill ${childSlipNo} ra khỏi đơn gộp ${slipNo}?`)) return;
+    setUnmergingSlip(childSlipNo);
+    try {
+      await apiSend('/api/delivery-tracking/unmerge', 'POST', { child_slip_no: childSlipNo });
+      onToast(`Đã tách bill ${childSlipNo} thành công!`);
+      onChanged?.();
+      await loadDetail(slipNo, true);
+    } catch (e: any) {
+      onToast(e.message, 'err');
+    } finally {
+      setUnmergingSlip(null);
     }
   };
 
@@ -135,6 +205,11 @@ export default function SlipDetailModal({
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-mono font-bold text-base tracking-tight">{slipNo}</span>
+              {mergedSlips.length > 0 && (
+                <span className="px-2 py-0.5 rounded-full text-[11px] font-bold bg-purple-400/25 text-purple-100 inline-flex items-center gap-1">
+                  <GitMerge className="w-3 h-3" /> Gộp +{mergedSlips.length} bill
+                </span>
+              )}
               {ord ? (
                 <span className={`px-2 py-0.5 rounded-full text-[11px] font-bold ${statusBadgeClass(ord.status)}`}>
                   {ord.status}
@@ -178,7 +253,7 @@ export default function SlipDetailModal({
                   <div className="text-[11px] text-[#6e5543]">Net Sales (Tax excl.)</div>
                   <div className="text-base font-bold text-[#224B85] mt-0.5">{fmtVnd(netSales)}</div>
                   {pos?.gross_sales_incl_tax ? (
-                    <div className="text-[10px] text-[#6e5543] mt-0.5">Gồm VAT: {fmtVnd(pos.gross_sales_incl_tax)}</div>
+                    <div className="text-[10px] text-[#6e5543] mt-0.5">Gồm VAT (bill gốc): {fmtVnd(pos.gross_sales_incl_tax)}</div>
                   ) : null}
                 </div>
                 <div className="rounded-xl bg-[#FAF7F2] border border-[#EFE7DC] p-3">
@@ -204,39 +279,145 @@ export default function SlipDetailModal({
                 </div>
               </div>
 
+              {/* 1b. Consolidated / Merged Child Slips (with 1-click Unmerge!) */}
+              {mergedSlips.length > 0 && (
+                <div className="rounded-xl border border-purple-200 bg-purple-50/50 overflow-hidden">
+                  <div className="px-3.5 py-2.5 bg-purple-100/70 border-b border-purple-200 flex items-center justify-between gap-2">
+                    <span className="font-bold text-purple-950 flex items-center gap-1.5">
+                      <GitMerge className="w-4 h-4 text-purple-700" />
+                      Các Bill Đã Gộp Vào Đơn Này ({mergedSlips.length} bill phụ)
+                    </span>
+                    <span className="text-[10px] text-purple-800">Doanh thu & phí đã tự cộng dồn vào tổng phía trên</span>
+                  </div>
+                  <div className="divide-y divide-purple-200/70">
+                    {mergedSlips.map((ms: any) => (
+                      <div key={ms.slip_no} className="px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-mono font-bold text-purple-950">{ms.slip_no}</span>
+                            <span className="text-[10px] text-[#6e5543]">{ms.sales_day}</span>
+                            {Number(ms.net_sales_excl_tax || 0) === 0 && (Number(ms.delivery_cust_pay || 0) > 0 || Number(ms.install_cust_pay || 0) > 0) && (
+                              <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 text-[10px] font-semibold">Bill thu phí</span>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-[#3B281A] mt-0.5">
+                            Net Sales: <strong>{fmtVnd(ms.net_sales_excl_tax)}</strong> • Giao: <strong className="text-[#234E36]">{fmtVnd(ms.delivery_cust_pay)}</strong>
+                            {Number(ms.install_cust_pay || 0) > 0 ? ` • Lắp: ${fmtVnd(ms.install_cust_pay)}` : ''}
+                          </div>
+                          {(ms.items_summary || ms.note) && (
+                            <div className="text-[10px] text-[#6e5543] mt-0.5 truncate" title={ms.items_summary || ms.note}>
+                              {ms.items_summary || ''}{ms.items_summary && ms.note ? ' | ' : ''}{ms.note ? `Note: ${ms.note}` : ''}
+                            </div>
+                          )}
+                        </div>
+                        {canEdit && (
+                          <button
+                            type="button"
+                            disabled={unmergingSlip === ms.slip_no}
+                            onClick={() => handleUnmergeChild(ms.slip_no)}
+                            className="px-2.5 py-1.5 rounded-lg bg-white border border-purple-300 text-purple-900 text-[11px] font-semibold hover:bg-purple-100 cursor-pointer inline-flex items-center gap-1 shrink-0 disabled:opacity-50"
+                          >
+                            <Unlink className="w-3 h-3" /> {unmergingSlip === ms.slip_no ? 'Đang tách...' : 'Tách bill'}
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* 2. Customer & Dispatch Details */}
               {ord ? (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div className="rounded-xl border border-[#E6DDD1] p-4 space-y-2">
-                    <div className="font-bold text-[#3B281A] flex items-center gap-1.5 pb-1.5 border-b border-[#EFE7DC]">
-                      <User className="w-4 h-4 text-[#3B281A]" /> Thông Tin Khách Hàng & Sales
+                    <div className="font-bold text-[#3B281A] flex items-center justify-between gap-1.5 pb-1.5 border-b border-[#EFE7DC]">
+                      <span className="flex items-center gap-1.5">
+                        <User className="w-4 h-4 text-[#3B281A]" /> Thông Tin Khách Hàng & Sales
+                      </span>
+                      {canEdit && (
+                        <button
+                          type="button"
+                          onClick={() => setEditingCust(v => !v)}
+                          className="px-2 py-0.5 rounded border border-[#D6BCA5] bg-[#FAF7F2] text-[10px] font-semibold text-[#3B281A] hover:bg-[#EFE7DC] cursor-pointer inline-flex items-center gap-1"
+                        >
+                          <Edit3 className="w-3 h-3" /> {editingCust ? 'Hủy' : 'Sửa KH'}
+                        </button>
+                      )}
                     </div>
-                    <div className="space-y-1.5">
-                      <div className="flex items-start justify-between gap-2">
-                        <span className="text-[#6e5543]">Khách hàng:</span>
-                        <span className="font-bold text-[#3B281A] text-right">{ord.customer_name || '—'}</span>
+
+                    {editingCust ? (
+                      <div className="space-y-2 pt-1">
+                        <div>
+                          <label className="text-[10px] font-semibold text-[#6e5543]">Tên khách hàng</label>
+                          <input
+                            value={custForm.customer_name}
+                            onChange={e => setCustForm({ ...custForm, customer_name: e.target.value })}
+                            className="w-full mt-0.5 px-2.5 py-1.5 rounded-lg border border-[#D6BCA5] text-xs"
+                          />
+                        </div>
+                        <div className="grid grid-cols-2 gap-2">
+                          <div>
+                            <label className="text-[10px] font-semibold text-[#6e5543]">Số điện thoại</label>
+                            <input
+                              value={custForm.customer_phone}
+                              onChange={e => setCustForm({ ...custForm, customer_phone: e.target.value })}
+                              className="w-full mt-0.5 px-2.5 py-1.5 rounded-lg border border-[#D6BCA5] text-xs font-mono"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-[10px] font-semibold text-[#6e5543]">Khu vực</label>
+                            <input
+                              value={custForm.region}
+                              onChange={e => setCustForm({ ...custForm, region: e.target.value })}
+                              className="w-full mt-0.5 px-2.5 py-1.5 rounded-lg border border-[#D6BCA5] text-xs"
+                            />
+                          </div>
+                        </div>
+                        <div>
+                          <label className="text-[10px] font-semibold text-[#6e5543]">Địa chỉ giao hàng</label>
+                          <input
+                            value={custForm.address}
+                            onChange={e => setCustForm({ ...custForm, address: e.target.value })}
+                            className="w-full mt-0.5 px-2.5 py-1.5 rounded-lg border border-[#D6BCA5] text-xs"
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          disabled={savingCust}
+                          onClick={handleSaveCustomer}
+                          className="w-full py-1.5 rounded-lg bg-[#234E36] text-white text-xs font-semibold hover:bg-[#1a3c29] cursor-pointer inline-flex items-center justify-center gap-1 disabled:opacity-60"
+                        >
+                          <Check className="w-3.5 h-3.5" /> {savingCust ? 'Đang lưu...' : 'Lưu & Đồng bộ sang Biên bản'}
+                        </button>
                       </div>
-                      <div className="flex items-start justify-between gap-2">
-                        <span className="text-[#6e5543] flex items-center gap-1"><Phone className="w-3 h-3" /> SĐT:</span>
-                        <span className="font-mono text-[#3B281A]">{ord.customer_phone || '—'}</span>
+                    ) : (
+                      <div className="space-y-1.5">
+                        <div className="flex items-start justify-between gap-2">
+                          <span className="text-[#6e5543]">Khách hàng:</span>
+                          <span className="font-bold text-[#3B281A] text-right">{ord.customer_name || '—'}</span>
+                        </div>
+                        <div className="flex items-start justify-between gap-2">
+                          <span className="text-[#6e5543] flex items-center gap-1"><Phone className="w-3 h-3" /> SĐT:</span>
+                          <span className="font-mono text-[#3B281A]">{ord.customer_phone || '—'}</span>
+                        </div>
+                        <div className="flex items-start justify-between gap-2">
+                          <span className="text-[#6e5543] shrink-0 flex items-center gap-1"><MapPin className="w-3 h-3" /> Địa chỉ:</span>
+                          <span className="text-[#3B281A] text-right">{ord.address || '—'}</span>
+                        </div>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[#6e5543]">Khu vực / Khoảng cách:</span>
+                          <span className="text-[#3B281A] font-medium">
+                            {ord.region || tr?.area || 'HCM'}{ord.distance_km ? ` • ${ord.distance_km} km` : ''}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[#6e5543]">PIC Sales / Kênh:</span>
+                          <span className="text-[#3B281A]">
+                            {ord.pic_sales || '—'}{ord.channel ? ` • ${ord.channel}` : ''}
+                          </span>
+                        </div>
                       </div>
-                      <div className="flex items-start justify-between gap-2">
-                        <span className="text-[#6e5543] shrink-0 flex items-center gap-1"><MapPin className="w-3 h-3" /> Địa chỉ:</span>
-                        <span className="text-[#3B281A] text-right">{ord.address || '—'}</span>
-                      </div>
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-[#6e5543]">Khu vực / Khoảng cách:</span>
-                        <span className="text-[#3B281A] font-medium">
-                          {ord.region || tr?.area || 'HCM'}{ord.distance_km ? ` • ${ord.distance_km} km` : ''}
-                        </span>
-                      </div>
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-[#6e5543]">PIC Sales / Kênh:</span>
-                        <span className="text-[#3B281A]">
-                          {ord.pic_sales || '—'}{ord.channel ? ` • ${ord.channel}` : ''}
-                        </span>
-                      </div>
-                    </div>
+                    )}
                   </div>
 
                   <div className="rounded-xl border border-[#E6DDD1] p-4 space-y-2">
@@ -261,8 +442,8 @@ export default function SlipDetailModal({
                       <div className="flex items-start justify-between gap-2">
                         <span className="text-[#6e5543] shrink-0 flex items-center gap-1"><Wrench className="w-3 h-3" /> KTV phụ trách:</span>
                         <div className="text-right">
-                          {isCustomerSelfInstall ? (
-                            <span className="text-[#6e5543] italic">Không cần gán (KH tự lắp đặt)</span>
+                          {isNoKtvInstall ? (
+                            <span className="text-[#6e5543] italic">Không cần gán ({noKtvLabel})</span>
                           ) : ktvList.length > 0 ? (
                             <div className="flex flex-wrap justify-end gap-1">
                               {ktvList.map((k, i) => (
@@ -279,8 +460,8 @@ export default function SlipDetailModal({
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-[#6e5543]">Lắp đặt (BM-01):</span>
                         <span className="font-medium text-[#3B281A]">
-                          {isCustomerSelfInstall
-                            ? 'Khách hàng tự lắp đặt'
+                          {isNoKtvInstall
+                            ? noKtvLabel
                             : (ord.install_status || (ord.require_install ? 'Yêu cầu lắp đặt' : 'Không yêu cầu'))}
                         </span>
                       </div>
@@ -288,23 +469,47 @@ export default function SlipDetailModal({
                   </div>
                 </div>
               ) : (
-                <div className="rounded-xl border border-dashed border-[#D6BCA5] bg-[#FAF7F2] p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div>
-                    <div className="font-bold text-[#3B281A]">Hóa đơn này chưa có hồ sơ bên Điều phối & BM-01</div>
-                    <div className="text-[11px] text-[#6e5543] mt-0.5">
-                      Khu vực: <strong>{tr?.area || 'HCM'}</strong> • 3PL: <strong>{carrierLabel}</strong>
-                      {tr?.note ? ` • Ghi chú: ${tr.note}` : ''}
+                <div className="rounded-xl border border-dashed border-[#D6BCA5] bg-[#FAF7F2] p-4 space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div>
+                      <div className="font-bold text-[#3B281A]">Hóa đơn này chưa có hồ sơ bên Điều phối & BM-01</div>
+                      <div className="text-[11px] text-[#6e5543] mt-0.5">
+                        Khu vực: <strong>{tr?.area || 'HCM'}</strong> • 3PL: <strong>{carrierLabel}</strong>
+                        {tr?.note ? ` • Ghi chú: ${tr.note}` : ''}
+                      </div>
                     </div>
+                    {canEdit && (
+                      <button
+                        type="button"
+                        disabled={pushing}
+                        onClick={handlePush}
+                        className="px-3.5 py-2 rounded-lg bg-[#224B85] text-white text-xs font-semibold hover:bg-[#1a3a68] cursor-pointer shrink-0 disabled:opacity-60"
+                      >
+                        {pushing ? 'Đang đẩy...' : '+ Đẩy sang Điều phối & BM-01'}
+                      </button>
+                    )}
                   </div>
                   {canEdit && (
-                    <button
-                      type="button"
-                      disabled={pushing}
-                      onClick={handlePush}
-                      className="px-3.5 py-2 rounded-lg bg-[#224B85] text-white text-xs font-semibold hover:bg-[#1a3a68] cursor-pointer shrink-0 disabled:opacity-60"
-                    >
-                      {pushing ? 'Đang đẩy...' : '+ Đẩy sang Điều phối & BM-01'}
-                    </button>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-2 border-t border-[#E6DDD1]">
+                      <input
+                        value={custForm.customer_name}
+                        onChange={e => setCustForm({ ...custForm, customer_name: e.target.value })}
+                        placeholder="Tên khách hàng (tùy chọn)..."
+                        className="px-2.5 py-1.5 rounded-lg border border-[#D6BCA5] bg-white text-xs"
+                      />
+                      <input
+                        value={custForm.customer_phone}
+                        onChange={e => setCustForm({ ...custForm, customer_phone: e.target.value })}
+                        placeholder="SĐT khách hàng..."
+                        className="px-2.5 py-1.5 rounded-lg border border-[#D6BCA5] bg-white text-xs font-mono"
+                      />
+                      <input
+                        value={custForm.address}
+                        onChange={e => setCustForm({ ...custForm, address: e.target.value })}
+                        placeholder="Địa chỉ giao hàng..."
+                        className="px-2.5 py-1.5 rounded-lg border border-[#D6BCA5] bg-white text-xs"
+                      />
+                    </div>
                   )}
                 </div>
               )}
@@ -342,7 +547,14 @@ export default function SlipDetailModal({
                         {items.map((it: any) => (
                           <tr key={it.id} className="hover:bg-[#FAF7F2]">
                             <td className="py-2 px-3 font-mono text-[11px] text-[#6e5543] whitespace-nowrap">{it.barcode || '—'}</td>
-                            <td className="py-2 px-3 font-medium text-[#3B281A]">{it.product_name}</td>
+                            <td className="py-2 px-3 font-medium text-[#3B281A]">
+                              {it.product_name}
+                              {it.orig_invoice && it.orig_invoice !== slipNo && (
+                                <span className="ml-1.5 px-1.5 py-0.5 rounded bg-purple-50 border border-purple-200 text-purple-800 font-mono text-[10px]">
+                                  Bill {it.orig_invoice}
+                                </span>
+                              )}
+                            </td>
                             <td className="py-2 px-2 text-center font-bold text-[#3B281A]">{it.qty} {it.unit || ''}</td>
                             <td className="py-2 px-3 whitespace-nowrap">
                               <span className={`px-1.5 py-0.5 rounded border text-[10px] font-bold ${whBadgeClass(it.source_warehouse || ord?.source_warehouse || '')}`}>
@@ -367,7 +579,7 @@ export default function SlipDetailModal({
                 )}
               </div>
 
-              {/* 4. Linked Documents: Handovers (BM-01/BM-05), Warehouse Slips (XK/NK), Warranty (BM-02) */}
+              {/* 4. Linked Documents */}
               {(handovers.length > 0 || slips.length > 0 || tickets.length > 0) && (
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   {handovers.length > 0 && (

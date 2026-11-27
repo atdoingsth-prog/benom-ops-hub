@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { BookOpen, Camera, CheckCircle2, Eraser, MapPin, Phone, Printer, Star, Trash2, X } from 'lucide-react';
+import { BookOpen, Camera, CheckCircle2, Edit3, Eraser, MapPin, Phone, Printer, Star, Trash2, X } from 'lucide-react';
 import { apiGet, apiSend } from '../api';
 import { compressImageFile } from '../utils/imageCompress';
 import KtvListPicker, { KtvEntry, StaffItem } from './KtvListPicker';
@@ -14,6 +14,11 @@ interface Props {
   onPrint: (h: any) => void;
 }
 
+const NO_KTV_MODES = ['Khách hàng tự lắp đặt', 'Sản phẩm không cần lắp đặt'];
+function isNoKtvMode(mode: string) {
+  return NO_KTV_MODES.includes(String(mode || '').trim());
+}
+
 function initKtvsFromHandover(h: any): KtvEntry[] {
   if (Array.isArray(h.ktvs) && h.ktvs.length > 0) {
     return h.ktvs.map((k: any) => ({ code: k.code || '', name: k.name || '' })).filter((k: KtvEntry) => k.name || k.code);
@@ -25,12 +30,15 @@ function initKtvsFromHandover(h: any): KtvEntry[] {
 }
 
 export default function HandoverModal({ handover, staffList, readOnly = false, onStaffAdded, onClose, onSaved, onPrint }: Props) {
-  const initialInstallMode = handover.install_mode || (handover.doc_type === 'BM-05' ? 'Khách hàng tự lắp đặt' : 'Kỹ thuật Benom lắp đặt');
+  const initialInstallMode = handover.install_mode || (handover.doc_type === 'BM-05' ? 'Sản phẩm không cần lắp đặt' : 'Kỹ thuật Benom lắp đặt');
   const [staff, setStaff] = useState<StaffItem[]>(staffList || []);
   const [ktvs, setKtvs] = useState<KtvEntry[]>(() =>
-    initialInstallMode === 'Khách hàng tự lắp đặt' ? [] : initKtvsFromHandover(handover)
+    isNoKtvMode(initialInstallMode) ? [] : initKtvsFromHandover(handover)
   );
   const [form, setForm] = useState({
+    customer_name: handover.customer_name || '',
+    customer_phone: handover.customer_phone || '',
+    address: handover.address || '',
     handover_date: handover.handover_date || new Date().toISOString().slice(0, 10),
     driver_name: handover.driver_name || '',
     driver_phone: handover.driver_phone || '',
@@ -45,6 +53,12 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
     csat_comment: handover.csat_comment || '',
     status: handover.status || 'Pending',
   });
+  const needsCustomerFill = !readOnly && (
+    /^Khách POS\s/i.test(String(handover.customer_name || '').trim()) ||
+    !String(handover.customer_name || '').trim() ||
+    (!String(handover.customer_phone || '').trim() && !String(handover.address || '').trim())
+  );
+  const [editingCustomer, setEditingCustomer] = useState(needsCustomerFill);
   const [photos, setPhotos] = useState<string[]>(() => {
     try { return JSON.parse(handover.photos_json || '[]'); } catch { return []; }
   });
@@ -177,13 +191,13 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
     }
   };
 
-  const isCustomerSelfInstall = form.install_mode === 'Khách hàng tự lắp đặt';
+  const isNoKtvInstall = isNoKtvMode(form.install_mode);
 
   const handleSave = async (markCompleted: boolean) => {
     setSaving(true);
     try {
       const sigData = hasSig && canvasRef.current ? canvasRef.current.toDataURL('image/png') : '';
-      const effectiveKtvs = isCustomerSelfInstall ? [] : ktvs;
+      const effectiveKtvs = isNoKtvInstall ? [] : ktvs;
       const payload = {
         ...form,
         ktvs: effectiveKtvs,
@@ -209,17 +223,24 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
     <div className="fixed inset-0 z-40 bg-black/50 flex items-center justify-center p-2 sm:p-4 overflow-y-auto">
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[94vh] flex flex-col overflow-hidden border border-[#E6DDD1]">
         {/* Header */}
-        <div className="px-5 py-4 bg-[#3B281A] text-[#F8F4EC] flex items-center justify-between">
-          <div>
+        <div className="px-5 py-4 bg-[#3B281A] text-[#F8F4EC] flex items-center justify-between gap-2">
+          <div className="min-w-0">
             <div className="text-xs uppercase tracking-wider text-[#D6BCA5]">
               {handover.doc_type === 'BM-05' ? 'Phiếu Giao Hàng (BM-05)' : 'Biên Bản Giao Nhận & Lắp Đặt (BM-01)'}
             </div>
-            <div className="text-lg font-bold">{handover.doc_no} • ĐH {handover.invoice_no}</div>
+            <div className="text-lg font-bold flex flex-wrap items-center gap-2">
+              <span>{handover.doc_no} • ĐH {handover.invoice_no}</span>
+              {handover.merged_invoices && (
+                <span className="px-2 py-0.5 rounded-full bg-purple-400/25 text-purple-100 text-[11px] font-semibold">
+                  Gộp: {handover.merged_invoices}
+                </span>
+              )}
+            </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0">
             <button
               onClick={() => {
-                const printKtvs = isCustomerSelfInstall ? [] : ktvs;
+                const printKtvs = isNoKtvInstall ? [] : ktvs;
                 onPrint({
                   ...handover,
                   ...form,
@@ -249,25 +270,40 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
             </div>
           )}
 
-          {/* Customer summary + 1-tap Call/Maps & Quick HDLR/HDBQ (TASK-14) */}
+          {/* Customer summary + Editable Customer Info + 1-tap Call/Maps & Quick HDLR/HDBQ */}
           <div className="bg-[#F8F4EC] p-3.5 rounded-xl border border-[#E6DDD1] space-y-2.5">
             <div className="flex flex-wrap items-start justify-between gap-2">
               <div className="min-w-0 flex-1">
-                <div className="font-semibold text-[#3B281A]">{handover.customer_name} — {handover.customer_phone}</div>
-                <div className="text-xs text-[#6e5543] mt-0.5">{handover.address}</div>
+                <div className="font-semibold text-[#3B281A]">
+                  {form.customer_name || 'Chưa có tên khách'} {form.customer_phone ? `— ${form.customer_phone}` : ''}
+                </div>
+                <div className="text-xs text-[#6e5543] mt-0.5">{form.address || 'Chưa có địa chỉ giao hàng'}</div>
               </div>
-              <div className="flex items-center gap-1.5 shrink-0">
-                {handover.customer_phone && (
+              <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                {!readOnly && (
+                  <button
+                    type="button"
+                    onClick={() => setEditingCustomer(v => !v)}
+                    className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold flex items-center gap-1 cursor-pointer border ${
+                      editingCustomer
+                        ? 'bg-[#3B281A] text-white border-[#3B281A]'
+                        : 'bg-white text-[#3B281A] border-[#D6BCA5] hover:bg-[#FAF7F2]'
+                    }`}
+                  >
+                    <Edit3 className="w-3 h-3" /> {editingCustomer ? 'Xong sửa KH' : 'Sửa thông tin KH'}
+                  </button>
+                )}
+                {form.customer_phone && (
                   <a
-                    href={`tel:${String(handover.customer_phone).replace(/\s+/g, '')}`}
+                    href={`tel:${String(form.customer_phone).replace(/\s+/g, '')}`}
                     className="px-2.5 py-1.5 rounded-lg bg-[#234E36] text-white text-[11px] font-semibold flex items-center gap-1 hover:bg-[#1b3d2a]"
                   >
                     <Phone className="w-3 h-3" /> Gọi khách
                   </a>
                 )}
-                {handover.address && (
+                {form.address && (
                   <a
-                    href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(handover.address)}`}
+                    href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(form.address)}`}
                     target="_blank"
                     rel="noreferrer"
                     className="px-2.5 py-1.5 rounded-lg bg-white border border-[#D6BCA5] text-[#224B85] text-[11px] font-semibold flex items-center gap-1 hover:bg-blue-50"
@@ -278,6 +314,38 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
               </div>
             </div>
 
+            {!readOnly && editingCustomer && (
+              <div className="pt-2.5 border-t border-[#E6DDD1] grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
+                <div>
+                  <label className="block text-[11px] font-semibold text-[#6e5543] mb-1">Tên khách hàng</label>
+                  <input
+                    value={form.customer_name}
+                    onChange={e => setForm({ ...form, customer_name: e.target.value })}
+                    placeholder="VD: Chị Lan / Anh Minh..."
+                    className="w-full px-2.5 py-1.5 rounded-lg border border-[#D6BCA5] bg-white text-xs text-[#3B281A]"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-[#6e5543] mb-1">Số điện thoại</label>
+                  <input
+                    value={form.customer_phone}
+                    onChange={e => setForm({ ...form, customer_phone: e.target.value })}
+                    placeholder="VD: 0909 123 456"
+                    className="w-full px-2.5 py-1.5 rounded-lg border border-[#D6BCA5] bg-white text-xs text-[#3B281A] font-mono"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="block text-[11px] font-semibold text-[#6e5543] mb-1">Địa chỉ giao hàng (Tự động đồng bộ về Đơn hàng gốc)</label>
+                  <input
+                    value={form.address}
+                    onChange={e => setForm({ ...form, address: e.target.value })}
+                    placeholder="Nhập địa chỉ giao hàng chi tiết..."
+                    className="w-full px-2.5 py-1.5 rounded-lg border border-[#D6BCA5] bg-white text-xs text-[#3B281A]"
+                  />
+                </div>
+              </div>
+            )}
+
             {handover.items?.length > 0 && (
               <div className="pt-2 border-t border-[#E6DDD1] space-y-1 text-xs">
                 {handover.items.map((it: any, i: number) => (
@@ -285,6 +353,11 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
                     <span>
                       {it.source_warehouse ? <strong className="font-mono text-[10px] px-1 py-0.5 mr-1 rounded bg-white border border-[#D6BCA5]">{it.source_warehouse}</strong> : '• '}
                       {it.product_name}
+                      {it.orig_invoice && it.orig_invoice !== handover.invoice_no ? (
+                        <span className="ml-1.5 px-1.5 py-0.5 rounded bg-purple-50 border border-purple-200 text-purple-800 font-mono text-[10px] font-semibold">
+                          Bill {it.orig_invoice}
+                        </span>
+                      ) : null}
                       {it.moving_no ? <span className="text-[10px] text-[#6e5543] ml-1">(Moving {it.moving_no})</span> : null}
                     </span>
                     <span className="font-semibold shrink-0">SL: {it.qty}</span>
@@ -384,28 +457,31 @@ export default function HandoverModal({ handover, staffList, readOnly = false, o
                 onChange={e => {
                   const nextMode = e.target.value;
                   setForm({ ...form, install_mode: nextMode });
-                  if (nextMode === 'Khách hàng tự lắp đặt') setKtvs([]);
+                  if (isNoKtvMode(nextMode)) setKtvs([]);
                 }}
                 className="w-full px-3 py-2 rounded-lg border border-[#D6BCA5] text-sm bg-white disabled:bg-gray-50"
               >
-                <option value="Kỹ thuật Benom lắp đặt">Kỹ thuật Benom lắp đặt</option>
+                <option value="Sản phẩm không cần lắp đặt">Sản phẩm không cần lắp đặt</option>
                 <option value="Khách hàng tự lắp đặt">Khách hàng tự lắp đặt</option>
+                <option value="Kỹ thuật Benom lắp đặt">Kỹ thuật Benom lắp đặt</option>
                 <option value="Hẹn kỹ thuật Benom lắp sau">Hẹn kỹ thuật Benom lắp sau (Tự tạo BM-01)</option>
               </select>
             </div>
           </div>
 
-          {/* Auto-expanding KTV Dropdown Picker (locked when customer self-installs) */}
+          {/* Auto-expanding KTV Dropdown Picker (locked when no install required or customer self-installs) */}
           <KtvListPicker
             staff={staff}
-            value={isCustomerSelfInstall ? [] : ktvs}
-            disabled={readOnly || isCustomerSelfInstall}
+            value={isNoKtvInstall ? [] : ktvs}
+            disabled={readOnly || isNoKtvInstall}
             disabledReason={
-              isCustomerSelfInstall
-                ? 'Khách hàng tự lắp đặt — Không cần gán Kỹ thuật viên và không được chọn danh sách KTV tham gia.'
-                : 'Chế độ chỉ xem — Không thể chỉnh sửa danh sách Kỹ thuật viên.'
+              form.install_mode === 'Sản phẩm không cần lắp đặt'
+                ? 'Sản phẩm không cần lắp đặt — Không cần gán Kỹ thuật viên và không được chọn danh sách KTV tham gia.'
+                : form.install_mode === 'Khách hàng tự lắp đặt'
+                  ? 'Khách hàng tự lắp đặt — Không cần gán Kỹ thuật viên và không được chọn danh sách KTV tham gia.'
+                  : 'Chế độ chỉ xem — Không thể chỉnh sửa danh sách Kỹ thuật viên.'
             }
-            onChange={v => !readOnly && !isCustomerSelfInstall && setKtvs(v)}
+            onChange={v => !readOnly && !isNoKtvInstall && setKtvs(v)}
             onStaffAdded={s => {
               setStaff(prev => [...prev.filter(x => x.emp_code !== s.emp_code), s].sort((a, b) => a.emp_code.localeCompare(b.emp_code)));
               if (onStaffAdded) onStaffAdded(s);

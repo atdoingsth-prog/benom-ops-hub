@@ -1,6 +1,6 @@
 import React, { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import {
-  ArrowUpRight, BarChart3, Check, Download, Plus, Search, Trash2, Truck, UploadCloud, X
+  ArrowUpRight, BarChart3, Check, Download, GitMerge, Plus, Search, Sparkles, Trash2, Truck, UploadCloud, X
 } from 'lucide-react';
 import {
   Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis
@@ -8,6 +8,7 @@ import {
 import { apiDownload, apiGet, apiSend, apiUpload, AuthUser, fmtMonth, fmtVnd } from '../api';
 
 const SlipDetailModal = lazy(() => import('../components/SlipDetailModal'));
+const MergeModal = lazy(() => import('../components/MergeModal'));
 
 interface Props {
   user: AuthUser;
@@ -21,6 +22,8 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
   const canEdit = user.role === 'ADMIN' || user.role === 'EDITOR';
   const [pushingSlip, setPushingSlip] = useState<string | null>(null);
   const [detailSlipNo, setDetailSlipNo] = useState<string | null>(null);
+  const [mergeModal, setMergeModal] = useState<{ open: boolean; masterKey?: string | null; childKeys?: string[] }>({ open: false });
+  const [quickMergingKey, setQuickMergingKey] = useState<string | null>(null);
   const [month, setMonthState] = useState<string>(() => localStorage.getItem('benom_3pl_month') || 'LATEST');
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
@@ -192,6 +195,24 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
     }
   };
 
+  const quickAcceptSuggestion = async (s: { master_slip_no: string; child_slip_no: string }) => {
+    const key = `${s.master_slip_no}<-${s.child_slip_no}`;
+    setQuickMergingKey(key);
+    try {
+      await apiSend('/api/delivery-tracking/merge', 'POST', {
+        master_slip_no: s.master_slip_no,
+        child_slip_nos: [s.child_slip_no],
+        also_merge_orders: true,
+      });
+      onToast(`Đã gộp bill ${s.child_slip_no} vào đơn chính ${s.master_slip_no}!`);
+      await load(month, true);
+    } catch (e: any) {
+      onToast(e.message, 'err');
+    } finally {
+      setQuickMergingKey(null);
+    }
+  };
+
   const filteredRows = useMemo(() => (data?.rows || []).filter((r: any) => {
     if (!searchQ.trim()) return true;
     const q = searchQ.toLowerCase();
@@ -199,7 +220,9 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
       String(r.slip_no).toLowerCase().includes(q) ||
       String(r.carrier_3pl || '').toLowerCase().includes(q) ||
       String(r.items_summary || '').toLowerCase().includes(q) ||
-      String(r.note || '').toLowerCase().includes(q)
+      String(r.note || '').toLowerCase().includes(q) ||
+      String(r.linked_customer_name || '').toLowerCase().includes(q) ||
+      (r.merged_slips || []).some((m: any) => String(m.slip_no).toLowerCase().includes(q))
     );
   }), [data?.rows, searchQ]);
 
@@ -243,6 +266,14 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
                 {uploading ? 'Đang nạp CSV...' : 'Nạp transaction_detail CSV'}
                 <input type="file" accept=".csv" className="hidden" onChange={handleUploadPos} />
               </label>
+
+              <button
+                onClick={() => setMergeModal({ open: true, masterKey: null, childKeys: [] })}
+                className="px-3 py-2 rounded-lg border border-purple-700 text-purple-900 bg-purple-50 text-xs font-semibold flex items-center gap-1 hover:bg-purple-100 cursor-pointer"
+                title="Gộp bill thu phí ship / bill mua thêm giao chung 1 chuyến"
+              >
+                <GitMerge className="w-4 h-4" /> Gộp đơn
+              </button>
 
               <button
                 onClick={() => { setNewSlip({ ...newSlip, sales_month: month === 'ALL' ? (data?.month || '2026-11') : month }); setShowAdd(true); }}
@@ -381,6 +412,51 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
             </div>
           </div>
 
+          {/* Smart Auto-Detected Merge Suggestions */}
+          {canEdit && Array.isArray(data.merge_suggestions) && data.merge_suggestions.length > 0 && (
+            <div className="bg-purple-50/70 rounded-xl border border-purple-200 p-4 space-y-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="font-bold text-xs text-purple-950 flex items-center gap-1.5">
+                  <Sparkles className="w-4 h-4 text-purple-700" />
+                  Gợi ý gộp đơn tự động ({data.merge_suggestions.length} cặp phát hiện theo Ghi chú / Mã vận đơn)
+                </div>
+                <span className="text-[11px] text-purple-800">Gộp để cộng dồn phí ship/lắp vào 1 chuyến duy nhất (có thể tách lại bất cứ lúc nào)</span>
+              </div>
+              <div className="space-y-1.5">
+                {data.merge_suggestions.slice(0, 6).map((s: any) => {
+                  const sKey = `${s.master_slip_no}<-${s.child_slip_no}`;
+                  return (
+                    <div key={sKey} className="bg-white rounded-lg border border-purple-200/80 px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+                      <div className="min-w-0 flex-1">
+                        <span className="font-mono font-bold text-purple-900">{s.child_slip_no}</span>
+                        <span className="mx-1.5 text-[#6e5543]">→ gộp vào →</span>
+                        <span className="font-mono font-bold text-[#3B281A]">{s.master_slip_no}</span>
+                        <span className="ml-2 text-[11px] text-[#6e5543]">({s.reason})</span>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => setMergeModal({ open: true, masterKey: s.master_slip_no, childKeys: [s.child_slip_no] })}
+                          className="px-2.5 py-1 rounded-lg border border-purple-300 text-purple-900 text-[11px] font-semibold hover:bg-purple-50 cursor-pointer"
+                        >
+                          Xem trước
+                        </button>
+                        <button
+                          type="button"
+                          disabled={quickMergingKey === sKey}
+                          onClick={() => quickAcceptSuggestion(s)}
+                          className="px-2.5 py-1 rounded-lg bg-purple-700 text-white text-[11px] font-semibold hover:bg-purple-800 cursor-pointer inline-flex items-center gap-1 disabled:opacity-50"
+                        >
+                          <GitMerge className="w-3 h-3" /> {quickMergingKey === sKey ? 'Đang gộp...' : 'Gộp ngay'}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* Inline-Editable Slip Detail Table */}
           <div className="bg-white rounded-xl border border-[#E6DDD1] overflow-hidden">
             <div className="p-4 bg-[#F8F4EC] border-b border-[#E6DDD1] flex flex-wrap items-center justify-between gap-3">
@@ -419,17 +495,32 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
                     const ed = edits[r.slip_no] || { carrier_3pl: r.carrier_3pl, fee_3pl: r.fee_3pl, area: r.area, note: r.note, dirty: false };
                     return (
                       <tr key={r.slip_no} className={`hover:bg-[#FAF7F2] ${ed.dirty ? 'bg-amber-50/40' : ''}`}>
-                        <td className="py-2 px-3 max-w-[230px]">
-                          <button
-                            type="button"
-                            onClick={() => setDetailSlipNo(r.slip_no)}
-                            className="font-mono font-bold text-[#224B85] hover:text-[#3B281A] hover:underline cursor-pointer text-left inline-flex items-center gap-1"
-                            title="Nhấn để xem thông tin chi tiết đơn hàng"
-                          >
-                            {r.slip_no}
-                            <ArrowUpRight className="w-3 h-3 opacity-70 shrink-0" />
-                          </button>
-                          <div className="text-[10px] text-[#6e5543]">{r.sales_day}</div>
+                        <td className="py-2 px-3 max-w-[240px]">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => setDetailSlipNo(r.slip_no)}
+                              className="font-mono font-bold text-[#224B85] hover:text-[#3B281A] hover:underline cursor-pointer text-left inline-flex items-center gap-1"
+                              title="Nhấn để xem thông tin chi tiết đơn hàng"
+                            >
+                              {r.slip_no}
+                              <ArrowUpRight className="w-3 h-3 opacity-70 shrink-0" />
+                            </button>
+                            {Array.isArray(r.merged_slips) && r.merged_slips.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => setDetailSlipNo(r.slip_no)}
+                                className="px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-900 text-[10px] font-bold inline-flex items-center gap-0.5 hover:bg-purple-200 cursor-pointer"
+                                title={`Đã gộp: ${r.merged_slips.map((m: any) => m.slip_no).join(', ')} — Nhấn để xem hoặc tách`}
+                              >
+                                <GitMerge className="w-2.5 h-2.5" /> +{r.merged_slips.length}
+                              </button>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-[#6e5543]">
+                            {r.sales_day}
+                            {r.linked_customer_name && !/^Khách POS\s/i.test(r.linked_customer_name) ? ` • ${r.linked_customer_name}` : ''}
+                          </div>
                           {r.items_summary && <div className="text-[10px] text-[#6e5543] truncate" title={r.items_summary}>{r.items_summary}</div>}
                         </td>
                         <td className="py-2 px-2 text-right whitespace-nowrap text-[#234E36] font-medium">{fmtVnd(r.delivery_cust_pay)}</td>
@@ -558,7 +649,23 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
             canEdit={canEdit}
             onClose={() => setDetailSlipNo(null)}
             onPushToDispatch={pushToDispatch}
+            onChanged={() => load(month, true)}
             onNavigateOrders={onNavigate ? () => onNavigate('orders') : undefined}
+            onToast={onToast}
+          />
+        </Suspense>
+      )}
+
+      {/* Merge Slips Modal (lazy-loaded on-demand) */}
+      {mergeModal.open && (
+        <Suspense fallback={null}>
+          <MergeModal
+            mode="3pl"
+            rows={data?.rows || []}
+            initialMasterKey={mergeModal.masterKey}
+            initialChildKeys={mergeModal.childKeys}
+            onClose={() => setMergeModal({ open: false })}
+            onMerged={() => load(month, true)}
             onToast={onToast}
           />
         </Suspense>

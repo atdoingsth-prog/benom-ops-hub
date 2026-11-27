@@ -93,13 +93,18 @@ export default function PrintModal({ doc, onClose }: Props) {
                 <div><strong>Khách hàng:</strong> {doc.data.customer_name}</div>
                 <div><strong>Số điện thoại:</strong> {doc.data.customer_phone}</div>
                 <div className="col-span-2"><strong>Địa chỉ giao hàng:</strong> {doc.data.address}</div>
-                <div><strong>Mã hóa đơn (POS):</strong> {doc.data.invoice_no}</div>
+                <div>
+                  <strong>Mã hóa đơn (POS):</strong> {doc.data.invoice_no}
+                  {doc.data.merged_invoices ? <span className="text-[11px] text-[#6e5543]"> (+ {doc.data.merged_invoices})</span> : null}
+                </div>
                 <div><strong>Hình thức:</strong> {doc.data.install_mode}</div>
                 <div>
                   <strong>KTV / Tài xế:</strong>{' '}
-                  {Array.isArray(doc.data.ktvs) && doc.data.ktvs.length > 0
-                    ? doc.data.ktvs.map((k: any) => (k.code ? `[${k.code}] ${k.name}` : k.name)).join(', ')
-                    : ([doc.data.ktv1_name, doc.data.ktv2_name, doc.data.driver_name].filter(Boolean).join(', ') || '—')}
+                  {doc.data.install_mode === 'Khách hàng tự lắp đặt' || doc.data.install_mode === 'Sản phẩm không cần lắp đặt'
+                    ? (doc.data.driver_name || 'Không yêu cầu KTV')
+                    : Array.isArray(doc.data.ktvs) && doc.data.ktvs.length > 0
+                      ? doc.data.ktvs.map((k: any) => (k.code ? `[${k.code}] ${k.name}` : k.name)).join(', ')
+                      : ([doc.data.ktv1_name, doc.data.ktv2_name, doc.data.driver_name].filter(Boolean).join(', ') || '—')}
                 </div>
                 <div><strong>Đơn vị vận chuyển:</strong> {doc.data.carrier || 'benom'}</div>
               </div>
@@ -123,6 +128,9 @@ export default function PrintModal({ doc, onClose }: Props) {
                       <td className="border border-[#cbb7a2] p-2 font-mono">{it.barcode}</td>
                       <td className="border border-[#cbb7a2] p-2">
                         {it.product_name}
+                        {it.orig_invoice && it.orig_invoice !== doc.data.invoice_no ? (
+                          <span className="text-[10px] text-gray-500 ml-1">[Bill {it.orig_invoice}]</span>
+                        ) : null}
                         {it.moving_no ? <span className="text-[10px] text-gray-500 ml-1">(Moving: {it.moving_no})</span> : null}
                       </td>
                       <td className="border border-[#cbb7a2] p-2 text-center font-mono font-semibold">{it.source_warehouse || doc.data.warehouse_code || '9005'}</td>

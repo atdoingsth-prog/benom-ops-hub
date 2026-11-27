@@ -160,6 +160,8 @@ const SCHEMA_STATEMENTS = [
     status TEXT DEFAULT 'New',
     install_status TEXT DEFAULT '',
     notes TEXT DEFAULT '',
+    merged_into_order_id INTEGER DEFAULT NULL,
+    merged_invoices TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now', '+7 hours'))
   )`,
   `CREATE TABLE IF NOT EXISTS order_items (
@@ -176,6 +178,8 @@ const SCHEMA_STATEMENTS = [
     p_installation_unit REAL DEFAULT 0,
     source_warehouse TEXT DEFAULT '',
     moving_no TEXT DEFAULT '',
+    orig_order_id INTEGER DEFAULT NULL,
+    orig_invoice TEXT DEFAULT '',
     FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
   )`,
   `CREATE TABLE IF NOT EXISTS warehouse_slips (
@@ -357,6 +361,7 @@ const SCHEMA_STATEMENTS = [
     area TEXT DEFAULT 'HCM',
     note TEXT DEFAULT '',
     items_summary TEXT DEFAULT '',
+    merged_into TEXT DEFAULT '',
     updated_at TEXT DEFAULT (datetime('now', '+7 hours'))
   )`,
   `CREATE INDEX IF NOT EXISTS idx_delivery_tracking_month ON delivery_tracking(sales_month)`,
@@ -445,6 +450,7 @@ const SCHEMA_STATEMENTS = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_logs(entity_type)`,
+  `CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action, id DESC)`,
   `CREATE TABLE IF NOT EXISTS spare_parts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     code TEXT UNIQUE NOT NULL,
@@ -502,8 +508,17 @@ export async function initDb() {
     `ALTER TABLE product_guides ADD COLUMN source_url TEXT DEFAULT ''`,
     `ALTER TABLE product_guides ADD COLUMN barcodes_json TEXT DEFAULT '[]'`,
     `ALTER TABLE product_guides ADD COLUMN images_json TEXT DEFAULT '[]'`,
+    `ALTER TABLE orders ADD COLUMN merged_into_order_id INTEGER DEFAULT NULL`,
+    `ALTER TABLE orders ADD COLUMN merged_invoices TEXT DEFAULT ''`,
+    `ALTER TABLE order_items ADD COLUMN orig_order_id INTEGER DEFAULT NULL`,
+    `ALTER TABLE order_items ADD COLUMN orig_invoice TEXT DEFAULT ''`,
+    `ALTER TABLE delivery_tracking ADD COLUMN merged_into TEXT DEFAULT ''`,
   ].map(alterSql => dbRun(alterSql).catch(() => { /* column already exists */ })));
-  await dbRun(`CREATE INDEX IF NOT EXISTS idx_product_guides_handle ON product_guides(handle)`).catch(() => {});
+  await Promise.all([
+    `CREATE INDEX IF NOT EXISTS idx_product_guides_handle ON product_guides(handle)`,
+    `CREATE INDEX IF NOT EXISTS idx_orders_merged ON orders(merged_into_order_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_delivery_tracking_merged ON delivery_tracking(merged_into)`,
+  ].map(idxSql => dbRun(idxSql).catch(() => {})));
 
   // Check seed status in 1 parallel batch instead of 4 sequential round-trips
   const [userCount, whCount, stCount, spCount] = await Promise.all([
