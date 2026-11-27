@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowUpRight, BarChart3, Check, Download, Plus, Search, Trash2, Truck, UploadCloud, X
 } from 'lucide-react';
@@ -24,6 +24,7 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
   const [uploading, setUploading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [searchQ, setSearchQ] = useState('');
+  const [visibleLimit, setVisibleLimit] = useState(50);
   const [edits, setEdits] = useState<Record<string, any>>({});
 
   const setMonth = (m: string) => {
@@ -49,11 +50,12 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
     items_summary: '',
   });
 
-  const load = async (m = month) => {
+  const load = async (m = month, force = false) => {
     setLoading(true);
     try {
-      const res = await apiGet(`/api/delivery-tracking?month=${encodeURIComponent(m)}`);
+      const res = await apiGet(`/api/delivery-tracking?month=${encodeURIComponent(m)}`, { cacheMs: 25000, force });
       setData(res);
+      setVisibleLimit(50);
       // If requested LATEST (or resolved month differs from 'LATEST'), sync dropdown to exact resolved month (e.g. 2026-11)
       if (m === 'LATEST' && res.month && res.month !== 'LATEST') {
         setMonthState(res.month);
@@ -187,7 +189,7 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
     }
   };
 
-  const filteredRows = (data?.rows || []).filter((r: any) => {
+  const filteredRows = useMemo(() => (data?.rows || []).filter((r: any) => {
     if (!searchQ.trim()) return true;
     const q = searchQ.toLowerCase();
     return (
@@ -196,15 +198,15 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
       String(r.items_summary || '').toLowerCase().includes(q) ||
       String(r.note || '').toLowerCase().includes(q)
     );
-  });
+  }), [data?.rows, searchQ]);
 
-  const chartData = (data?.pivot || [])
+  const chartData = useMemo(() => (data?.pivot || [])
     .filter((p: any) => p.sum_fee > 0 || p.sum_delivery_cust > 0)
     .map((p: any) => ({
       name: p.carrier_3pl,
       fee: Math.round(p.sum_fee / 1000),
       cust: Math.round(p.sum_delivery_cust / 1000),
-    }));
+    })), [data?.pivot]);
 
   const gt = data?.grand_total || { slip_count: 0, sum_fee: 0, sum_delivery_cust: 0, sum_install_cust: 0, sum_net_sales: 0, fee_to_sales_pct: 0, net_ship_gap: 0 };
 
@@ -410,7 +412,7 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#F0E9DF]">
-                  {filteredRows.map((r: any) => {
+                  {filteredRows.slice(0, visibleLimit).map((r: any) => {
                     const ed = edits[r.slip_no] || { carrier_3pl: r.carrier_3pl, fee_3pl: r.fee_3pl, area: r.area, note: r.note, dirty: false };
                     return (
                       <tr key={r.slip_no} className={`hover:bg-[#FAF7F2] ${ed.dirty ? 'bg-amber-50/40' : ''}`}>
@@ -521,6 +523,18 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
                 </tbody>
               </table>
             </div>
+            {filteredRows.length > visibleLimit && (
+              <div className="p-3 bg-[#FAF7F2] border-t border-[#E6DDD1] flex items-center justify-between text-xs">
+                <span className="text-[#6e5543]">Đang hiển thị <strong>{visibleLimit}</strong> / {filteredRows.length} hóa đơn</span>
+                <button
+                  type="button"
+                  onClick={() => setVisibleLimit(v => v + 50)}
+                  className="px-4 py-1.5 rounded-lg bg-[#3B281A] text-white font-semibold hover:bg-[#563C28] cursor-pointer"
+                >
+                  Hiển thị thêm {Math.min(50, filteredRows.length - visibleLimit)} hóa đơn
+                </button>
+              </div>
+            )}
           </div>
         </>
       )}

@@ -1,11 +1,13 @@
 import React, { useEffect, useState } from 'react';
-import { BookOpen, Edit3, Package, Search, X } from 'lucide-react';
-import { apiGet, apiSend, AuthUser, fmtVnd } from '../api';
+import { BookOpen, ChevronDown, ChevronUp, Edit3, Package, Search, X } from 'lucide-react';
+import { apiGet, apiGetPage, apiSend, AuthUser, fmtVnd } from '../api';
 
 interface Props {
   user: AuthUser;
   onToast: (msg: string, tone?: 'ok' | 'err') => void;
 }
+
+const PAGE_SIZE = 50;
 
 export default function MasterDataView({ user, onToast }: Props) {
   const canEditMaster = user.role === 'ADMIN';
@@ -19,26 +21,67 @@ export default function MasterDataView({ user, onToast }: Props) {
   const [q, setQ] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
   const [products, setProducts] = useState<any[]>([]);
+  const [totalProducts, setTotalProducts] = useState(0);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  // Guides: lightweight summary list; full content_md fetched on-demand per card
   const [guides, setGuides] = useState<any[]>([]);
+  const [expandedGuides, setExpandedGuides] = useState<Record<number, string>>({});
+  const [loadingGuideId, setLoadingGuideId] = useState<number | null>(null);
+
   const [editing, setEditing] = useState<any>(null);
 
-  const loadProducts = async () => {
-    const res = await apiGet(`/api/master/products?q=${encodeURIComponent(q)}&type=${encodeURIComponent(typeFilter)}`);
-    setProducts(res);
+  const loadProducts = async (offset = 0, append = false) => {
+    if (append) setLoadingMore(true);
+    try {
+      const { data, total } = await apiGetPage(
+        `/api/master/products?q=${encodeURIComponent(q)}&type=${encodeURIComponent(typeFilter)}&limit=${PAGE_SIZE}&offset=${offset}`
+      );
+      setProducts(prev => (append ? [...prev, ...data] : data));
+      setTotalProducts(total);
+    } catch (e: any) {
+      onToast(e.message, 'err');
+    } finally {
+      if (append) setLoadingMore(false);
+    }
   };
 
   const loadGuides = async () => {
-    setGuides(await apiGet(`/api/guides?q=${encodeURIComponent(q)}`));
+    try {
+      setGuides(await apiGet(`/api/guides?summary=1&q=${encodeURIComponent(q)}`, { cacheMs: 60000 }));
+    } catch (e: any) {
+      onToast(e.message, 'err');
+    }
+  };
+
+  const toggleGuide = async (id: number) => {
+    if (expandedGuides[id] !== undefined) {
+      setExpandedGuides(prev => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      return;
+    }
+    setLoadingGuideId(id);
+    try {
+      const full = await apiGet(`/api/guides/${id}`, { cacheMs: 300000 });
+      setExpandedGuides(prev => ({ ...prev, [id]: full.content_md || '' }));
+    } catch (e: any) {
+      onToast(e.message, 'err');
+    } finally {
+      setLoadingGuideId(null);
+    }
   };
 
   useEffect(() => {
-    if (subTab === 'products') loadProducts();
+    if (subTab === 'products') loadProducts(0, false);
     else loadGuides();
   }, [subTab, typeFilter]);
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
-    if (subTab === 'products') loadProducts();
+    if (subTab === 'products') loadProducts(0, false);
     else loadGuides();
   };
 
@@ -47,7 +90,7 @@ export default function MasterDataView({ user, onToast }: Props) {
       await apiSend(`/api/master/products/${encodeURIComponent(editing.barcode)}`, 'PUT', editing);
       onToast(`Đã cập nhật SKU ${editing.barcode}`);
       setEditing(null);
-      loadProducts();
+      loadProducts(0, false);
     } catch (e: any) {
       onToast(e.message, 'err');
     }
@@ -58,7 +101,7 @@ export default function MasterDataView({ user, onToast }: Props) {
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold text-[#3B281A]">Danh Mục Master & Thư Viện HDLR / HDBQ</h1>
-          <p className="text-xs text-[#6e5543]">Nguồn sự thật duy nhất (682 mã: Sản phẩm + Phí POS + Bao bì BN-*) & 12 bộ hướng dẫn lắp ráp/bảo quản.</p>
+          <p className="text-xs text-[#6e5543]">Nguồn sự thật duy nhất (682 mã SKU) & bộ hướng dẫn lắp ráp/bảo quản — tải phân trang & mở nội dung theo nhu cầu.</p>
         </div>
         <div className="flex bg-[#EFE7DC] p-1 rounded-lg self-start">
           <button
@@ -83,7 +126,7 @@ export default function MasterDataView({ user, onToast }: Props) {
           <input
             value={q}
             onChange={e => setQ(e.target.value)}
-            placeholder={subTab === 'products' ? 'Tìm theo Barcode, tên sản phẩm, NCC...' : 'Tìm hướng dẫn lắp ráp / bảo quản (Kito, Cheri, Oki, Welin...)'}
+            placeholder={subTab === 'products' ? 'Tìm theo Barcode, tên sản phẩm, NCC...' : 'Tìm hướng dẫn lắp ráp / bảo quản (Noma, Murest, Lilow, Kito...)'}
             className="w-full pl-9 pr-3 py-2 rounded-lg border border-[#D6BCA5] bg-white text-xs"
           />
         </div>
@@ -151,21 +194,49 @@ export default function MasterDataView({ user, onToast }: Props) {
               </tbody>
             </table>
           </div>
+          {products.length < totalProducts && (
+            <div className="p-3 bg-[#FAF7F2] border-t border-[#E6DDD1] flex items-center justify-between text-xs">
+              <span className="text-[#6e5543]">Đang hiển thị <strong>{products.length}</strong> / {totalProducts} SKU</span>
+              <button
+                disabled={loadingMore}
+                onClick={() => loadProducts(products.length, true)}
+                className="px-4 py-1.5 rounded-lg bg-[#3B281A] text-white font-semibold hover:bg-[#563C28] cursor-pointer disabled:opacity-60"
+              >
+                {loadingMore ? 'Đang tải...' : `Tải thêm ${Math.min(PAGE_SIZE, totalProducts - products.length)} SKU`}
+              </button>
+            </div>
+          )}
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {guides.map(g => (
-            <div key={g.id} className="bg-white rounded-xl p-4 border border-[#E6DDD1] space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="px-2 py-0.5 rounded bg-[#F8F4EC] border border-[#D6BCA5] text-[10px] font-bold text-[#3B281A]">{g.product_line}</span>
-                <span className="text-[10px] text-[#6e5543]">{g.source_file}</span>
+          {guides.map(g => {
+            const isOpen = expandedGuides[g.id] !== undefined;
+            const isLoading = loadingGuideId === g.id;
+            return (
+              <div key={g.id} className="bg-white rounded-xl p-4 border border-[#E6DDD1] space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="px-2 py-0.5 rounded bg-[#F8F4EC] border border-[#D6BCA5] text-[10px] font-bold text-[#3B281A]">
+                    {g.product_line || 'Chung'} • {g.guide_type || 'HDLR'}
+                  </span>
+                  <button
+                    onClick={() => toggleGuide(g.id)}
+                    disabled={isLoading}
+                    className="text-[11px] font-semibold text-[#224B85] hover:underline flex items-center gap-1 cursor-pointer"
+                  >
+                    {isLoading ? 'Đang tải...' : isOpen ? <>Thu gọn <ChevronUp className="w-3.5 h-3.5" /></> : <>Xem chi tiết <ChevronDown className="w-3.5 h-3.5" /></>}
+                  </button>
+                </div>
+                <h3 className="font-bold text-sm text-[#3B281A]">{g.title}</h3>
+                {!isOpen ? (
+                  <p className="text-xs text-[#6e5543] line-clamp-2">{g.preview}</p>
+                ) : (
+                  <pre className="whitespace-pre-wrap font-sans text-xs text-[#4a392d] bg-[#FAF7F2] p-3 rounded-lg max-h-64 overflow-y-auto border border-[#EFE7DC]">
+                    {expandedGuides[g.id]}
+                  </pre>
+                )}
               </div>
-              <h3 className="font-bold text-sm text-[#3B281A]">{g.title}</h3>
-              <pre className="whitespace-pre-wrap font-sans text-xs text-[#4a392d] bg-[#FAF7F2] p-3 rounded-lg max-h-48 overflow-y-auto border border-[#EFE7DC]">
-                {g.content_md}
-              </pre>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 

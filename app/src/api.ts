@@ -1,4 +1,19 @@
 const TOKEN_KEY = 'benom_ops_token';
+const NUM_FMT = new Intl.NumberFormat('vi-VN');
+
+// In-flight GET coalescing + short TTL client cache (auto-invalidated on mutations)
+const _inflightGets = new Map<string, Promise<any>>();
+const _clientCache = new Map<string, { exp: number; data: any }>();
+
+export function invalidateApiCache(prefix = '') {
+  if (!prefix) {
+    _clientCache.clear();
+    return;
+  }
+  for (const k of _clientCache.keys()) {
+    if (k.startsWith(prefix)) _clientCache.delete(k);
+  }
+}
 
 export function getAuthToken(): string {
   return localStorage.getItem(TOKEN_KEY) || '';
@@ -6,10 +21,12 @@ export function getAuthToken(): string {
 
 export function setAuthToken(token: string) {
   localStorage.setItem(TOKEN_KEY, token);
+  _clientCache.clear();
 }
 
 export function clearAuthToken() {
   localStorage.removeItem(TOKEN_KEY);
+  _clientCache.clear();
 }
 
 function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
@@ -17,7 +34,41 @@ function authHeaders(extra: Record<string, string> = {}): Record<string, string>
   return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
 }
 
-export async function apiGet<T = any>(url: string): Promise<T> {
+export async function apiGet<T = any>(url: string, opts?: { cacheMs?: number; force?: boolean }): Promise<T> {
+  const cacheMs = opts?.cacheMs || 0;
+  if (cacheMs > 0 && !opts?.force) {
+    const hit = _clientCache.get(url);
+    if (hit && hit.exp > Date.now()) return hit.data as T;
+  }
+  const existing = _inflightGets.get(url);
+  if (existing) return existing as Promise<T>;
+
+  const req = (async () => {
+    const res = await fetch(url, { headers: authHeaders() });
+    if (res.status === 401) {
+      clearAuthToken();
+      window.dispatchEvent(new Event('benom-auth-expired'));
+    }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error || 'Lỗi tải dữ liệu');
+    }
+    const data = await res.json();
+    if (cacheMs > 0) {
+      _clientCache.set(url, { exp: Date.now() + cacheMs, data });
+    }
+    return data as T;
+  })();
+
+  _inflightGets.set(url, req);
+  try {
+    return await req;
+  } finally {
+    _inflightGets.delete(url);
+  }
+}
+
+export async function apiGetPage<T = any>(url: string): Promise<{ data: T[]; total: number }> {
   const res = await fetch(url, { headers: authHeaders() });
   if (res.status === 401) {
     clearAuthToken();
@@ -27,7 +78,10 @@ export async function apiGet<T = any>(url: string): Promise<T> {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(err.error || 'Lỗi tải dữ liệu');
   }
-  return res.json();
+  const data = await res.json();
+  const totalHeader = Number(res.headers.get('X-Total-Count'));
+  const total = Number.isFinite(totalHeader) && totalHeader >= 0 ? totalHeader : (Array.isArray(data) ? data.length : 0);
+  return { data: Array.isArray(data) ? data : [], total };
 }
 
 export async function apiSend<T = any>(url: string, method: 'POST' | 'PUT' | 'DELETE', body?: any): Promise<T> {
@@ -44,6 +98,7 @@ export async function apiSend<T = any>(url: string, method: 'POST' | 'PUT' | 'DE
   if (!res.ok) {
     throw new Error(data.error || `Lỗi ${res.status}`);
   }
+  _clientCache.clear();
   return data;
 }
 
@@ -59,6 +114,7 @@ export async function apiUpload<T = any>(url: string, file: File): Promise<T> {
   if (!res.ok) {
     throw new Error(data.error || `Lỗi upload (${res.status})`);
   }
+  _clientCache.clear();
   return data;
 }
 
@@ -92,11 +148,11 @@ export async function apiDownload(url: string, fallbackFilename: string, postBod
 
 export function fmtVnd(v: number | string | null | undefined): string {
   const n = Number(v || 0);
-  return new Intl.NumberFormat('vi-VN').format(Math.round(n)) + ' đ';
+  return NUM_FMT.format(Math.round(n)) + ' đ';
 }
 
 export function fmtNum(v: number | string | null | undefined): string {
-  return new Intl.NumberFormat('vi-VN').format(Number(v || 0));
+  return NUM_FMT.format(Number(v || 0));
 }
 
 export function fmtMonth(ym: string): string {

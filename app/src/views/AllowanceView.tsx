@@ -30,10 +30,10 @@ export default function AllowanceView({ user, onToast }: Props) {
     localStorage.setItem('benom_allow_scope', s);
   };
 
-  const load = async (m: string, s: string) => {
+  const load = async (m: string, s: string, force = false) => {
     setLoading(true);
     try {
-      const res = await apiGet(`/api/allowance?month=${encodeURIComponent(m)}&scope=${encodeURIComponent(s)}`);
+      const res = await apiGet(`/api/allowance?month=${encodeURIComponent(m)}&scope=${encodeURIComponent(s)}`, { cacheMs: 25000, force });
       setData(res);
       if (m === 'LATEST' && res.month && res.month !== 'LATEST') {
         setMonthState(res.month);

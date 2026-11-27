@@ -1,14 +1,13 @@
-import React, { useEffect, useState } from 'react';
+import React, { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertOctagon, ClipboardList, Clock, Factory, FileOutput, PackagePlus,
   Plus, Printer, Search, ShieldCheck, Wrench, X
 } from 'lucide-react';
-import {
-  Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis
-} from 'recharts';
 import { apiGet, apiSend, AuthUser, fmtVnd, PrintDoc } from '../api';
-import Bm03Modal from '../components/Bm03Modal';
-import Bm04Modal from '../components/Bm04Modal';
+
+const Bm03Modal = lazy(() => import('../components/Bm03Modal'));
+const Bm04Modal = lazy(() => import('../components/Bm04Modal'));
+const QcSupplierChart = lazy(() => import('../components/QcSupplierChart'));
 
 const WOOD_DEFECT_CATEGORIES = [
   'Cong vênh / Co ngót gỗ',
@@ -47,6 +46,8 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
   const [bm04List, setBm04List] = useState<any[]>([]);
   const [qcList, setQcList] = useState<any[]>([]);
   const [logs, setLogs] = useState<any[]>([]);
+  const [counts, setCounts] = useState({ warranty: 0, bm03: 0, bm04: 0, qc_units: 0, support_hours: 0 });
+  const loadedTabs = useRef<Set<SubTab>>(new Set());
 
   // Active modals
   const [activeBm03, setActiveBm03] = useState<any>(null);
@@ -90,26 +91,32 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
     notes: '',
   });
 
-  const loadAll = async () => {
+  const loadCounts = async () => {
     try {
-      const [t, b3, b4, q, s] = await Promise.all([
-        apiGet('/api/warranty'),
-        apiGet('/api/bm03'),
-        apiGet('/api/bm04'),
-        apiGet('/api/qc-returns'),
-        apiGet('/api/support-logs'),
-      ]);
-      setTickets(t);
-      setBm03List(b3);
-      setBm04List(b4);
-      setQcList(q);
-      setLogs(s);
+      setCounts(await apiGet('/api/warranty/counts'));
+    } catch { /* ignore */ }
+  };
+
+  const loadTab = async (tab: SubTab, force = false) => {
+    if (!force && loadedTabs.current.has(tab)) return;
+    try {
+      if (tab === 'warranty') setTickets(await apiGet('/api/warranty'));
+      else if (tab === 'bm03') setBm03List(await apiGet('/api/bm03'));
+      else if (tab === 'bm04') setBm04List(await apiGet('/api/bm04'));
+      else if (tab === 'qc') setQcList(await apiGet('/api/qc-returns'));
+      else if (tab === 'support') setLogs(await apiGet('/api/support-logs'));
+      loadedTabs.current.add(tab);
     } catch (e: any) {
       onToast(e.message, 'err');
     }
   };
 
-  useEffect(() => { loadAll(); }, []);
+  const refreshTabs = async (...tabs: SubTab[]) => {
+    await Promise.all([loadCounts(), ...tabs.map(t => loadTab(t, true))]);
+  };
+
+  useEffect(() => { loadCounts(); }, []);
+  useEffect(() => { loadTab(subTab); }, [subTab]);
 
   const doLookup = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -144,7 +151,7 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
       const res = await apiSend('/api/warranty', 'POST', newTicket);
       onToast(`Đã tạo Ticket bảo hành ${res.ticket_no} (tự động tính mốc SLA 2h/24h/48h GMT+7)!`);
       setShowNewTicket(false);
-      loadAll();
+      refreshTabs('warranty');
     } catch (err: any) {
       onToast(err.message, 'err');
     }
@@ -154,7 +161,7 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
     try {
       await apiSend(`/api/warranty/${t.id}`, 'PUT', { ...t, status });
       onToast(`Cập nhật ${t.ticket_no} → ${status}`);
-      loadAll();
+      refreshTabs('warranty');
     } catch (err: any) {
       onToast(err.message, 'err');
     }
@@ -192,7 +199,7 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
         supplier_name: '', barcode: '', product_name: '', defect_category: WOOD_DEFECT_CATEGORIES[2],
         issue: '', defective_qty: 1, sold_qty: 0, stock_qty: 0, action: 'Back to factory', est_out: 'TBU', est_in: 'TBU',
       });
-      loadAll();
+      refreshTabs('qc');
     } catch (err: any) {
       onToast(err.message, 'err');
     }
@@ -202,7 +209,7 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
     try {
       await apiSend(`/api/qc-returns/${q.id}`, 'PUT', { ...q, status });
       onToast(`Đã cập nhật QC ${q.product_name} → ${status}`);
-      loadAll();
+      refreshTabs('qc');
     } catch (err: any) {
       onToast(err.message, 'err');
     }
@@ -212,7 +219,7 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
     try {
       const res = await apiSend(`/api/qc-returns/${q.id}/generate-slip`, 'POST', { slip_type: slipType });
       onToast(`Đã tạo phiếu ${res.slip_no} (${slipType === 'XK' ? 'Trả xưởng NCC' : 'Nhận lại từ xưởng'}) & tự gắn vào lô QC!`);
-      loadAll();
+      refreshTabs('qc');
     } catch (err: any) {
       onToast(err.message, 'err');
     }
@@ -242,17 +249,21 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
       await apiSend('/api/support-logs', 'POST', newLog);
       onToast('Đã ghi nhận giờ Support chéo phòng ban!');
       setNewLog({ ...newLog, notes: '' });
-      loadAll();
+      refreshTabs('support');
     } catch (err: any) {
       onToast(err.message, 'err');
     }
   };
 
-  const totalDefective = qcList.filter(x => x.status !== 'Closed').reduce((s, x) => s + (x.defective_qty || 0), 0);
-  const totalSupportHours = logs.reduce((s, x) => s + Number(x.hours || 0), 0);
+  const totalDefective = loadedTabs.current.has('qc')
+    ? qcList.filter(x => x.status !== 'Closed').reduce((s, x) => s + (x.defective_qty || 0), 0)
+    : counts.qc_units;
+  const totalSupportHours = loadedTabs.current.has('support')
+    ? logs.reduce((s, x) => s + Number(x.hours || 0), 0)
+    : counts.support_hours;
 
-  // QC Factory Analytics by Supplier (TASK-12)
-  const qcBySupplier = (() => {
+  // QC Factory Analytics by Supplier (TASK-12, memoized)
+  const qcBySupplier = useMemo(() => {
     const m = new Map<string, { supplier: string; units: number; skus: number }>();
     for (const q of qcList) {
       const key = q.supplier_name || 'Khác';
@@ -262,7 +273,7 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
       m.set(key, cur);
     }
     return Array.from(m.values()).sort((a, b) => b.units - a.units);
-  })();
+  }, [qcList]);
 
   return (
     <div className="space-y-5">
@@ -273,9 +284,9 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
         </div>
         <div className="flex flex-wrap bg-[#EFE7DC] p-1 rounded-lg self-start gap-0.5">
           {[
-            ['warranty', `BM-02 (${tickets.length})`],
-            ['bm03', `BM-03 (${bm03List.length})`],
-            ['bm04', `BM-04 (${bm04List.length})`],
+            ['warranty', `BM-02 (${loadedTabs.current.has('warranty') ? tickets.length : counts.warranty})`],
+            ['bm03', `BM-03 (${loadedTabs.current.has('bm03') ? bm03List.length : counts.bm03})`],
+            ['bm04', `BM-04 (${loadedTabs.current.has('bm04') ? bm04List.length : counts.bm04})`],
             ['qc', `QC Xưởng (${totalDefective} sp)`],
             ['support', `Support (${totalSupportHours}h)`],
           ].map(([id, lbl]) => (
@@ -582,17 +593,9 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
                   </button>
                 )}
               </div>
-              <div className="h-44">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={qcBySupplier} layout="vertical" margin={{ left: 10, right: 20 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#EFE7DC" />
-                    <XAxis type="number" tick={{ fontSize: 11, fill: '#6e5543' }} />
-                    <YAxis dataKey="supplier" type="category" width={95} tick={{ fontSize: 11, fill: '#3B281A' }} />
-                    <Tooltip formatter={(v: any) => [`${v} sản phẩm lỗi`, 'Tổng lỗi']} />
-                    <Bar dataKey="units" fill="#9A2B26" radius={[0, 4, 4, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
+              <Suspense fallback={<div className="h-44 flex items-center justify-center text-xs text-[#6e5543]">Đang tải biểu đồ...</div>}>
+                <QcSupplierChart data={qcBySupplier} />
+              </Suspense>
             </div>
             <div className="bg-white rounded-xl p-4 border border-[#E6DDD1] flex flex-col justify-between">
               <div>
@@ -891,25 +894,27 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
         </div>
       )}
 
-      {/* BM-03 & BM-04 Modals */}
-      {activeBm03 && (
-        <Bm03Modal
-          initial={activeBm03}
-          readOnly={!canUpdateTicketOrLog}
-          onClose={() => setActiveBm03(null)}
-          onSaved={() => { onToast('Đã lưu Biên bản kiểm định & thu hồi BM-03!'); loadAll(); }}
-          onPrint={doc => onPrint({ type: 'BM03', data: doc })}
-        />
-      )}
-      {activeBm04 && (
-        <Bm04Modal
-          initial={activeBm04}
-          readOnly={!canUpdateTicketOrLog}
-          onClose={() => setActiveBm04(null)}
-          onSaved={() => { onToast('Đã lưu Biên bản sự cố giao nhận BM-04 (hạn Claim 48h)!'); loadAll(); }}
-          onPrint={doc => onPrint({ type: 'BM04', data: doc })}
-        />
-      )}
+      {/* BM-03 & BM-04 Modals (lazy-loaded on-demand) */}
+      <Suspense fallback={null}>
+        {activeBm03 && (
+          <Bm03Modal
+            initial={activeBm03}
+            readOnly={!canUpdateTicketOrLog}
+            onClose={() => setActiveBm03(null)}
+            onSaved={() => { onToast('Đã lưu Biên bản kiểm định & thu hồi BM-03!'); refreshTabs('bm03', 'warranty'); }}
+            onPrint={doc => onPrint({ type: 'BM03', data: doc })}
+          />
+        )}
+        {activeBm04 && (
+          <Bm04Modal
+            initial={activeBm04}
+            readOnly={!canUpdateTicketOrLog}
+            onClose={() => setActiveBm04(null)}
+            onSaved={() => { onToast('Đã lưu Biên bản sự cố giao nhận BM-04 (hạn Claim 48h)!'); refreshTabs('bm04', 'warranty'); }}
+            onPrint={doc => onPrint({ type: 'BM04', data: doc })}
+          />
+        )}
+      </Suspense>
     </div>
   );
 }

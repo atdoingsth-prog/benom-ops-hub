@@ -1,20 +1,32 @@
-import React, { useEffect, useState } from 'react';
+import React, { lazy, Suspense, useEffect, useState } from 'react';
 import {
   BarChart3, BookOpen, Calculator, History, KeyRound, LayoutDashboard, LogOut, ShieldCheck, Truck, Users, Warehouse
 } from 'lucide-react';
 import { apiGet, AuthUser, clearAuthToken, getAuthToken, PrintDoc } from './api';
-import PrintModal from './components/PrintModal';
 import LoginScreen from './components/LoginScreen';
-import ShareUsersModal from './components/ShareUsersModal';
-import ChangePasswordModal from './components/ChangePasswordModal';
-import AuditLogModal from './components/AuditLogModal';
-import DashboardView from './views/DashboardView';
-import OrdersDispatchView from './views/OrdersDispatchView';
-import DeliveryTrackingView from './views/DeliveryTrackingView';
-import AllowanceView from './views/AllowanceView';
-import WarehouseErpView from './views/WarehouseErpView';
-import WarrantyQcView from './views/WarrantyQcView';
-import MasterDataView from './views/MasterDataView';
+
+// On-demand lazy chunks: views & modals only download when opened
+const DashboardView = lazy(() => import('./views/DashboardView'));
+const OrdersDispatchView = lazy(() => import('./views/OrdersDispatchView'));
+const DeliveryTrackingView = lazy(() => import('./views/DeliveryTrackingView'));
+const AllowanceView = lazy(() => import('./views/AllowanceView'));
+const WarehouseErpView = lazy(() => import('./views/WarehouseErpView'));
+const WarrantyQcView = lazy(() => import('./views/WarrantyQcView'));
+const MasterDataView = lazy(() => import('./views/MasterDataView'));
+
+const PrintModal = lazy(() => import('./components/PrintModal'));
+const ShareUsersModal = lazy(() => import('./components/ShareUsersModal'));
+const ChangePasswordModal = lazy(() => import('./components/ChangePasswordModal'));
+const AuditLogModal = lazy(() => import('./components/AuditLogModal'));
+
+function ViewFallback() {
+  return (
+    <div className="p-10 text-center text-xs text-[#6e5543]">
+      <div className="inline-block w-5 h-5 border-2 border-[#D6BCA5] border-t-[#3B281A] rounded-full animate-spin mb-2" />
+      <div>Đang tải phân hệ...</div>
+    </div>
+  );
+}
 
 const NAV_ITEMS = [
   { id: 'dashboard', label: 'Tổng quan', icon: LayoutDashboard },
@@ -220,13 +232,15 @@ export default function App() {
         )}
 
         <div className="max-w-7xl mx-auto p-4 sm:p-6 lg:p-8">
-          {tab === 'dashboard' && <DashboardView user={user} onToast={showToast} onNavigate={setTab} />}
-          {tab === 'delivery3pl' && <DeliveryTrackingView user={user} onToast={showToast} onNavigate={setTab} />}
-          {tab === 'orders' && <OrdersDispatchView user={user} onToast={showToast} onPrint={setPrintDoc} />}
-          {tab === 'allowance' && <AllowanceView user={user} onToast={showToast} />}
-          {tab === 'warehouse' && <WarehouseErpView user={user} onToast={showToast} onPrint={setPrintDoc} />}
-          {tab === 'warranty' && <WarrantyQcView user={user} onToast={showToast} onPrint={setPrintDoc} />}
-          {tab === 'master' && <MasterDataView user={user} onToast={showToast} />}
+          <Suspense fallback={<ViewFallback />}>
+            {tab === 'dashboard' && <DashboardView user={user} onToast={showToast} onNavigate={setTab} />}
+            {tab === 'delivery3pl' && <DeliveryTrackingView user={user} onToast={showToast} onNavigate={setTab} />}
+            {tab === 'orders' && <OrdersDispatchView user={user} onToast={showToast} onPrint={setPrintDoc} />}
+            {tab === 'allowance' && <AllowanceView user={user} onToast={showToast} />}
+            {tab === 'warehouse' && <WarehouseErpView user={user} onToast={showToast} onPrint={setPrintDoc} />}
+            {tab === 'warranty' && <WarrantyQcView user={user} onToast={showToast} onPrint={setPrintDoc} />}
+            {tab === 'master' && <MasterDataView user={user} onToast={showToast} />}
+          </Suspense>
         </div>
       </main>
 
@@ -259,23 +273,19 @@ export default function App() {
         </div>
       )}
 
-      {/* Printable A4 Modal */}
-      <PrintModal doc={printDoc} onClose={() => setPrintDoc(null)} />
-
-      {/* Share & RBAC Modal (Admin) */}
-      {showShare && <ShareUsersModal onClose={() => setShowShare(false)} onToast={showToast} />}
-
-      {/* Change Password Modal (All roles) */}
-      {showChangePwd && (
-        <ChangePasswordModal
-          email={user.email}
-          onClose={() => setShowChangePwd(false)}
-          onToast={showToast}
-        />
-      )}
-
-      {/* Audit Trail Modal */}
-      {showAudit && <AuditLogModal onClose={() => setShowAudit(false)} onToast={showToast} />}
+      {/* Lazy Modals — only downloaded & mounted when opened */}
+      <Suspense fallback={null}>
+        {printDoc && <PrintModal doc={printDoc} onClose={() => setPrintDoc(null)} />}
+        {showShare && <ShareUsersModal onClose={() => setShowShare(false)} onToast={showToast} />}
+        {showChangePwd && (
+          <ChangePasswordModal
+            email={user.email}
+            onClose={() => setShowChangePwd(false)}
+            onToast={showToast}
+          />
+        )}
+        {showAudit && <AuditLogModal onClose={() => setShowAudit(false)} onToast={showToast} />}
+      </Suspense>
     </div>
   );
 }

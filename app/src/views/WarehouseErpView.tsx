@@ -1,10 +1,12 @@
-import React, { useEffect, useState } from 'react';
+import React, { lazy, Suspense, useEffect, useState } from 'react';
 import {
   AlertTriangle, Ban, CheckCircle2, ClipboardCheck, Download, FileSpreadsheet,
   Plus, Printer, UploadCloud, Warehouse, X
 } from 'lucide-react';
-import { apiDownload, apiGet, apiSend, apiUpload, AuthUser, PrintDoc } from '../api';
-import SparePartsPanel from '../components/SparePartsPanel';
+import { apiDownload, apiGet, apiGetPage, apiSend, apiUpload, AuthUser, PrintDoc } from '../api';
+
+const SparePartsPanel = lazy(() => import('../components/SparePartsPanel'));
+const SLIP_PAGE_SIZE = 40;
 
 interface Props {
   user: AuthUser;
@@ -25,6 +27,8 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
     localStorage.setItem('benom_wh_subtab', v);
   };
   const [slips, setSlips] = useState<any[]>([]);
+  const [totalSlips, setTotalSlips] = useState(0);
+  const [loadingMoreSlips, setLoadingMoreSlips] = useState(false);
   const [slipFilter, setSlipFilter] = useState('');
   const [showNewSlip, setShowNewSlip] = useState(false);
 
@@ -58,15 +62,23 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
   const [recData, setRecData] = useState<any>(null);
   const [onlyDiff, setOnlyDiff] = useState(true);
 
-  const loadSlips = async () => {
+  const loadSlips = async (offset = 0, append = false) => {
+    if (append) setLoadingMoreSlips(true);
     try {
-      setSlips(await apiGet(`/api/slips?type=${encodeURIComponent(slipFilter)}`));
+      const { data, total } = await apiGetPage(`/api/slips?type=${encodeURIComponent(slipFilter)}&limit=${SLIP_PAGE_SIZE}&offset=${offset}`);
+      setSlips(prev => (append ? [...prev, ...data] : data));
+      setTotalSlips(total);
     } catch (e: any) {
       onToast(e.message, 'err');
+    } finally {
+      if (append) setLoadingMoreSlips(false);
     }
   };
 
-  useEffect(() => { loadSlips(); }, [slipFilter]);
+  // On-demand: only fetch slips when user is actually on the 'slips' sub-tab
+  useEffect(() => {
+    if (subTab === 'slips') loadSlips(0, false);
+  }, [subTab, slipFilter]);
 
   const searchSkuWithStock = async (val: string) => {
     setSkuSearch(val);
@@ -241,7 +253,7 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
           <h1 className="text-2xl font-bold text-[#3B281A]">Kho 9005 Toàn Nhất, ERP Sidecar & Ngũ Kim KTV</h1>
           <p className="text-xs text-[#6e5543]">Quản lý Phiếu NK/XK (SKU tồn 9005, SL thực tế, Cut-off HĐ 019-2026), nạp ERP CSV, đối soát Toàn Nhất & Kho Ngũ Kim KTV.</p>
         </div>
-        <div className="flex flex-wrap bg-[#EFE7DC] p-1 rounded-lg self-start gap-0.5">
+        <div className="flex flex-wrap bg-[#EFE7DC] p-1 rounded-lg self-start gap-0.5 shrink-0">
           {[
             ['slips', 'Phiếu NK / XK'],
             ['erp', 'Nạp ERP CSV'],
@@ -251,7 +263,7 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
             <button
               key={id}
               onClick={() => setSubTab(id as any)}
-              className={`px-3 py-1.5 rounded-md text-xs font-semibold cursor-pointer ${subTab === id ? 'bg-[#3B281A] text-white' : 'text-[#3B281A]'}`}
+              className={`px-2.5 py-1.5 rounded-md text-xs font-semibold whitespace-nowrap cursor-pointer ${subTab === id ? 'bg-[#3B281A] text-white' : 'text-[#3B281A]'}`}
             >
               {label}
             </button>
@@ -368,6 +380,18 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
                 </tbody>
               </table>
             </div>
+            {slips.length < totalSlips && (
+              <div className="p-3 bg-[#FAF7F2] border-t border-[#E6DDD1] flex items-center justify-between text-xs">
+                <span className="text-[#6e5543]">Đang hiển thị <strong>{slips.length}</strong> / {totalSlips} phiếu</span>
+                <button
+                  disabled={loadingMoreSlips}
+                  onClick={() => loadSlips(slips.length, true)}
+                  className="px-4 py-1.5 rounded-lg bg-[#3B281A] text-white font-semibold hover:bg-[#563C28] cursor-pointer disabled:opacity-60"
+                >
+                  {loadingMoreSlips ? 'Đang tải...' : `Tải thêm ${Math.min(SLIP_PAGE_SIZE, totalSlips - slips.length)} phiếu cũ`}
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -505,9 +529,11 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
         </div>
       )}
 
-      {/* TAB 4: SPARE PARTS / HARDWARE MINI WAREHOUSE (TASK-15) */}
+      {/* TAB 4: SPARE PARTS / HARDWARE MINI WAREHOUSE (TASK-15, lazy-loaded) */}
       {subTab === 'spare_parts' && (
-        <SparePartsPanel user={user} onToast={onToast} />
+        <Suspense fallback={<div className="bg-white rounded-xl p-6 border border-[#E6DDD1] text-center text-xs text-[#6e5543]">Đang tải Kho Ngũ Kim KTV...</div>}>
+          <SparePartsPanel user={user} onToast={onToast} />
+        </Suspense>
       )}
 
       {/* Actual Qty & Status Modal (TASK-09) */}

@@ -465,25 +465,41 @@ const SCHEMA_STATEMENTS = [
     notes TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now', '+7 hours'))
   )`,
+  // Performance indexes for Turso Cloud & Local SQLite (eliminates full-table scans on joins & filters)
+  `CREATE INDEX IF NOT EXISTS idx_erp_store_month_bc ON erp_snapshots(store_code, target_month, barcode)`,
+  `CREATE INDEX IF NOT EXISTS idx_orders_invoice ON orders(invoice_no)`,
+  `CREATE INDEX IF NOT EXISTS idx_orders_date_id ON orders(order_date DESC, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_orders_delivery_date ON orders(delivery_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_handovers_invoice ON handovers(invoice_no)`,
+  `CREATE INDEX IF NOT EXISTS idx_handovers_order ON handovers(order_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_handovers_doctype ON handovers(doc_type, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_slips_type_date ON warehouse_slips(slip_type, slip_date DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_slip_items_slip ON warehouse_slip_items(slip_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_products_type_top ON products(item_type, is_top_50 DESC, net_weight_g DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_spare_part_logs_part ON spare_part_logs(part_id, id DESC)`,
 ];
 
 export async function initDb() {
   if (_initialized) return;
-  for (const sql of SCHEMA_STATEMENTS) {
-    await dbRun(sql);
-  }
+  // Execute all CREATE TABLE / CREATE INDEX statements in 1 batch round-trip (huge Turso Cloud cold-start win)
+  await dbBatch(SCHEMA_STATEMENTS.map(sql => ({ sql, args: [] })));
   // Safe migrations for existing Local/Turso databases
-  for (const alterSql of [
+  await Promise.all([
     `ALTER TABLE orders ADD COLUMN ktvs_json TEXT DEFAULT '[]'`,
     `ALTER TABLE handovers ADD COLUMN ktvs_json TEXT DEFAULT '[]'`,
     `ALTER TABLE order_items ADD COLUMN source_warehouse TEXT DEFAULT ''`,
     `ALTER TABLE order_items ADD COLUMN moving_no TEXT DEFAULT ''`,
     `ALTER TABLE qc_factory_returns ADD COLUMN defect_category TEXT DEFAULT 'Khác'`,
-  ]) {
-    try { await dbRun(alterSql); } catch { /* column already exists */ }
-  }
-  // Seed default team accounts if empty
-  const userCount = await dbGet('SELECT COUNT(*) as c FROM users');
+  ].map(alterSql => dbRun(alterSql).catch(() => { /* column already exists */ })));
+
+  // Check seed status in 1 parallel batch instead of 4 sequential round-trips
+  const [userCount, whCount, stCount, spCount] = await Promise.all([
+    dbGet('SELECT COUNT(*) as c FROM users'),
+    dbGet('SELECT COUNT(*) as c FROM warehouses'),
+    dbGet('SELECT COUNT(*) as c FROM staff'),
+    dbGet('SELECT COUNT(*) as c FROM spare_parts'),
+  ]);
   if (!userCount || userCount.c === 0) {
     const defaultPwd = hashPassword(process.env.DEFAULT_ADMIN_PASSWORD || 'benom2026');
     const defaults = [
@@ -501,30 +517,23 @@ export async function initDb() {
     console.log('[Auth] Seeded 4 default role accounts (password: benom2026).');
   }
   // Seed base warehouses & staff if empty (useful on fresh Turso cloud DB)
-  const whCount = await dbGet('SELECT COUNT(*) as c FROM warehouses');
   if (!whCount || whCount.c === 0) {
     const whs = [
       ['3001', 'Store benom Parkson Lê Thánh Tôn', 'Store', 'Tầng 3, 35-45 Lê Thánh Tôn, Q.1, TP.HCM', 0, 0],
       ['9005', 'Kho DC Toàn Nhất (BD02 - Sóng Thần 1)', '3PL Warehouse', 'Số 10 ĐL Độc Lập, KCN Sóng Thần 1, Dĩ An', 300, 32700000],
       ['1001', 'Pop-up Store benom Aeon Bình Tân', 'Pop-up', 'Aeon Mall Bình Tân, TP.HCM', 0, 0],
     ];
-    for (const w of whs) {
-      await dbRun(`INSERT OR IGNORE INTO warehouses (code, name, type, address, capacity_m2, monthly_fee_vnd) VALUES (?,?,?,?,?,?)`, w);
-    }
+    await dbBatch(whs.map(w => ({ sql: `INSERT OR IGNORE INTO warehouses (code, name, type, address, capacity_m2, monthly_fee_vnd) VALUES (?,?,?,?,?,?)`, args: w })));
   }
-  const stCount = await dbGet('SELECT COUNT(*) as c FROM staff');
   if (!stCount || stCount.c === 0) {
     const staffRows = [
       ['260135', 'Trần Anh Tuyến', 'Operations Lead', 'Operations'],
       ['KTV01', 'Nguyễn Huy Hoàng Tuấn', 'Kỹ thuật viên', 'Operations'],
       ['KTV02', 'Trương Văn Tính', 'Kỹ thuật viên', 'Operations'],
     ];
-    for (const s of staffRows) {
-      await dbRun(`INSERT OR IGNORE INTO staff (emp_code, full_name, role, department, active) VALUES (?,?,?,?,1)`, s);
-    }
+    await dbBatch(staffRows.map(s => ({ sql: `INSERT OR IGNORE INTO staff (emp_code, full_name, role, department, active) VALUES (?,?,?,?,1)`, args: s })));
   }
   // Seed default furniture hardware / spare parts kit if empty (TASK-15)
-  const spCount = await dbGet('SELECT COUNT(*) as c FROM spare_parts');
   if (!spCount || spCount.c === 0) {
     const defaultsSp = [
       ['NK-OC-M6', 'Bulông lục giác M6 + Long đền (Bàn/Ghế/Kệ)', 'Ốc vít & Liên kết', 'Cái', 100, 30, 'Túi đồ KTV / Store 3001', 'Dùng cho ghế Cheri, kệ Keepsake, bàn trà'],
@@ -536,12 +545,10 @@ export async function initDb() {
       ['NK-SAP-GO', 'Sáp / Dầu dưỡng gỗ tự nhiên & Dầu bôi trơn bi', 'Bảo dưỡng đồ gỗ', 'Chai', 6, 2, 'Store 3001', 'Bảo dưỡng bàn xoay Noma & mặt gỗ định kỳ'],
       ['NK-BUT-DAM', 'Bút dặm màu sơn gỗ (Tự nhiên / Óc chó / Đen)', 'Xử lý bề mặt gỗ', 'Cây', 9, 3, 'Túi đồ KTV', 'Chấm dặm vết xước nhẹ tại nhà khách (Cấp 1)'],
     ];
-    for (const sp of defaultsSp) {
-      await dbRun(
-        `INSERT OR IGNORE INTO spare_parts (code, name, category, unit, stock_qty, min_stock, location, notes) VALUES (?,?,?,?,?,?,?,?)`,
-        sp
-      );
-    }
+    await dbBatch(defaultsSp.map(sp => ({
+      sql: `INSERT OR IGNORE INTO spare_parts (code, name, category, unit, stock_qty, min_stock, location, notes) VALUES (?,?,?,?,?,?,?,?)`,
+      args: sp,
+    })));
   }
   _initialized = true;
 }

@@ -1,12 +1,14 @@
-import React, { useEffect, useState } from 'react';
+import React, { lazy, Suspense, useEffect, useState } from 'react';
 import {
   AlertTriangle, Calendar, CheckCircle2, ClipboardCheck, Edit3, FileOutput,
   Plus, Printer, Search, Smartphone, Star, Trash2, Truck, X
 } from 'lucide-react';
-import { apiGet, apiSend, AuthUser, fmtVnd, PrintDoc } from '../api';
-import HandoverModal from '../components/HandoverModal';
+import { apiGet, apiGetPage, apiSend, AuthUser, fmtVnd, PrintDoc } from '../api';
 import KtvFieldBoard from '../components/KtvFieldBoard';
 import KtvListPicker, { KtvEntry } from '../components/KtvListPicker';
+
+const HandoverModal = lazy(() => import('../components/HandoverModal'));
+const ORDER_PAGE_SIZE = 60;
 
 function formatKtvList(row: any): string {
   const arr: KtvEntry[] = Array.isArray(row.ktvs) && row.ktvs.length > 0
@@ -54,7 +56,10 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
     localStorage.setItem(subTabStorageKey, v);
   };
   const [orders, setOrders] = useState<any[]>([]);
+  const [totalOrders, setTotalOrders] = useState(0);
+  const [loadingMoreOrders, setLoadingMoreOrders] = useState(false);
   const [handovers, setHandovers] = useState<any[]>([]);
+  const [handoversLoaded, setHandoversLoaded] = useState(false);
   const [staff, setStaff] = useState<any[]>([]);
   const [q, setQ] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
@@ -93,22 +98,55 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
   const [skuSearch, setSkuSearch] = useState('');
   const [skuResults, setSkuResults] = useState<any[]>([]);
 
-  const loadData = async () => {
+  const ensureStaffLoaded = async () => {
+    if (staff.length > 0) return;
     try {
-      const [o, h, l] = await Promise.all([
-        apiGet(`/api/orders?q=${encodeURIComponent(q)}&status=${encodeURIComponent(statusFilter)}`),
-        apiGet('/api/handovers'),
-        apiGet('/api/master/lookups'),
-      ]);
-      setOrders(o);
-      setHandovers(h);
+      const l = await apiGet('/api/master/lookups', { cacheMs: 300000 });
       setStaff(l.staff || []);
+    } catch { /* ignore */ }
+  };
+
+  const loadOrders = async (offset = 0, append = false) => {
+    if (append) setLoadingMoreOrders(true);
+    try {
+      const lim = subTab === 'orders' ? ORDER_PAGE_SIZE : 100;
+      const { data, total } = await apiGetPage(
+        `/api/orders?q=${encodeURIComponent(q)}&status=${encodeURIComponent(statusFilter)}&limit=${lim}&offset=${offset}`
+      );
+      setOrders(prev => (append ? [...prev, ...data] : data));
+      setTotalOrders(total);
+    } catch (e: any) {
+      onToast(e.message, 'err');
+    } finally {
+      if (append) setLoadingMoreOrders(false);
+    }
+  };
+
+  const loadHandovers = async () => {
+    try {
+      setHandovers(await apiGet('/api/handovers'));
+      setHandoversLoaded(true);
     } catch (e: any) {
       onToast(e.message, 'err');
     }
   };
 
-  useEffect(() => { loadData(); }, [statusFilter]);
+  const loadData = async () => {
+    if (subTab === 'handovers') {
+      await loadHandovers();
+    } else {
+      await loadOrders(0, false);
+      if (handoversLoaded) loadHandovers();
+    }
+  };
+
+  useEffect(() => {
+    if (subTab === 'handovers') {
+      if (!handoversLoaded) loadHandovers();
+    } else {
+      loadOrders(0, false);
+    }
+  }, [subTab, statusFilter]);
 
   const searchPosForOrder = async (val: string) => {
     setNewOrder((prev: any) => ({ ...prev, invoice_no: val }));
@@ -227,6 +265,7 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
   };
 
   const openEditOrder = (o: any) => {
+    ensureStaffLoaded();
     setEditSkuSearch('');
     setEditSkuResults([]);
     setEditingOrder({
@@ -307,6 +346,7 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
 
   // 1-tap open or auto-create BM-01/BM-05 from KtvFieldBoard (TASK-14 & TASK-15)
   const openOrCreateHandoverForOrder = async (o: any) => {
+    ensureStaffLoaded();
     try {
       const existingId = o.handovers?.[0]?.id;
       if (existingId) {
@@ -360,18 +400,18 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
               onClick={() => setSubTab('orders')}
               className={`px-2.5 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer ${subTab === 'orders' ? 'bg-[#3B281A] text-white' : 'text-[#3B281A]'}`}
             >
-              <Truck className="w-3.5 h-3.5" /> Đơn hàng ({orders.length})
+              <Truck className="w-3.5 h-3.5" /> Đơn hàng {totalOrders > 0 ? `(${totalOrders})` : ''}
             </button>
             <button
               onClick={() => setSubTab('handovers')}
               className={`px-2.5 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer ${subTab === 'handovers' ? 'bg-[#3B281A] text-white' : 'text-[#3B281A]'}`}
             >
-              <ClipboardCheck className="w-3.5 h-3.5" /> Biên bản ({handovers.length})
+              <ClipboardCheck className="w-3.5 h-3.5" /> Biên bản {handoversLoaded ? `(${handovers.length})` : ''}
             </button>
           </div>
           {canManageOrders && (
             <button
-              onClick={() => setShowNewOrder(true)}
+              onClick={() => { ensureStaffLoaded(); setShowNewOrder(true); }}
               className="px-3.5 py-2 rounded-lg bg-[#3B281A] text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-[#563C28] cursor-pointer"
             >
               <Plus className="w-4 h-4" /> Tạo đơn mới
@@ -433,7 +473,7 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#F0E9DF]">
-                  {orders.slice(0, 80).map(o => (
+                  {orders.map(o => (
                     <tr key={o.id} className={`hover:bg-[#FAF7F2] ${o.status === 'Cancelled' ? 'opacity-60' : ''}`}>
                       <td className="py-2.5 px-3 whitespace-nowrap">
                         <div className="font-bold text-[#3B281A]">{o.invoice_no}</div>
@@ -515,11 +555,7 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                         )}
                         {o.handovers?.length > 0 ? (
                           <button
-                            onClick={() => {
-                              const found = handovers.find(h => h.id === o.handovers[0].id);
-                              if (found) setActiveHandover(found);
-                              else setSubTab('handovers');
-                            }}
+                            onClick={() => openOrCreateHandoverForOrder(o)}
                             className={`px-2 py-1 rounded text-[11px] font-semibold cursor-pointer align-middle ${
                               o.handovers[0].status === 'Completed'
                                 ? 'bg-emerald-50 border border-[#234E36] text-[#234E36] hover:bg-emerald-100'
@@ -545,6 +581,18 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                 </tbody>
               </table>
             </div>
+            {orders.length < totalOrders && (
+              <div className="p-3 bg-[#FAF7F2] border-t border-[#E6DDD1] flex items-center justify-between text-xs">
+                <span className="text-[#6e5543]">Đang hiển thị <strong>{orders.length}</strong> / {totalOrders} đơn hàng</span>
+                <button
+                  disabled={loadingMoreOrders}
+                  onClick={() => loadOrders(orders.length, true)}
+                  className="px-4 py-1.5 rounded-lg bg-[#3B281A] text-white font-semibold hover:bg-[#563C28] cursor-pointer disabled:opacity-60"
+                >
+                  {loadingMoreOrders ? 'Đang tải...' : `Tải thêm ${Math.min(ORDER_PAGE_SIZE, totalOrders - orders.length)} đơn cũ`}
+                </button>
+              </div>
+            )}
           </div>
         </>
       ) : (
@@ -579,7 +627,7 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
               </div>
               <div className="flex items-center gap-2 pt-2 border-t border-[#EFE7DC]">
                 <button
-                  onClick={() => setActiveHandover(h)}
+                  onClick={() => { ensureStaffLoaded(); setActiveHandover(h); }}
                   className="flex-1 py-2 rounded-lg bg-[#234E36] text-white text-xs font-semibold flex items-center justify-center gap-1.5 hover:bg-[#1b3d2a] cursor-pointer"
                 >
                   <CheckCircle2 className="w-3.5 h-3.5" /> {!canHandover ? 'Xem chi tiết' : h.status === 'Completed' ? 'Xem / Sửa biên bản' : 'Mở ký hiện trường'}
@@ -597,17 +645,19 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
         </div>
       )}
 
-      {/* Handover Mobile Modal */}
+      {/* Handover Mobile Modal (lazy-loaded on-demand) */}
       {activeHandover && (
-        <HandoverModal
-          handover={activeHandover}
-          staffList={staff}
-          readOnly={!canHandover}
-          onStaffAdded={s => setStaff(prev => [...prev.filter(x => x.emp_code !== s.emp_code), s])}
-          onClose={() => setActiveHandover(null)}
-          onSaved={() => { onToast('Đã lưu biên bản & tự động đồng bộ KTV + trạng thái đơn hàng!'); loadData(); }}
-          onPrint={h => onPrint({ type: 'HANDOVER', data: h })}
-        />
+        <Suspense fallback={null}>
+          <HandoverModal
+            handover={activeHandover}
+            staffList={staff}
+            readOnly={!canHandover}
+            onStaffAdded={s => setStaff(prev => [...prev.filter(x => x.emp_code !== s.emp_code), s])}
+            onClose={() => setActiveHandover(null)}
+            onSaved={() => { onToast('Đã lưu biên bản & tự động đồng bộ KTV + trạng thái đơn hàng!'); loadData(); }}
+            onPrint={h => onPrint({ type: 'HANDOVER', data: h })}
+          />
+        </Suspense>
       )}
 
       {/* Edit Order Modal (TASK-07) */}
