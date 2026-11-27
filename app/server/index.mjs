@@ -707,8 +707,8 @@ app.get('/api/dashboard', wrap(async (req, res) => {
   const ph = last3Months.length ? last3Months.map(() => '?').join(',') : '?';
   const mArgs = last3Months.length ? last3Months : [latest3001];
 
-  // Batch 2: dependent analytics in parallel (skips heavy items[] and Top 50 slow-moving until requested!)
-  const [wh9005, wh3001, negativeStock, replenishAlerts, slowMoving, slowMovingTotal] = await Promise.all([
+  // Batch 2: dependent analytics in parallel (skips heavy items[] and Top 50 lists until requested!)
+  const [wh9005, wh3001, negativeStock, replenishAlerts, slowMoving, slowMovingTotal, bestSellers, bestSellersTotal] = await Promise.all([
     calcWarehouse9005Footprint(false, latestMap),
     calcStore3001Inventory(false, latestMap, last3Months),
     dbAll(`
@@ -746,7 +746,7 @@ app.get('/api/dashboard', wrap(async (req, res) => {
       ) r3 ON r3.barcode = s3.barcode
       LEFT JOIN products p ON p.barcode = s3.barcode
       WHERE s3.store_code = '3001' AND s3.target_month = ?
-        AND s3.close_qty > 0 AND COALESCE(r3.sold_3m, 0) = 0
+        AND s3.close_qty > 0 AND COALESCE(r3.sold_3m, 0) <= 0
       ORDER BY s3.close_cst DESC LIMIT 6
     `, [...mArgs, latest3001]),
     dbGet(`
@@ -758,14 +758,50 @@ app.get('/api/dashboard', wrap(async (req, res) => {
         GROUP BY barcode
       ) r3 ON r3.barcode = s3.barcode
       WHERE s3.store_code = '3001' AND s3.target_month = ?
-        AND s3.close_qty > 0 AND COALESCE(r3.sold_3m, 0) = 0
+        AND s3.close_qty > 0 AND COALESCE(r3.sold_3m, 0) <= 0
     `, [...mArgs, latest3001]),
+    dbAll(`
+      SELECT r.barcode,
+             COALESCE(NULLIF(p.name_vn,''), MAX(r.product_name)) as product_name,
+             COALESCE(NULLIF(p.supplier_name,''), MAX(r.supplier_code), 'Khác') as supplier,
+             ROUND(SUM(r.sales_qty), 0) as sold_qty,
+             ROUND(SUM(r.sales_amt), 0) as sales_amt,
+             ROUND(SUM(r.cogs), 0) as cogs,
+             COALESCE(s3.close_qty, 0) as stock_3001,
+             COALESCE(s9.close_qty, 0) as stock_9005,
+             COALESCE(p.min_stock_3001, 2) as min_stock
+      FROM erp_snapshots r
+      LEFT JOIN products p ON p.barcode = r.barcode
+      LEFT JOIN erp_snapshots s3 ON s3.barcode = r.barcode AND s3.store_code = '3001' AND s3.target_month = ?
+      LEFT JOIN erp_snapshots s9 ON s9.barcode = r.barcode AND s9.store_code = '9005' AND s9.target_month = ?
+      WHERE r.store_code = '3001' AND r.target_month IN (${ph})
+        AND COALESCE(NULLIF(p.item_type,''), 'PRODUCT') = 'PRODUCT'
+      GROUP BY r.barcode
+      HAVING SUM(r.sales_qty) > 0
+      ORDER BY SUM(r.sales_amt) DESC LIMIT 6
+    `, [latest3001, latest9005, ...mArgs]),
+    dbGet(`
+      SELECT COUNT(*) as count,
+             ROUND(COALESCE(SUM(sold_qty), 0), 0) as total_qty,
+             ROUND(COALESCE(SUM(sales_amt), 0), 0) as total_sales_amt
+      FROM (
+        SELECT r.barcode, SUM(r.sales_qty) as sold_qty, SUM(r.sales_amt) as sales_amt
+        FROM erp_snapshots r
+        LEFT JOIN products p ON p.barcode = r.barcode
+        WHERE r.store_code = '3001' AND r.target_month IN (${ph})
+          AND COALESCE(NULLIF(p.item_type,''), 'PRODUCT') = 'PRODUCT'
+        GROUP BY r.barcode
+        HAVING SUM(r.sales_qty) > 0
+      )
+    `, mArgs),
   ]);
 
   const payload = {
     orderStats, ticketStats, qcStats, csatStats,
     wh9005, wh3001, store3001Trend, latest3001,
-    negativeStock, replenishAlerts, slowMoving, slowMovingTotal,
+    negativeStock, replenishAlerts,
+    slowMoving, slowMovingTotal, slowMovingMonths: last3Months,
+    bestSellers, bestSellersTotal, bestSellersMonths: last3Months,
   };
   res.json(setServerCache('dashboard:summary', payload, 45000));
 }));
@@ -788,30 +824,111 @@ app.get('/api/dashboard/store3001-items', wrap(async (req, res) => {
   res.json(setServerCache('dashboard:store3001-items', payload, 45000));
 }));
 
-// On-demand Top 50 Slow-Moving SKUs (loaded only when user clicks "Xem Top 50")
+// On-demand Slow-Moving SKUs at Store 3001 for 30 / 60 / 90 days (1 / 2 / 3 latest ERP months)
 app.get('/api/dashboard/slow-moving', wrap(async (req, res) => {
-  const cached = getServerCache('dashboard:slow-moving');
+  const days = [30, 60, 90].includes(Number(req.query.days)) ? Number(req.query.days) : 90;
+  const limit = Math.max(6, Math.min(100, Number(req.query.limit) || 50));
+  const cacheKey = `dashboard:slow-moving:${days}:${limit}`;
+  const cached = getServerCache(cacheKey);
   if (cached) return res.json(cached);
-  const months = await dbAll(`SELECT DISTINCT target_month FROM erp_snapshots WHERE store_code = '3001' ORDER BY target_month DESC LIMIT 3`);
-  const last3 = months.map(r => r.target_month);
-  const latest3001 = last3[0] || '202611';
-  const ph = last3.length ? last3.map(() => '?').join(',') : '?';
-  const mArgs = last3.length ? last3 : [latest3001];
-  const items = await dbAll(`
-    SELECT s3.barcode, s3.product_name, s3.close_qty, ROUND(s3.close_cst, 0) as close_cst,
-           COALESCE(p.supplier_name, s3.supplier_code) as supplier
-    FROM erp_snapshots s3
-    LEFT JOIN (
-      SELECT barcode, SUM(sales_qty) as sold_3m
-      FROM erp_snapshots WHERE store_code = '3001' AND target_month IN (${ph})
-      GROUP BY barcode
-    ) r3 ON r3.barcode = s3.barcode
-    LEFT JOIN products p ON p.barcode = s3.barcode
-    WHERE s3.store_code = '3001' AND s3.target_month = ?
-      AND s3.close_qty > 0 AND COALESCE(r3.sold_3m, 0) = 0
-    ORDER BY s3.close_cst DESC LIMIT 50
-  `, [...mArgs, latest3001]);
-  res.json(setServerCache('dashboard:slow-moving', { items }, 45000));
+
+  const monthCount = days === 30 ? 1 : days === 60 ? 2 : 3;
+  const monthsRows = await dbAll(`SELECT DISTINCT target_month FROM erp_snapshots WHERE store_code = '3001' ORDER BY target_month DESC LIMIT ?`, [monthCount]);
+  const months = monthsRows.map(r => r.target_month);
+  const latest3001 = months[0] || '202611';
+  const ph = months.length ? months.map(() => '?').join(',') : '?';
+  const mArgs = months.length ? months : [latest3001];
+
+  const [items, total] = await Promise.all([
+    dbAll(`
+      SELECT s3.barcode, s3.product_name, s3.close_qty, ROUND(s3.close_cst, 0) as close_cst,
+             COALESCE(p.supplier_name, s3.supplier_code) as supplier
+      FROM erp_snapshots s3
+      LEFT JOIN (
+        SELECT barcode, SUM(sales_qty) as sold_w
+        FROM erp_snapshots WHERE store_code = '3001' AND target_month IN (${ph})
+        GROUP BY barcode
+      ) r ON r.barcode = s3.barcode
+      LEFT JOIN products p ON p.barcode = s3.barcode
+      WHERE s3.store_code = '3001' AND s3.target_month = ?
+        AND s3.close_qty > 0 AND COALESCE(r.sold_w, 0) <= 0
+      ORDER BY s3.close_cst DESC LIMIT ?
+    `, [...mArgs, latest3001, limit]),
+    dbGet(`
+      SELECT COUNT(*) as count, ROUND(COALESCE(SUM(s3.close_cst), 0), 0) as total_cost
+      FROM erp_snapshots s3
+      LEFT JOIN (
+        SELECT barcode, SUM(sales_qty) as sold_w
+        FROM erp_snapshots WHERE store_code = '3001' AND target_month IN (${ph})
+        GROUP BY barcode
+      ) r ON r.barcode = s3.barcode
+      WHERE s3.store_code = '3001' AND s3.target_month = ?
+        AND s3.close_qty > 0 AND COALESCE(r.sold_w, 0) <= 0
+    `, [...mArgs, latest3001]),
+  ]);
+
+  res.json(setServerCache(cacheKey, { days, months: [...months].reverse(), total: total || { count: 0, total_cost: 0 }, items }, 45000));
+}));
+
+// On-demand Best-Selling SKUs at Store 3001 for 30 / 60 / 90 days (sorted by Revenue or Qty)
+app.get('/api/dashboard/best-sellers', wrap(async (req, res) => {
+  const days = [30, 60, 90].includes(Number(req.query.days)) ? Number(req.query.days) : 90;
+  const sort = req.query.sort === 'sales_qty' ? 'sales_qty' : 'sales_amt';
+  const limit = Math.max(6, Math.min(100, Number(req.query.limit) || 50));
+  const cacheKey = `dashboard:best-sellers:${days}:${sort}:${limit}`;
+  const cached = getServerCache(cacheKey);
+  if (cached) return res.json(cached);
+
+  const monthCount = days === 30 ? 1 : days === 60 ? 2 : 3;
+  const [monthsRows, latest9005Row] = await Promise.all([
+    dbAll(`SELECT DISTINCT target_month FROM erp_snapshots WHERE store_code = '3001' ORDER BY target_month DESC LIMIT ?`, [monthCount]),
+    dbGet(`SELECT MAX(target_month) as m FROM erp_snapshots WHERE store_code = '9005'`),
+  ]);
+  const months = monthsRows.map(r => r.target_month);
+  const latest3001 = months[0] || '202611';
+  const latest9005 = latest9005Row?.m || '202611';
+  const ph = months.length ? months.map(() => '?').join(',') : '?';
+  const mArgs = months.length ? months : [latest3001];
+  const orderCol = sort === 'sales_qty' ? 'SUM(r.sales_qty) DESC, SUM(r.sales_amt) DESC' : 'SUM(r.sales_amt) DESC, SUM(r.sales_qty) DESC';
+
+  const [items, total] = await Promise.all([
+    dbAll(`
+      SELECT r.barcode,
+             COALESCE(NULLIF(p.name_vn,''), MAX(r.product_name)) as product_name,
+             COALESCE(NULLIF(p.supplier_name,''), MAX(r.supplier_code), 'Khác') as supplier,
+             ROUND(SUM(r.sales_qty), 0) as sold_qty,
+             ROUND(SUM(r.sales_amt), 0) as sales_amt,
+             ROUND(SUM(r.cogs), 0) as cogs,
+             COALESCE(s3.close_qty, 0) as stock_3001,
+             COALESCE(s9.close_qty, 0) as stock_9005,
+             COALESCE(p.min_stock_3001, 2) as min_stock
+      FROM erp_snapshots r
+      LEFT JOIN products p ON p.barcode = r.barcode
+      LEFT JOIN erp_snapshots s3 ON s3.barcode = r.barcode AND s3.store_code = '3001' AND s3.target_month = ?
+      LEFT JOIN erp_snapshots s9 ON s9.barcode = r.barcode AND s9.store_code = '9005' AND s9.target_month = ?
+      WHERE r.store_code = '3001' AND r.target_month IN (${ph})
+        AND COALESCE(NULLIF(p.item_type,''), 'PRODUCT') = 'PRODUCT'
+      GROUP BY r.barcode
+      HAVING SUM(r.sales_qty) > 0
+      ORDER BY ${orderCol} LIMIT ?
+    `, [latest3001, latest9005, ...mArgs, limit]),
+    dbGet(`
+      SELECT COUNT(*) as count,
+             ROUND(COALESCE(SUM(sold_qty), 0), 0) as total_qty,
+             ROUND(COALESCE(SUM(sales_amt), 0), 0) as total_sales_amt
+      FROM (
+        SELECT r.barcode, SUM(r.sales_qty) as sold_qty, SUM(r.sales_amt) as sales_amt
+        FROM erp_snapshots r
+        LEFT JOIN products p ON p.barcode = r.barcode
+        WHERE r.store_code = '3001' AND r.target_month IN (${ph})
+          AND COALESCE(NULLIF(p.item_type,''), 'PRODUCT') = 'PRODUCT'
+        GROUP BY r.barcode
+        HAVING SUM(r.sales_qty) > 0
+      )
+    `, mArgs),
+  ]);
+
+  res.json(setServerCache(cacheKey, { days, sort, months: [...months].reverse(), total: total || { count: 0, total_qty: 0, total_sales_amt: 0 }, items }, 45000));
 }));
 
 // ─── 2. MASTER DATA & GUIDES (PAGINATED + LEAN PROJECTION) ─────

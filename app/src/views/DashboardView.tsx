@@ -1,6 +1,6 @@
 import React, { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  AlertTriangle, ArrowRightLeft, BarChart3, CheckCircle2,
+  AlertTriangle, ArrowRightLeft, BarChart3, CheckCircle2, Flame,
   ShieldAlert, Star, Store, TrendingUp, Truck, Warehouse
 } from 'lucide-react';
 import {
@@ -31,10 +31,18 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
   const [sup3001Metric, setSup3001Metric] = useState<'cost_m' | 'qty'>('cost_m');
   const drillSectionRef = useRef<HTMLDivElement | null>(null);
 
-  // On-demand Top 50 slow-moving list (initially only top 6 come in /api/dashboard)
+  // On-demand Store 3001 Slow-Moving (90 / 60 / 30 days)
+  const [slowDays, setSlowDays] = useState<90 | 60 | 30>(90);
   const [showSlowAll, setShowSlowAll] = useState(false);
-  const [slowMovingFull, setSlowMovingFull] = useState<any[] | null>(null);
+  const [slowByDays, setSlowByDays] = useState<Record<string, { total: { count: number; total_cost: number }; months: string[]; items: any[] }>>({});
   const [loadingSlow, setLoadingSlow] = useState(false);
+
+  // On-demand Store 3001 Best-Sellers (90 / 60 / 30 days, sort by revenue or qty)
+  const [bestDays, setBestDays] = useState<90 | 60 | 30>(90);
+  const [bestSort, setBestSort] = useState<'sales_amt' | 'sales_qty'>('sales_amt');
+  const [showBestAll, setShowBestAll] = useState(false);
+  const [bestByKey, setBestByKey] = useState<Record<string, { total: { count: number; total_qty: number; total_sales_amt: number }; months: string[]; items: any[] }>>({});
+  const [loadingBest, setLoadingBest] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -86,23 +94,88 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
     if (scrollToDetail) scrollToDrill();
   };
 
-  const toggleSlowMoving = async () => {
-    if (showSlowAll) {
-      setShowSlowAll(false);
-      return;
+  const fetchSlowMoving = async (days: 90 | 60 | 30, limit: number) => {
+    const key = `${days}:${limit}`;
+    if (slowByDays[key]) return;
+    setLoadingSlow(true);
+    try {
+      const res = await apiGet(`/api/dashboard/slow-moving?days=${days}&limit=${limit}`, { cacheMs: 60000 });
+      setSlowByDays(prev => ({
+        ...prev,
+        [key]: { total: res.total || { count: 0, total_cost: 0 }, months: res.months || [], items: res.items || [] },
+      }));
+    } catch (e: any) {
+      onToast(e.message, 'err');
+    } finally {
+      setLoadingSlow(false);
     }
-    setShowSlowAll(true);
-    if (!slowMovingFull) {
-      setLoadingSlow(true);
-      try {
-        const res = await apiGet<{ items: any[] }>('/api/dashboard/slow-moving', { cacheMs: 60000 });
-        setSlowMovingFull(res.items || []);
-      } catch (e: any) {
-        onToast(e.message, 'err');
-      } finally {
-        setLoadingSlow(false);
-      }
+  };
+
+  const handleSlowDaysChange = (days: 90 | 60 | 30) => {
+    setSlowDays(days);
+    const needLimit = showSlowAll ? 50 : 6;
+    if (days !== 90 || showSlowAll) {
+      fetchSlowMoving(days, needLimit);
     }
+  };
+
+  const toggleSlowMoving = () => {
+    const next = !showSlowAll;
+    setShowSlowAll(next);
+    if (next) {
+      fetchSlowMoving(slowDays, 50);
+    }
+  };
+
+  const fetchBestSellers = async (days: 90 | 60 | 30, sort: 'sales_amt' | 'sales_qty', limit: number) => {
+    const key = `${days}:${sort}:${limit}`;
+    if (bestByKey[key]) return;
+    setLoadingBest(true);
+    try {
+      const res = await apiGet(`/api/dashboard/best-sellers?days=${days}&sort=${sort}&limit=${limit}`, { cacheMs: 60000 });
+      setBestByKey(prev => ({
+        ...prev,
+        [key]: {
+          total: res.total || { count: 0, total_qty: 0, total_sales_amt: 0 },
+          months: res.months || [],
+          items: res.items || [],
+        },
+      }));
+    } catch (e: any) {
+      onToast(e.message, 'err');
+    } finally {
+      setLoadingBest(false);
+    }
+  };
+
+  const handleBestDaysChange = (days: 90 | 60 | 30) => {
+    setBestDays(days);
+    const needLimit = showBestAll ? 50 : 6;
+    if (days !== 90 || bestSort !== 'sales_amt' || showBestAll) {
+      fetchBestSellers(days, bestSort, needLimit);
+    }
+  };
+
+  const handleBestSortChange = (sort: 'sales_amt' | 'sales_qty') => {
+    setBestSort(sort);
+    const needLimit = showBestAll ? 50 : 6;
+    if (bestDays !== 90 || sort !== 'sales_amt' || showBestAll) {
+      fetchBestSellers(bestDays, sort, needLimit);
+    }
+  };
+
+  const toggleBestSellers = () => {
+    const next = !showBestAll;
+    setShowBestAll(next);
+    if (next) {
+      fetchBestSellers(bestDays, bestSort, 50);
+    }
+  };
+
+  const formatMonthSpan = (months: string[] | undefined) => {
+    if (!months || months.length === 0) return '';
+    if (months.length === 1) return fmtMonth(months[0]);
+    return `${fmtMonth(months[0])}–${fmtMonth(months[months.length - 1])}`;
   };
 
   const trendChart = useMemo(() => (data?.store3001Trend || []).map((r: any) => ({
@@ -142,10 +215,29 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
     return <div className="p-8 text-center text-[#6e5543] text-sm">Đang tải dữ liệu vận hành benom...</div>;
   }
 
-  const { orderStats, wh9005, wh3001, negativeStock, replenishAlerts, slowMoving, slowMovingTotal, ticketStats, qcStats, csatStats } = data;
+  const { orderStats, wh9005, wh3001, negativeStock, replenishAlerts, slowMoving, slowMovingTotal, slowMovingMonths, bestSellers, bestSellersTotal, bestSellersMonths, ticketStats, qcStats, csatStats } = data;
   const otifPct = orderStats.total_orders > 0 ? Math.round((orderStats.done_orders / orderStats.total_orders) * 100) : 0;
   const isOverCap = wh9005.total_area_m2 >= 285;
-  const displayedSlow = showSlowAll ? (slowMovingFull || slowMoving) : slowMoving.slice(0, 6);
+
+  // Resolve active Slow-Moving dataset (90/60/30 days, Top 6 or Top 50)
+  const activeSlowData =
+    slowByDays[`${slowDays}:50`] ||
+    (showSlowAll ? null : slowByDays[`${slowDays}:6`]) ||
+    (slowDays === 90 ? { total: slowMovingTotal, months: slowMovingMonths || [], items: slowMoving || [] } : null);
+  const displayedSlow = activeSlowData ? (showSlowAll ? activeSlowData.items : activeSlowData.items.slice(0, 6)) : [];
+  const activeSlowTotal = activeSlowData?.total || slowMovingTotal || { count: 0, total_cost: 0 };
+  const activeSlowMonths = activeSlowData?.months || [];
+
+  // Resolve active Best-Sellers dataset (90/60/30 days, Revenue or Qty, Top 6 or Top 50)
+  const activeBestData =
+    bestByKey[`${bestDays}:${bestSort}:50`] ||
+    (showBestAll ? null : bestByKey[`${bestDays}:${bestSort}:6`]) ||
+    (bestDays === 90 && bestSort === 'sales_amt'
+      ? { total: bestSellersTotal || { count: 0, total_qty: 0, total_sales_amt: 0 }, months: bestSellersMonths || [], items: bestSellers || [] }
+      : null);
+  const displayedBest = activeBestData ? (showBestAll ? activeBestData.items : activeBestData.items.slice(0, 6)) : [];
+  const activeBestTotal = activeBestData?.total || bestSellersTotal || { count: 0, total_qty: 0, total_sales_amt: 0 };
+  const activeBestMonths = activeBestData?.months || [];
 
   return (
     <div className="space-y-6">
@@ -620,25 +712,158 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
         </div>
       </div>
 
-      {/* Slow-Moving 90 days (Top 6 initial, Top 50 loaded on-demand) */}
+      {/* Best-Selling Products at Store 3001 (90 / 60 / 30 days) */}
       <div className="bg-white rounded-xl p-5 border border-[#E6DDD1]">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
-          <div className="flex items-center gap-2">
-            <AlertTriangle className="w-5 h-5 text-amber-600" />
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 mb-3">
+          <div className="flex items-start gap-2">
+            <Flame className="w-5 h-5 text-[#234E36] shrink-0 mt-0.5" />
             <div>
               <h2 className="font-bold text-[#3B281A] text-sm">
-                Danh Sách Chậm Luân Chuyển 90 Ngày Tại Store 3001 ({slowMovingTotal.count} SKU • Vốn đọng: {fmtVnd(slowMovingTotal.total_cost)})
+                Danh Sách Hàng Bán Chạy {bestDays} Ngày Tại Store 3001 ({fmtNum(activeBestTotal.count)} SKU • {fmtNum(activeBestTotal.total_qty)} sp • Doanh số: {fmtVnd(activeBestTotal.total_sales_amt)})
               </h2>
-              <p className="text-[11px] text-[#6e5543]">Các mã còn tồn kho nhưng doanh số 3 tháng gần nhất = 0 — đề xuất Sale/Clearance để giải phóng vốn & mặt bằng.</p>
+              <p className="text-[11px] text-[#6e5543]">
+                {activeBestMonths.length > 0 ? `Kỳ ERP ${formatMonthSpan(activeBestMonths)} • ` : ''}
+                Chỉ tính sản phẩm nội thất/gia dụng (đã lọc bỏ mã phí dịch vụ) — ưu tiên giữ tồn trưng bày & châm hàng từ Kho 9005.
+              </p>
             </div>
           </div>
-          <button
-            onClick={toggleSlowMoving}
-            disabled={loadingSlow}
-            className="text-xs font-semibold text-[#224B85] hover:underline cursor-pointer disabled:opacity-60"
-          >
-            {loadingSlow ? 'Đang tải Top 50...' : showSlowAll ? 'Thu gọn (Top 6)' : 'Xem Top 50 mã vốn cao nhất'}
-          </button>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <div className="inline-flex rounded-lg border border-[#D6BCA5] bg-[#FAF7F2] p-0.5 text-[11px]">
+              {([30, 60, 90] as const).map(d => (
+                <button
+                  key={d}
+                  onClick={() => handleBestDaysChange(d)}
+                  className={`px-2.5 py-1 rounded-md font-semibold cursor-pointer transition-colors ${
+                    bestDays === d ? 'bg-[#234E36] text-white' : 'text-[#6e5543] hover:text-[#3B281A]'
+                  }`}
+                >
+                  {d} ngày
+                </button>
+              ))}
+            </div>
+            <div className="inline-flex rounded-lg border border-[#E6DDD1] bg-white p-0.5 text-[11px]">
+              <button
+                onClick={() => handleBestSortChange('sales_amt')}
+                className={`px-2 py-1 rounded-md font-semibold cursor-pointer ${bestSort === 'sales_amt' ? 'bg-[#3B281A] text-white' : 'text-[#6e5543]'}`}
+              >
+                Doanh số
+              </button>
+              <button
+                onClick={() => handleBestSortChange('sales_qty')}
+                className={`px-2 py-1 rounded-md font-semibold cursor-pointer ${bestSort === 'sales_qty' ? 'bg-[#3B281A] text-white' : 'text-[#6e5543]'}`}
+              >
+                SL bán
+              </button>
+            </div>
+            <button
+              onClick={toggleBestSellers}
+              disabled={loadingBest}
+              className="text-xs font-semibold text-[#224B85] hover:underline cursor-pointer disabled:opacity-60"
+            >
+              {loadingBest ? 'Đang tải...' : showBestAll ? 'Thu gọn (Top 6)' : 'Xem Top 50 bán chạy'}
+            </button>
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs text-left">
+            <thead>
+              <tr className="border-b border-[#E6DDD1] text-[#6e5543] bg-[#F8F4EC]">
+                <th className="py-2 px-2 text-center w-9">#</th>
+                <th className="py-2 px-3">Barcode</th>
+                <th className="py-2 px-3">Tên sản phẩm</th>
+                <th className="py-2 px-3">NCC</th>
+                <th className="py-2 px-3 text-right">SL bán ({bestDays}N)</th>
+                <th className="py-2 px-3 text-right">Doanh số ({bestDays}N)</th>
+                <th className="py-2 px-3 text-right">Tồn 3001</th>
+                <th className="py-2 px-3 text-right">Tồn 9005</th>
+                {canEdit && <th className="py-2 px-2 text-right">Châm hàng</th>}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-[#F0E9DF]">
+              {loadingBest && displayedBest.length === 0 ? (
+                <tr><td colSpan={canEdit ? 9 : 8} className="py-6 text-center text-[#6e5543]">Đang tải danh sách hàng bán chạy {bestDays} ngày...</td></tr>
+              ) : displayedBest.length === 0 ? (
+                <tr><td colSpan={canEdit ? 9 : 8} className="py-6 text-center text-[#6e5543]">Chưa có dữ liệu bán hàng trong kỳ {bestDays} ngày.</td></tr>
+              ) : displayedBest.map((it: any, idx: number) => {
+                const lowStoreStock = Number(it.stock_3001 || 0) <= 1;
+                const canReplenish = lowStoreStock && Number(it.stock_9005 || 0) > 0;
+                return (
+                  <tr key={it.barcode} className="hover:bg-[#FAF7F2]">
+                    <td className="py-2 px-2 text-center">
+                      <span className={`inline-flex items-center justify-center w-5 h-5 rounded-full text-[10px] font-bold ${
+                        idx < 3 ? 'bg-[#234E36] text-white' : 'bg-[#EFE7DC] text-[#3B281A]'
+                      }`}>
+                        {idx + 1}
+                      </span>
+                    </td>
+                    <td className="py-2 px-3 font-mono text-[11px]">{it.barcode}</td>
+                    <td className="py-2 px-3 font-medium text-[#3B281A]">{it.product_name}</td>
+                    <td className="py-2 px-3 text-[#6e5543]">{it.supplier}</td>
+                    <td className="py-2 px-3 text-right font-bold text-[#234E36]">{fmtNum(it.sold_qty)}</td>
+                    <td className="py-2 px-3 text-right font-bold text-[#3B281A] whitespace-nowrap">{fmtVnd(it.sales_amt)}</td>
+                    <td className={`py-2 px-3 text-right font-semibold ${lowStoreStock ? 'text-[#9A2B26]' : 'text-[#3B281A]'}`}>
+                      {fmtNum(it.stock_3001)}
+                    </td>
+                    <td className="py-2 px-3 text-right font-semibold text-[#224B85]">{fmtNum(it.stock_9005)}</td>
+                    {canEdit && (
+                      <td className="py-2 px-2 text-right whitespace-nowrap">
+                        {canReplenish ? (
+                          <button
+                            onClick={() => handleQuickReplenish({ ...it, sold_3m: it.sold_qty })}
+                            className="px-2 py-1 rounded bg-[#224B85] text-white text-[10px] font-semibold hover:bg-[#1a3a68] cursor-pointer"
+                          >
+                            + XK 9005→3001
+                          </button>
+                        ) : (
+                          <span className="text-[10px] text-[#6e5543]">—</span>
+                        )}
+                      </td>
+                    )}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Slow-Moving 90 / 60 / 30 days at Store 3001 (Top 6 initial, Top 50 loaded on-demand) */}
+      <div className="bg-white rounded-xl p-5 border border-[#E6DDD1]">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 mb-3">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+            <div>
+              <h2 className="font-bold text-[#3B281A] text-sm">
+                Danh Sách Chậm Luân Chuyển {slowDays} Ngày Tại Store 3001 ({fmtNum(activeSlowTotal.count)} SKU • Vốn đọng: {fmtVnd(activeSlowTotal.total_cost)})
+              </h2>
+              <p className="text-[11px] text-[#6e5543]">
+                {activeSlowMonths.length > 0 ? `Kỳ ERP ${formatMonthSpan(activeSlowMonths)} • ` : ''}
+                Các mã còn tồn kho nhưng doanh số {slowDays === 30 ? '1 tháng' : slowDays === 60 ? '2 tháng' : '3 tháng'} gần nhất = 0 — đề xuất Sale/Clearance để giải phóng vốn & mặt bằng.
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <div className="inline-flex rounded-lg border border-[#D6BCA5] bg-[#FAF7F2] p-0.5 text-[11px]">
+              {([30, 60, 90] as const).map(d => (
+                <button
+                  key={d}
+                  onClick={() => handleSlowDaysChange(d)}
+                  className={`px-2.5 py-1 rounded-md font-semibold cursor-pointer transition-colors ${
+                    slowDays === d ? 'bg-amber-600 text-white' : 'text-[#6e5543] hover:text-[#3B281A]'
+                  }`}
+                >
+                  {d} ngày
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={toggleSlowMoving}
+              disabled={loadingSlow}
+              className="text-xs font-semibold text-[#224B85] hover:underline cursor-pointer disabled:opacity-60"
+            >
+              {loadingSlow ? 'Đang tải...' : showSlowAll ? 'Thu gọn (Top 6)' : 'Xem Top 50 mã vốn cao nhất'}
+            </button>
+          </div>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-xs text-left">
@@ -652,12 +877,16 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
               </tr>
             </thead>
             <tbody className="divide-y divide-[#F0E9DF]">
-              {displayedSlow.map((it: any) => (
+              {loadingSlow && displayedSlow.length === 0 ? (
+                <tr><td colSpan={5} className="py-6 text-center text-[#6e5543]">Đang tải danh sách chậm luân chuyển {slowDays} ngày...</td></tr>
+              ) : displayedSlow.length === 0 ? (
+                <tr><td colSpan={5} className="py-6 text-center text-[#234E36]">Không có mã chậm luân chuyển trong kỳ {slowDays} ngày!</td></tr>
+              ) : displayedSlow.map((it: any) => (
                 <tr key={it.barcode} className="hover:bg-[#FAF7F2]">
                   <td className="py-2 px-3 font-mono text-[11px]">{it.barcode}</td>
                   <td className="py-2 px-3 font-medium text-[#3B281A]">{it.product_name}</td>
                   <td className="py-2 px-3 text-[#6e5543]">{it.supplier}</td>
-                  <td className="py-2 px-3 text-right font-semibold">{it.close_qty}</td>
+                  <td className="py-2 px-3 text-right font-semibold">{fmtNum(it.close_qty)}</td>
                   <td className="py-2 px-3 text-right font-semibold text-[#9A2B26]">{fmtVnd(it.close_cst)}</td>
                 </tr>
               ))}
