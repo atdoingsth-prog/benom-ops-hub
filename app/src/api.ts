@@ -198,4 +198,24 @@ export interface NavIntent {
   openBm04No?: string;
   // 3PL Report ('delivery3pl')
   open3plSlipNo?: string;
+  // Prefill new order from Shipping Quote Calculator
+  prefillNewOrder?: {
+    source_warehouse?: string;
+    region?: string;
+    address?: string;
+    distance_km?: number;
+    carrier?: string;
+    shipping_fee_3pl?: number;
+    customer_paid_fee?: number;
+    require_install?: boolean;
+    notes?: string;
+    items?: Array<{
+      barcode: string;
+      product_name: string;
+      unit?: string;
+      qty: number;
+      net_weight_g: number;
+      source_warehouse: string;
+    }>;
+  };
 }

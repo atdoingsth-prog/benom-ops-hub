@@ -988,6 +988,7 @@ app.get('/api/master/products', wrap(async (req, res) => {
   const type = (req.query.type || '').trim();
   const includeStock = req.query.include_stock_9005 === '1';
   const includeAllStock = req.query.include_all_stock === '1';
+  const includeDims = req.query.include_dims === '1';
   const defaultLimit = (includeStock || includeAllStock) ? 20 : 50;
   const limit = Math.max(1, Math.min(300, Number(req.query.limit) || defaultLimit));
   const offset = Math.max(0, Number(req.query.offset) || 0);
@@ -1008,19 +1009,32 @@ app.get('/api/master/products', wrap(async (req, res) => {
     filterParams.push(type);
   }
 
+  const dimCols = includeDims
+    ? `, p.length_mm, p.width_mm, p.height_mm, p.box_w_cm, p.box_d_cm, p.box_h_cm, p.qty_per_box`
+    : '';
   const cols = `p.barcode, p.name_vn, p.item_type, p.supplier_name, p.unit, p.retail_price, p.cost_price,
                 p.net_weight_g, p.p_handling, p.install_level, p.p_installation,
-                p.warranty_policy, p.warranty_months, p.min_stock_3001, p.is_top_50`;
+                p.warranty_policy, p.warranty_months, p.min_stock_3001, p.is_top_50${dimCols}`;
+  const orderSql = q
+    ? `ORDER BY CASE WHEN p.barcode = ? THEN 0 ELSE 1 END, p.is_top_50 DESC, p.net_weight_g DESC, p.name_vn ASC`
+    : `ORDER BY p.is_top_50 DESC, p.net_weight_g DESC, p.name_vn ASC`;
   const selectSql = includeStock
     ? `SELECT ${cols}, COALESCE(e.close_qty, 0) as stock_9005
        FROM products p
        LEFT JOIN erp_snapshots e ON e.barcode = p.barcode AND e.store_code = '9005' AND e.target_month = ?
-       ${where} ORDER BY p.is_top_50 DESC, p.net_weight_g DESC, p.name_vn ASC LIMIT ? OFFSET ?`
-    : `SELECT ${cols} FROM products p ${where} ORDER BY p.is_top_50 DESC, p.net_weight_g DESC, p.name_vn ASC LIMIT ? OFFSET ?`;
+       ${where} ${orderSql} LIMIT ? OFFSET ?`
+    : `SELECT ${cols} FROM products p ${where} ${orderSql} LIMIT ? OFFSET ?`;
+  const selectParams = [
+    ...(includeStock ? [latest9005] : []),
+    ...filterParams,
+    ...(q ? [q] : []),
+    limit,
+    offset,
+  ];
 
   const [countRow, prods, guideMap] = await Promise.all([
     dbGet(`SELECT COUNT(*) as c FROM products p ${where}`, filterParams),
-    dbAll(selectSql, includeStock ? [latest9005, ...filterParams, limit, offset] : [...filterParams, limit, offset]),
+    dbAll(selectSql, selectParams),
     getGuideBarcodeMap(),
   ]);
   res.setHeader('X-Total-Count', String(countRow?.c || prods.length));
@@ -3822,6 +3836,51 @@ app.get('/api/admin/backup', requireRoles('ADMIN'), wrap(async (req, res) => {
   }
   res.setHeader('Content-Length', String(rawBuf.length));
   res.end(rawBuf);
+}));
+
+// ─── SHIPPING QUOTE TARIFFS (AHAMOVE / XANH SM / CPN / CHÀNH XE) ─
+app.get('/api/shipping/tariffs', wrap(async (_req, res) => {
+  const cached = getServerCache('shipping:tariffs');
+  if (cached) return res.json(cached);
+  const row = await dbGet(`SELECT config_json, updated_by, updated_at FROM shipping_tariffs WHERE id = 'default'`);
+  let parsed = null;
+  if (row?.config_json) {
+    try { parsed = JSON.parse(row.config_json); } catch { parsed = null; }
+  }
+  res.json(setServerCache('shipping:tariffs', {
+    config: parsed,
+    updated_by: row?.updated_by || null,
+    updated_at: row?.updated_at || null,
+  }, 300000));
+}));
+
+app.put('/api/shipping/tariffs', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const before = await dbGet(`SELECT config_json, updated_by, updated_at FROM shipping_tariffs WHERE id = 'default'`);
+  if (req.body?.reset === true) {
+    await dbRun(`DELETE FROM shipping_tariffs WHERE id = 'default'`);
+    clearServerCache();
+    await logAudit(req, 'RESET_SHIPPING_TARIFFS', 'shipping_tariffs', 'default', 'Khôi phục bảng cước vận chuyển mặc định', before || null, { reset: true });
+    return res.json({ ok: true, reset: true });
+  }
+  const cfg = req.body?.config;
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
+    return res.status(400).json({ error: 'Cấu hình bảng giá không hợp lệ.' });
+  }
+  const updatedBy = req.user?.full_name || req.user?.email || 'Admin';
+  const updatedAt = getVnDateTime();
+  const serialized = JSON.stringify(cfg);
+  await dbRun(
+    `INSERT INTO shipping_tariffs (id, config_json, updated_by, updated_at)
+     VALUES ('default', ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       config_json = excluded.config_json,
+       updated_by = excluded.updated_by,
+       updated_at = excluded.updated_at`,
+    [serialized, updatedBy, updatedAt]
+  );
+  clearServerCache();
+  await logAudit(req, 'UPDATE_SHIPPING_TARIFFS', 'shipping_tariffs', 'default', `Cập nhật bảng cước báo giá vận chuyển`, before ? { updated_by: before.updated_by, updated_at: before.updated_at } : null, { updated_by: updatedBy, updated_at: updatedAt });
+  res.json({ ok: true, updated_by: updatedBy, updated_at: updatedAt });
 }));
 
 // Global API error handler

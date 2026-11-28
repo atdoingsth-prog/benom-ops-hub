@@ -1,6 +1,6 @@
 import React, { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import {
-  ArrowUpRight, BarChart3, Check, Download, GitMerge, Plus, Search, Sparkles, Trash2, Truck, UploadCloud, X
+  ArrowUpRight, BarChart3, Calculator, Check, Download, GitMerge, Plus, Search, Sparkles, Trash2, Truck, UploadCloud, X
 } from 'lucide-react';
 import {
   Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis
@@ -9,6 +9,7 @@ import { apiDownload, apiGet, apiSend, apiUpload, AuthUser, fmtMonth, fmtVnd, Na
 
 const SlipDetailModal = lazy(() => import('../components/SlipDetailModal'));
 const MergeModal = lazy(() => import('../components/MergeModal'));
+const ShippingQuotePanel = lazy(() => import('../components/ShippingQuotePanel'));
 
 interface Props {
   user: AuthUser;
@@ -22,6 +23,13 @@ const CARRIERS = ['', 'Ahamove', 'Xanh SM', '247 Express', 'Sagawa', 'Toàn Nh�
 
 export default function DeliveryTrackingView({ user, onToast, onNavigate, navIntent, onConsumeIntent }: Props) {
   const canEdit = user.role === 'ADMIN' || user.role === 'EDITOR';
+  const [subTab, setSubTabState] = useState<'report' | 'quote'>(() =>
+    localStorage.getItem('benom_3pl_subtab') === 'quote' ? 'quote' : 'report'
+  );
+  const setSubTab = (t: 'report' | 'quote') => {
+    setSubTabState(t);
+    localStorage.setItem('benom_3pl_subtab', t);
+  };
   const [pushingSlip, setPushingSlip] = useState<string | null>(null);
   const [detailSlipNo, setDetailSlipNo] = useState<string | null>(null);
   const [mergeModal, setMergeModal] = useState<{ open: boolean; masterKey?: string | null; childKeys?: string[] }>({ open: false });
@@ -87,13 +95,22 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate, navInt
     }
   };
 
-  useEffect(() => { load(month); }, [month]);
+  useEffect(() => {
+    if (subTab === 'report') load(month);
+  }, [month, subTab]);
 
   useEffect(() => {
     if (!navIntent?.nonce) return;
     const slip = navIntent.open3plSlipNo;
+    const nextSub = navIntent.subTab;
     onConsumeIntent?.();
-    if (slip) setDetailSlipNo(slip);
+    if (nextSub === 'quote' || nextSub === 'report') {
+      setSubTab(nextSub);
+    }
+    if (slip) {
+      setSubTab('report');
+      setDetailSlipNo(slip);
+    }
   }, [navIntent?.nonce]);
 
   const handleUploadPos = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -259,76 +276,112 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate, navInt
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-bold text-[#3B281A]">Theo Dõi Giao Hàng 3PL (Từ POS Transaction Detail)</h1>
-          <p className="text-xs text-[#6e5543] mt-0.5">
-            Thay thế hoàn toàn Google Sheets: nạp <code>transaction_detail_*.csv</code> để tự tách Phí giao/lắp & Net Sales (Tax excl.), điền 3PL & Fee trực tiếp và tự xuất bảng Pivot.
-          </p>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <select
-            value={month === 'LATEST' ? (data?.month || '') : month}
-            onChange={e => setMonth(e.target.value)}
-            className="px-3 py-2 rounded-lg border border-[#D6BCA5] bg-white text-xs font-bold text-[#3B281A]"
+      {/* Sub-tab Switcher */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="inline-flex bg-[#EFE7DC] p-1 rounded-xl gap-1">
+          <button
+            type="button"
+            onClick={() => setSubTab('report')}
+            className={`px-3.5 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer transition ${
+              subTab === 'report' ? 'bg-[#3B281A] text-white shadow-sm' : 'text-[#3B281A] hover:bg-white/60'
+            }`}
           >
-            <option value="ALL">Tất cả các tháng (2026)</option>
-            {(data?.available_months || []).map((m: string) => (
-              <option key={m} value={m}>{fmtMonth(m)}</option>
-            ))}
-          </select>
-
-          {canEdit && (
-            <>
-              <label className="px-3.5 py-2 rounded-lg bg-[#3B281A] text-[#F8F4EC] text-xs font-semibold flex items-center gap-1.5 hover:bg-[#563C28] cursor-pointer">
-                <UploadCloud className="w-4 h-4" />
-                {uploading ? 'Đang nạp CSV...' : 'Nạp transaction_detail CSV'}
-                <input type="file" accept=".csv" className="hidden" onChange={handleUploadPos} />
-              </label>
-
-              <button
-                onClick={() => setMergeModal({ open: true, masterKey: null, childKeys: [] })}
-                className="px-3 py-2 rounded-lg border border-purple-700 text-purple-900 bg-purple-50 text-xs font-semibold flex items-center gap-1 hover:bg-purple-100 cursor-pointer"
-                title="Gộp bill thu phí ship / bill mua thêm giao chung 1 chuyến"
-              >
-                <GitMerge className="w-4 h-4" /> Gộp đơn
-              </button>
-
-              <button
-                onClick={() => { setNewSlip({ ...newSlip, sales_month: month === 'ALL' ? (data?.month || '2026-11') : month }); setShowAdd(true); }}
-                className="px-3 py-2 rounded-lg border border-[#3B281A] text-[#3B281A] bg-white text-xs font-semibold flex items-center gap-1 hover:bg-[#F8F4EC] cursor-pointer"
-              >
-                <Plus className="w-4 h-4" /> Thêm đơn Freeship
-              </button>
-
-              <button
-                disabled={exporting || loading}
-                onClick={async () => {
-                  setExporting(true);
-                  try {
-                    const m = data?.month || month;
-                    await apiDownload(`/api/delivery-tracking/export?month=${encodeURIComponent(m)}`, `Benom_3PL_Delivery_Report_${m}.xlsx`);
-                    onToast(`Đã xuất Excel Báo cáo 3PL (${m === 'ALL' ? '2026' : fmtMonth(m)})!`);
-                  } catch (e: any) {
-                    onToast(e.message, 'err');
-                  } finally {
-                    setExporting(false);
-                  }
-                }}
-                className="px-3.5 py-2 rounded-lg bg-[#234E36] text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-[#1b3d2a] cursor-pointer disabled:opacity-60"
-              >
-                <Download className="w-4 h-4" /> {exporting ? 'Đang xuất...' : 'Xuất Excel Pivot'}
-              </button>
-            </>
-          )}
+            <BarChart3 className="w-4 h-4" /> Theo dõi 3PL (POS)
+          </button>
+          <button
+            type="button"
+            onClick={() => setSubTab('quote')}
+            className={`px-3.5 py-2 rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer transition ${
+              subTab === 'quote' ? 'bg-[#3B281A] text-white shadow-sm' : 'text-[#3B281A] hover:bg-white/60'
+            }`}
+          >
+            <Calculator className="w-4 h-4" /> Tính phí & Báo giá Ship (Sales)
+          </button>
         </div>
       </div>
 
-      {loading || !data ? (
-        <div className="p-8 text-center text-[#6e5543] text-sm">Đang tải báo cáo giao hàng 3PL...</div>
+      {subTab === 'quote' ? (
+        <Suspense
+          fallback={
+            <div className="p-10 text-center text-xs text-[#6e5543] bg-white rounded-2xl border border-[#E6DDD1]">
+              Đang tải công cụ tính phí & báo giá vận chuyển...
+            </div>
+          }
+        >
+          <ShippingQuotePanel user={user} onToast={onToast} onNavigate={onNavigate} />
+        </Suspense>
       ) : (
+        <>
+          {/* Header */}
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div>
+              <h1 className="text-2xl font-bold text-[#3B281A]">Theo Dõi Giao Hàng 3PL (Từ POS Transaction Detail)</h1>
+              <p className="text-xs text-[#6e5543] mt-0.5">
+                Thay thế hoàn toàn Google Sheets: nạp <code>transaction_detail_*.csv</code> để tự tách Phí giao/lắp & Net Sales (Tax excl.), điền 3PL & Fee trực tiếp và tự xuất bảng Pivot.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <select
+                value={month === 'LATEST' ? (data?.month || '') : month}
+                onChange={e => setMonth(e.target.value)}
+                className="px-3 py-2 rounded-lg border border-[#D6BCA5] bg-white text-xs font-bold text-[#3B281A]"
+              >
+                <option value="ALL">Tất cả các tháng (2026)</option>
+                {(data?.available_months || []).map((m: string) => (
+                  <option key={m} value={m}>{fmtMonth(m)}</option>
+                ))}
+              </select>
+
+              {canEdit && (
+                <>
+                  <label className="px-3.5 py-2 rounded-lg bg-[#3B281A] text-[#F8F4EC] text-xs font-semibold flex items-center gap-1.5 hover:bg-[#563C28] cursor-pointer">
+                    <UploadCloud className="w-4 h-4" />
+                    {uploading ? 'Đang nạp CSV...' : 'Nạp transaction_detail CSV'}
+                    <input type="file" accept=".csv" className="hidden" onChange={handleUploadPos} />
+                  </label>
+
+                  <button
+                    onClick={() => setMergeModal({ open: true, masterKey: null, childKeys: [] })}
+                    className="px-3 py-2 rounded-lg border border-purple-700 text-purple-900 bg-purple-50 text-xs font-semibold flex items-center gap-1 hover:bg-purple-100 cursor-pointer"
+                    title="Gộp bill thu phí ship / bill mua thêm giao chung 1 chuyến"
+                  >
+                    <GitMerge className="w-4 h-4" /> Gộp đơn
+                  </button>
+
+                  <button
+                    onClick={() => { setNewSlip({ ...newSlip, sales_month: month === 'ALL' ? (data?.month || '2026-11') : month }); setShowAdd(true); }}
+                    className="px-3 py-2 rounded-lg border border-[#3B281A] text-[#3B281A] bg-white text-xs font-semibold flex items-center gap-1 hover:bg-[#F8F4EC] cursor-pointer"
+                  >
+                    <Plus className="w-4 h-4" /> Thêm đơn Freeship
+                  </button>
+
+                  <button
+                    disabled={exporting || loading}
+                    onClick={async () => {
+                      setExporting(true);
+                      try {
+                        const m = data?.month || month;
+                        await apiDownload(`/api/delivery-tracking/export?month=${encodeURIComponent(m)}`, `Benom_3PL_Delivery_Report_${m}.xlsx`);
+                        onToast(`Đã xuất Excel Báo cáo 3PL (${m === 'ALL' ? '2026' : fmtMonth(m)})!`);
+                      } catch (e: any) {
+                        onToast(e.message, 'err');
+                      } finally {
+                        setExporting(false);
+                      }
+                    }}
+                    className="px-3.5 py-2 rounded-lg bg-[#234E36] text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-[#1b3d2a] cursor-pointer disabled:opacity-60"
+                  >
+                    <Download className="w-4 h-4" /> {exporting ? 'Đang xuất...' : 'Xuất Excel Pivot'}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+
+          {loading || !data ? (
+            <div className="p-8 text-center text-[#6e5543] text-sm">Đang tải báo cáo giao hàng 3PL...</div>
+          ) : (
         <>
           {/* KPI Summary */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
@@ -665,6 +718,8 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate, navInt
               </div>
             )}
           </div>
+            </>
+          )}
         </>
       )}
 

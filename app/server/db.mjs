@@ -476,6 +476,12 @@ const SCHEMA_STATEMENTS = [
     notes TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now', '+7 hours'))
   )`,
+  `CREATE TABLE IF NOT EXISTS shipping_tariffs (
+    id TEXT PRIMARY KEY,
+    config_json TEXT NOT NULL,
+    updated_by TEXT DEFAULT '',
+    updated_at TEXT DEFAULT (datetime('now', '+7 hours'))
+  )`,
   // Performance indexes for Turso Cloud & Local SQLite (eliminates full-table scans on joins & filters)
   `CREATE INDEX IF NOT EXISTS idx_erp_store_month_bc ON erp_snapshots(store_code, target_month, barcode)`,
   `CREATE INDEX IF NOT EXISTS idx_orders_invoice ON orders(invoice_no)`,

@@ -196,6 +196,47 @@ export default function OrdersDispatchView({ user, onToast, onPrint, onNavigate,
           } else {
             await openOrCreateHandoverForOrder(ord);
           }
+          return;
+        }
+        if (intent.prefillNewOrder && canManageOrders) {
+          ensureStaffLoaded();
+          const pf = intent.prefillNewOrder;
+          const reqInstall = pf.require_install !== undefined ? pf.require_install : true;
+          setNewOrder((prev: any) => ({
+            ...prev,
+            invoice_no: '',
+            order_date: new Date().toISOString().slice(0, 10),
+            delivery_date: new Date(Date.now() + 86400000).toISOString().slice(0, 10),
+            customer_name: '',
+            customer_phone: '',
+            address: pf.address ?? prev.address,
+            region: pf.region ?? prev.region,
+            distance_km: pf.distance_km ?? prev.distance_km,
+            carrier: pf.carrier ?? prev.carrier,
+            tracking_no: '',
+            source_warehouse: pf.source_warehouse ?? prev.source_warehouse,
+            shipping_fee_3pl: pf.shipping_fee_3pl ?? 0,
+            customer_paid_fee: pf.customer_paid_fee ?? 0,
+            is_promo_free_ship: (pf.customer_paid_fee ?? 0) === 0,
+            require_install: reqInstall,
+            ktvs: reqInstall ? [{ code: '260135', name: 'Trần Anh Tuyến' }] : [],
+            notes: pf.notes ?? '',
+            items: Array.isArray(pf.items) && pf.items.length > 0
+              ? pf.items.map(it => ({
+                  barcode: it.barcode,
+                  product_name: it.product_name,
+                  unit: it.unit || 'Cái',
+                  qty: Number(it.qty) || 1,
+                  net_weight_g: Number(it.net_weight_g) || 0,
+                  source_warehouse: it.source_warehouse || pf.source_warehouse || '9005',
+                  moving_no: '',
+                }))
+              : [],
+          }));
+          setPosHintSummary('');
+          setSubTab('orders');
+          setShowNewOrder(true);
+          onToast('Đã nạp dữ liệu báo giá vận chuyển vào form tạo đơn hàng mới!');
         }
       } catch (e: any) {
         onToast(e.message, 'err');
@@ -487,6 +528,15 @@ export default function OrdersDispatchView({ user, onToast, onPrint, onNavigate,
               <ClipboardCheck className="w-3.5 h-3.5" /> Biên bản {handoversLoaded ? `(${handovers.length})` : ''}
             </button>
           </div>
+          {onNavigate && (
+            <button
+              onClick={() => onNavigate('delivery3pl', { subTab: 'quote' })}
+              className="px-3 py-2 rounded-lg border border-amber-700 text-amber-900 bg-amber-50 text-xs font-semibold flex items-center gap-1.5 hover:bg-amber-100 cursor-pointer"
+              title="Mở công cụ tính phí & báo giá Ahamove / Xanh SM / CPN"
+            >
+              <Truck className="w-4 h-4" /> Tính phí Ship
+            </button>
+          )}
           {canManageOrders && (
             <>
               <button
