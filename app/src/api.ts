@@ -177,7 +177,8 @@ export type PrintDoc =
   | { type: 'SLIP'; data: any }
   | { type: 'WARRANTY'; data: any }
   | { type: 'BM03'; data: any }
-  | { type: 'BM04'; data: any };
+  | { type: 'BM04'; data: any }
+  | { type: 'PO'; data: any };
 
 export interface NavIntent {
   nonce?: number;
@@ -189,9 +190,31 @@ export interface NavIntent {
   preferredDocType?: 'BM-01' | 'BM-05';
   openOrderId?: number;
   openOrderInvoice?: string;
-  // Warehouse Slips ('warehouse')
+  // Warehouse Slips & Purchase Orders ('warehouse')
   openSlipId?: number;
   openSlipNo?: string;
+  openPoId?: number;
+  prefillNewPo?: {
+    po_category?: 'FACTORY' | 'TRADING';
+    supplier_code?: string;
+    supplier_name?: string;
+    vendor_legal_name?: string;
+    vendor_tax_code?: string;
+    vendor_address?: string;
+    vendor_bank_account?: string;
+    vendor_bank_name?: string;
+    vendor_contact?: string;
+    contract_no?: string;
+    payment_mode?: string;
+    items?: Array<{
+      barcode: string;
+      product_name: string;
+      unit?: string;
+      qty: number;
+      unit_price: number;
+      remark?: string;
+    }>;
+  };
   // Warranty & QC ('warranty')
   openTicketNo?: string;
   openBm03No?: string;

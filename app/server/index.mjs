@@ -961,6 +961,373 @@ app.get('/api/dashboard/best-sellers', wrap(async (req, res) => {
   res.json(setServerCache(cacheKey, { days, sort, months: [...months].reverse(), total: total || { count: 0, total_qty: 0, total_sales_amt: 0 }, items }, 45000));
 }));
 
+// ─── PURCHASE ORDER / SAFETY STOCK PLANNING (3001 + 9005 & SEASONALITY) ─
+const SEASON_PROFILES = {
+  NORMAL: {
+    id: 'NORMAL',
+    label: 'Ngày thường (Chuẩn)',
+    multipliers: { A: 1.0, B: 1.0, C: 1.0 },
+    extraLeadDays: 0,
+    description: 'Tối ưu vòng quay vốn ngày thường dựa trên sức bán thực tế 3–6 tháng.',
+  },
+  PEAK_BF: {
+    id: 'PEAK_BF',
+    label: 'Black Friday / Cuối năm',
+    multipliers: { A: 1.45, B: 1.35, C: 1.15 },
+    extraLeadDays: 3,
+    description: 'Ưu tiên tăng +35% đến +45% tồn kho an toàn & +3 ngày đệm cho mùa sale cuối năm.',
+  },
+  PEAK_TET: {
+    id: 'PEAK_TET',
+    label: 'Cao điểm Tết Nguyên Đán',
+    multipliers: { A: 1.65, B: 1.5, C: 1.25 },
+    extraLeadDays: 10,
+    description: 'Ưu tiên tăng +50% đến +65% tồn kho an toàn & +10 ngày đệm lịch nghỉ Tết của xưởng/NCC.',
+  },
+};
+
+function normSupKey(s) {
+  return String(s || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[đĐ]/g, 'd')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function getSuggestedSeason() {
+  const m = getVnShiftedDate().getUTCMonth() + 1;
+  if (m === 11) return 'PEAK_BF';
+  if (m === 12 || m === 1) return 'PEAK_TET';
+  return 'NORMAL';
+}
+
+function resolvePartnerForProduct(p, partnerByCode, partnerByNorm, partnersList) {
+  const code = String(p.supplier_code || '').trim();
+  if (code && partnerByCode.has(code)) return partnerByCode.get(code);
+  const supNorm = normSupKey(p.supplier_name);
+  if (supNorm && partnerByNorm.has(supNorm)) return partnerByNorm.get(supNorm);
+  if (supNorm.length >= 4) {
+    for (const pt of partnersList) {
+      const pNorm = normSupKey(pt.name);
+      if (pNorm && (pNorm.includes(supNorm) || supNorm.includes(pNorm))) return pt;
+    }
+  }
+  return null;
+}
+
+async function computePurchaseDataset(seasonInput) {
+  const season = SEASON_PROFILES[seasonInput] ? seasonInput : 'NORMAL';
+  const cacheKey = `dashboard:purchase-dataset:${season}`;
+  const cached = getServerCache(cacheKey);
+  if (cached) return cached;
+
+  const seasonCfg = SEASON_PROFILES[season];
+  const [latestRows, monthRows3001, products, partners] = await Promise.all([
+    dbAll(`SELECT store_code, MAX(target_month) as m FROM erp_snapshots WHERE store_code IN ('3001','9005') GROUP BY store_code`),
+    dbAll(`SELECT DISTINCT target_month FROM erp_snapshots WHERE store_code = '3001' ORDER BY target_month DESC LIMIT 6`),
+    dbAll(`
+      SELECT barcode, name_vn, supplier_code, supplier_name, product_family,
+             cost_price, retail_price, min_stock_3001, is_top_50, unit, status
+      FROM products
+      WHERE COALESCE(NULLIF(item_type,''), 'PRODUCT') = 'PRODUCT'
+        AND LOWER(COALESCE(status,'')) NOT LIKE '%discontinue%'
+    `),
+    dbAll(`SELECT * FROM partners ORDER BY name ASC`),
+  ]);
+
+  const latestMap = new Map(latestRows.map(r => [r.store_code, r.m]));
+  const latest3001 = latestMap.get('3001') || '202611';
+  const latest9005 = latestMap.get('9005') || '202611';
+  const months6 = monthRows3001.map(r => r.target_month);
+  if (months6.length === 0) months6.push(latest3001);
+  const months3 = months6.slice(0, 3);
+  const m6Set = new Set(months6);
+  const m3Set = new Set(months3);
+  const ph6 = months6.map(() => '?').join(',');
+
+  const [salesRows, stock3001Rows, stock9005Rows] = await Promise.all([
+    dbAll(
+      `SELECT barcode, target_month, SUM(sales_qty) as qty FROM erp_snapshots WHERE store_code = '3001' AND target_month IN (${ph6}) GROUP BY barcode, target_month`,
+      months6
+    ),
+    dbAll(`SELECT barcode, close_qty FROM erp_snapshots WHERE store_code = '3001' AND target_month = ?`, [latest3001]),
+    dbAll(`SELECT barcode, close_qty FROM erp_snapshots WHERE store_code = '9005' AND target_month = ?`, [latest9005]),
+  ]);
+
+  const s3Map = new Map(stock3001Rows.map(r => [r.barcode, Number(r.close_qty) || 0]));
+  const s9Map = new Map(stock9005Rows.map(r => [r.barcode, Number(r.close_qty) || 0]));
+  const salesMap = new Map();
+  for (const r of salesRows) {
+    if (!salesMap.has(r.barcode)) salesMap.set(r.barcode, new Map());
+    salesMap.get(r.barcode).set(r.target_month, Math.max(0, Number(r.qty) || 0));
+  }
+
+  const partnerByCode = new Map(partners.map(pt => [String(pt.code || '').trim(), pt]));
+  const partnerByNorm = new Map(partners.map(pt => [normSupKey(pt.name), pt]));
+
+  const skuCountBySupplier = new Map();
+  const rows = [];
+
+  for (const p of products) {
+    const partner = resolvePartnerForProduct(p, partnerByCode, partnerByNorm, partners);
+    if (partner && String(partner.partner_type || '').toUpperCase() === 'DISCONTINUE') continue;
+
+    const supName = partner?.name || p.supplier_name || 'Chưa phân loại NCC';
+    const supCode = partner?.code || p.supplier_code || '';
+    const partnerType = partner?.partner_type || 'TRADING';
+    skuCountBySupplier.set(supName, (skuCountBySupplier.get(supName) || 0) + 1);
+
+    const stock3001 = s3Map.get(p.barcode) || 0;
+    const stock9005 = s9Map.get(p.barcode) || 0;
+    const totalStock = stock3001 + stock9005;
+    const effectiveStock = Math.max(0, totalStock);
+
+    const mSales = salesMap.get(p.barcode);
+    let sold3m = 0;
+    let sold6m = 0;
+    let peakMonthly = 0;
+    const series6 = [];
+    if (mSales) {
+      for (const m of months6) {
+        if (!m6Set.has(m)) continue;
+        const v = mSales.get(m) || 0;
+        series6.push(v);
+        sold6m += v;
+        if (m3Set.has(m)) sold3m += v;
+        if (v > peakMonthly) peakMonthly = v;
+      }
+    }
+
+    const avg3m = months3.length > 0 ? sold3m / months3.length : 0;
+    const avg6m = months6.length > 0 ? sold6m / months6.length : 0;
+    const baseMonthlyVel = months6.length >= 4 ? (0.7 * avg3m + 0.3 * avg6m) : avg3m;
+
+    let stdMonthly = 0;
+    if (series6.length > 1 && avg6m > 0) {
+      const variance = series6.reduce((acc, v) => acc + Math.pow(v - avg6m, 2), 0) / series6.length;
+      stdMonthly = Math.sqrt(variance);
+    }
+
+    const isTop50 = Number(p.is_top_50) === 1;
+    const abcTier = (isTop50 || baseMonthlyVel >= 8) ? 'A' : (baseMonthlyVel >= 2 ? 'B' : 'C');
+    const zVal = abcTier === 'A' ? 1.65 : abcTier === 'B' ? 1.28 : 1.04;
+
+    const isFactory = String(partnerType).toUpperCase() === 'FACTORY';
+    const baseLeadDays = isFactory ? 30 : partner?.partner_type === 'TRADING' ? 14 : 21;
+    const reviewDays = isFactory ? 45 : 30;
+    const floorBufferDays = isFactory ? 10 : 7;
+    const leadTimeDays = baseLeadDays + seasonCfg.extraLeadDays;
+
+    const seasonFactor = seasonCfg.multipliers[abcTier];
+    const adjMonthlyVel = baseMonthlyVel * seasonFactor;
+    const adjDailyVel = adjMonthlyVel / 30;
+
+    const statSs = zVal * (stdMonthly / 30) * Math.sqrt(leadTimeDays) * seasonFactor;
+    const floorSs = adjDailyVel * floorBufferDays;
+    const displayFloor = Math.max(Number(p.min_stock_3001) || 0, abcTier === 'A' ? 2 : (baseMonthlyVel > 0 ? 1 : 0));
+    const safetyStock = (baseMonthlyVel > 0 || isTop50)
+      ? Math.max(displayFloor, Math.ceil(Math.max(statSs, floorSs)))
+      : displayFloor;
+
+    const reorderPoint = (baseMonthlyVel > 0 || isTop50)
+      ? Math.ceil(adjDailyVel * leadTimeDays) + safetyStock
+      : displayFloor;
+    const targetStock = (baseMonthlyVel > 0 || isTop50)
+      ? Math.ceil(adjDailyVel * (leadTimeDays + reviewDays)) + safetyStock
+      : displayFloor;
+    const suggestedOrderQty = (totalStock <= reorderPoint && (baseMonthlyVel > 0 || isTop50 || totalStock < 0))
+      ? Math.max(1, targetStock - effectiveStock)
+      : 0;
+    const docDays = adjDailyVel > 0 ? Math.round(effectiveStock / adjDailyVel) : 999;
+
+    let urgency = 'SAFE';
+    if (baseMonthlyVel > 0 || isTop50 || totalStock < 0) {
+      if (totalStock < 0 || (totalStock === 0 && baseMonthlyVel > 0) || totalStock < safetyStock) urgency = 'CRITICAL';
+      else if (totalStock <= reorderPoint) urgency = 'WARNING';
+    }
+
+    rows.push({
+      barcode: p.barcode,
+      product_name: p.name_vn,
+      unit: p.unit || 'Cái',
+      supplier_code: supCode,
+      supplier_name: supName,
+      partner_type: partnerType,
+      partner_category: partner?.category || p.product_family || '',
+      partner_contact: partner?.contact_info || '',
+      abc_tier: abcTier,
+      stock_3001: stock3001,
+      stock_9005: stock9005,
+      total_stock: totalStock,
+      sold_3m: Math.round(sold3m),
+      sold_6m: Math.round(sold6m),
+      peak_monthly: Math.round(peakMonthly),
+      base_monthly_vel: Number(baseMonthlyVel.toFixed(1)),
+      adj_monthly_vel: Number(adjMonthlyVel.toFixed(1)),
+      season_factor: seasonFactor,
+      lead_time_days: leadTimeDays,
+      safety_stock: safetyStock,
+      reorder_point: reorderPoint,
+      target_stock: targetStock,
+      suggested_order_qty: suggestedOrderQty,
+      doc_days: docDays,
+      urgency,
+      cost_price: Number(p.cost_price) || 0,
+    });
+  }
+
+  const urgRank = { CRITICAL: 0, WARNING: 1, SAFE: 2 };
+  rows.sort((a, b) => {
+    const ur = urgRank[a.urgency] - urgRank[b.urgency];
+    if (ur !== 0) return ur;
+    if (a.doc_days !== b.doc_days) return a.doc_days - b.doc_days;
+    return b.adj_monthly_vel - a.adj_monthly_vel;
+  });
+
+  const supAgg = new Map();
+  let criticalCount = 0;
+  let warningCount = 0;
+  for (const r of rows) {
+    if (r.urgency === 'CRITICAL') criticalCount++;
+    else if (r.urgency === 'WARNING') warningCount++;
+    const cur = supAgg.get(r.supplier_name) || { name: r.supplier_name, count: 0, need_count: 0 };
+    cur.count++;
+    if (r.urgency !== 'SAFE') cur.need_count++;
+    supAgg.set(r.supplier_name, cur);
+  }
+  const suppliers = [...supAgg.values()].sort((a, b) => b.need_count - a.need_count || b.count - a.count || a.name.localeCompare(b.name));
+
+  const dataset = {
+    season,
+    suggested_season: getSuggestedSeason(),
+    season_meta: seasonCfg,
+    latest3001,
+    latest9005,
+    skuCountBySupplier,
+    summary: {
+      total_active: rows.length,
+      critical_count: criticalCount,
+      warning_count: warningCount,
+      need_order_count: criticalCount + warningCount,
+    },
+    suppliers,
+    rows,
+  };
+  return setServerCache(cacheKey, dataset, 60000);
+}
+
+app.get('/api/dashboard/purchase-suggestions', wrap(async (req, res) => {
+  const dataset = await computePurchaseDataset(String(req.query.season || 'NORMAL'));
+  const urgency = String(req.query.urgency || 'NEED_ORDER');
+  const supplier = String(req.query.supplier || 'ALL').trim();
+  const q = String(req.query.q || '').trim().toLowerCase();
+  const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 12));
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+
+  const filtered = dataset.rows.filter(r => {
+    if (urgency === 'NEED_ORDER' && r.urgency === 'SAFE') return false;
+    if (urgency === 'CRITICAL' && r.urgency !== 'CRITICAL') return false;
+    if (supplier && supplier !== 'ALL' && r.supplier_name !== supplier) return false;
+    if (q) {
+      return (
+        String(r.barcode).toLowerCase().includes(q) ||
+        String(r.product_name || '').toLowerCase().includes(q) ||
+        String(r.supplier_name || '').toLowerCase().includes(q)
+      );
+    }
+    return true;
+  });
+
+  res.setHeader('X-Total-Count', String(filtered.length));
+  res.json({
+    season: dataset.season,
+    suggested_season: dataset.suggested_season,
+    season_meta: dataset.season_meta,
+    latest3001: dataset.latest3001,
+    latest9005: dataset.latest9005,
+    summary: {
+      ...dataset.summary,
+      filtered_count: filtered.length,
+    },
+    suppliers: dataset.suppliers,
+    items: filtered.slice(offset, offset + limit),
+  });
+}));
+
+app.get('/api/dashboard/supplier-info', wrap(async (req, res) => {
+  const season = String(req.query.season || 'NORMAL');
+  const supplierQuery = String(req.query.supplier || '').trim();
+  const supplierNameFallback = String(req.query.supplier_name || supplierQuery).trim();
+  const focusBarcode = String(req.query.barcode || '').trim();
+
+  const [dataset, partners] = await Promise.all([
+    computePurchaseDataset(season),
+    dbAll(`SELECT * FROM partners ORDER BY name ASC`),
+  ]);
+
+  const qNorm = normSupKey(supplierQuery);
+  const nameNorm = normSupKey(supplierNameFallback);
+  const partner = partners.find(pt =>
+    (supplierQuery && String(pt.code || '').trim() === supplierQuery) ||
+    (qNorm && normSupKey(pt.name) === qNorm) ||
+    (nameNorm && normSupKey(pt.name) === nameNorm) ||
+    (nameNorm.length >= 4 && (normSupKey(pt.name).includes(nameNorm) || nameNorm.includes(normSupKey(pt.name))))
+  );
+
+  let focusItem = focusBarcode ? dataset.rows.find(r => r.barcode === focusBarcode) || null : null;
+  if (!focusItem && focusBarcode) {
+    const prod = await dbGet(`SELECT barcode, name_vn, supplier_code, supplier_name, unit, min_stock_3001 FROM products WHERE barcode = ?`, [focusBarcode]);
+    if (prod) {
+      focusItem = {
+        barcode: prod.barcode,
+        product_name: prod.name_vn,
+        unit: prod.unit || 'Cái',
+        supplier_code: partner?.code || prod.supplier_code || '',
+        supplier_name: partner?.name || prod.supplier_name || supplierNameFallback,
+        stock_3001: 0,
+        stock_9005: 0,
+        total_stock: 0,
+        adj_monthly_vel: 0,
+        safety_stock: Number(prod.min_stock_3001) || 2,
+        reorder_point: Number(prod.min_stock_3001) || 2,
+        suggested_order_qty: Number(prod.min_stock_3001) || 2,
+      };
+    }
+  }
+
+  const matchSupName = partner?.name || focusItem?.supplier_name || supplierNameFallback;
+  const matchNorm = normSupKey(matchSupName);
+  const supItems = dataset.rows.filter(r =>
+    r.barcode !== focusBarcode &&
+    ((partner?.code && r.supplier_code === partner.code) || normSupKey(r.supplier_name) === matchNorm || normSupKey(r.supplier_name) === nameNorm)
+  );
+  const otherLowStock = supItems.filter(r => r.urgency !== 'SAFE').slice(0, 20);
+  const isFactory = String(partner?.partner_type || focusItem?.partner_type || '').toUpperCase() === 'FACTORY';
+  const seasonCfg = SEASON_PROFILES[season] || SEASON_PROFILES.NORMAL;
+
+    res.json({
+    supplier: {
+      code: partner?.code || focusItem?.supplier_code || supplierQuery || '',
+      name: partner?.name || matchSupName || 'Nhà cung cấp benom',
+      partner_type: partner?.partner_type || (isFactory ? 'FACTORY' : 'TRADING'),
+      category: partner?.category || focusItem?.partner_category || '',
+      contact_info: partner?.contact_info || '',
+      legal_name: partner?.legal_name || '',
+      tax_code: partner?.tax_code || '',
+      address: partner?.address || '',
+      bank_account: partner?.bank_account || '',
+      bank_name: partner?.bank_name || '',
+      contract_no: partner?.contract_no || '',
+      payment_terms: partner?.payment_terms || (isFactory ? '50_50' : '100_NET30'),
+      lead_time_days: (isFactory ? 30 : 14) + seasonCfg.extraLeadDays,
+      sku_count: dataset.skuCountBySupplier.get(partner?.name || matchSupName) || supItems.length + (focusItem ? 1 : 0),
+    },
+    focus_item: focusItem,
+    other_low_stock_items: otherLowStock,
+  });
+}));
+
 async function getGuideBarcodeMap() {
   const cached = getServerCache('guides:barcode-map');
   if (cached) return cached;
@@ -1105,6 +1472,54 @@ app.get('/api/master/lookups', wrap(async (req, res) => {
     dbAll('SELECT * FROM partners ORDER BY partner_type, name'),
   ]);
   res.json(setServerCache('master:lookups', { staff, warehouses, partners }, 120000));
+}));
+
+app.put('/api/master/partners/:code', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const code = String(req.params.code || '').trim();
+  const name = String(req.body?.name || '').trim();
+  const partnerType = String(req.body?.partner_type || 'TRADING').trim().toUpperCase();
+  const category = String(req.body?.category || '').trim();
+  const contactInfo = String(req.body?.contact_info || '').trim();
+  if (!code || !name) {
+    return res.status(400).json({ error: 'Thiếu mã hoặc tên Nhà Cung Cấp.' });
+  }
+  const before = await dbGet(`SELECT * FROM partners WHERE code = ?`, [code]);
+  const legalName = req.body?.legal_name !== undefined ? String(req.body.legal_name || '').trim() : (before?.legal_name || '');
+  const taxCode = req.body?.tax_code !== undefined ? String(req.body.tax_code || '').trim() : (before?.tax_code || '');
+  const address = req.body?.address !== undefined ? String(req.body.address || '').trim() : (before?.address || '');
+  const bankAccount = req.body?.bank_account !== undefined ? String(req.body.bank_account || '').trim() : (before?.bank_account || '');
+  const bankName = req.body?.bank_name !== undefined ? String(req.body.bank_name || '').trim() : (before?.bank_name || '');
+  const contractNo = req.body?.contract_no !== undefined ? String(req.body.contract_no || '').trim() : (before?.contract_no || '');
+  const paymentTerms = req.body?.payment_terms !== undefined ? String(req.body.payment_terms || '').trim() : (before?.payment_terms || '');
+
+  await dbRun(
+    `INSERT INTO partners (code, name, partner_type, category, contact_info, legal_name, tax_code, address, bank_account, bank_name, contract_no, payment_terms)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(code) DO UPDATE SET
+       name = excluded.name,
+       partner_type = excluded.partner_type,
+       category = excluded.category,
+       contact_info = excluded.contact_info,
+       legal_name = excluded.legal_name,
+       tax_code = excluded.tax_code,
+       address = excluded.address,
+       bank_account = excluded.bank_account,
+       bank_name = excluded.bank_name,
+       contract_no = excluded.contract_no,
+       payment_terms = excluded.payment_terms`,
+    [code, name, partnerType, category, contactInfo, legalName, taxCode, address, bankAccount, bankName, contractNo, paymentTerms]
+  );
+  clearServerCache();
+  await logAudit(req, 'UPDATE_PARTNER', 'PARTNER', code, `Cập nhật thông tin NCC ${name} (${code})`, before || null, {
+    code, name, partner_type: partnerType, category, contact_info: contactInfo, tax_code: taxCode, contract_no: contractNo,
+  });
+  res.json({
+    ok: true,
+    partner: {
+      code, name, partner_type: partnerType, category, contact_info: contactInfo,
+      legal_name: legalName, tax_code: taxCode, address, bank_account: bankAccount, bank_name: bankName, contract_no: contractNo, payment_terms: paymentTerms,
+    },
+  });
 }));
 
 app.post('/api/master/staff', requireRoles('ADMIN', 'EDITOR', 'KTV'), wrap(async (req, res) => {
@@ -3881,6 +4296,313 @@ app.put('/api/shipping/tariffs', requireRoles('ADMIN', 'EDITOR'), wrap(async (re
   clearServerCache();
   await logAudit(req, 'UPDATE_SHIPPING_TARIFFS', 'shipping_tariffs', 'default', `Cập nhật bảng cước báo giá vận chuyển`, before ? { updated_by: before.updated_by, updated_at: before.updated_at } : null, { updated_by: updatedBy, updated_at: updatedAt });
   res.json({ ok: true, updated_by: updatedBy, updated_at: updatedAt });
+}));
+
+// ─── PURCHASE ORDERS (FACTORY & TRAFFIC / TRADING POs) ────────
+async function nextPoNo() {
+  const d = getVnShiftedDate();
+  const yy = String(d.getUTCFullYear()).slice(-2);
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const base = `PO BN${yy}${mm}${dd}`;
+  const existing = await dbAll(`SELECT po_no FROM purchase_orders WHERE po_no LIKE ?`, [`${base}%`]);
+  if (existing.length === 0) return base;
+  const used = new Set(existing.map(r => String(r.po_no || '').trim()));
+  if (!used.has(base)) return base;
+  let seq = 2;
+  while (used.has(`${base}-${String(seq).padStart(2, '0')}`)) seq++;
+  return `${base}-${String(seq).padStart(2, '0')}`;
+}
+
+function computePoTotals(rawItems, rawVatRate, rawPayMode, rawDepPct) {
+  const items = (Array.isArray(rawItems) ? rawItems : []).map(it => {
+    const qty = Math.max(1, Number(it.qty) || 1);
+    const unitPrice = Math.max(0, Number(it.unit_price) || 0);
+    const lineTotal = Math.round(qty * unitPrice);
+    return {
+      product_code: String(it.product_code || '').trim(),
+      barcode: String(it.barcode || '').trim(),
+      product_name: String(it.product_name || '').trim(),
+      image_url: String(it.image_url || '').trim(),
+      unit: String(it.unit || 'Cái').trim() || 'Cái',
+      qty,
+      received_qty: Math.max(0, Number(it.received_qty) || 0),
+      unit_price: unitPrice,
+      line_total: lineTotal,
+      remark: String(it.remark || '').trim(),
+    };
+  });
+  const subtotal = items.reduce((s, it) => s + it.line_total, 0);
+  const vatRate = Math.max(0, Number(rawVatRate ?? 8) || 0);
+  const vatAmount = Math.round((subtotal * vatRate) / 100);
+  const totalAfterVat = subtotal + vatAmount;
+  const paymentMode = String(rawPayMode || '50_50').trim();
+  const depPct = paymentMode === '50_50'
+    ? Math.max(0, Math.min(100, Number(rawDepPct ?? 50) || 50))
+    : paymentMode === 'CUSTOM'
+      ? Math.max(0, Math.min(100, Number(rawDepPct) || 0))
+      : 0;
+  const depositAmount = depPct > 0 ? Math.round((totalAfterVat * depPct) / 100) : 0;
+  const balanceAmount = totalAfterVat - depositAmount;
+  return { items, subtotal, vatRate, vatAmount, totalAfterVat, paymentMode, depPct, depositAmount, balanceAmount };
+}
+
+async function fetchPoWithItems(id) {
+  const po = await dbGet(`SELECT * FROM purchase_orders WHERE id = ?`, [id]);
+  if (!po) return null;
+  const items = await dbAll(`SELECT * FROM purchase_order_items WHERE po_id = ? ORDER BY id ASC`, [id]);
+  return { ...po, items };
+}
+
+app.get('/api/purchase-orders/next-no', wrap(async (_req, res) => {
+  res.json({ po_no: await nextPoNo() });
+}));
+
+app.get('/api/purchase-orders', wrap(async (req, res) => {
+  const status = String(req.query.status || '').trim();
+  const category = String(req.query.po_category || '').trim();
+  const supplier = String(req.query.supplier || '').trim();
+  const q = String(req.query.q || '').trim();
+  const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 40));
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+
+  let where = ` WHERE 1=1`;
+  const params = [];
+  if (status) { where += ` AND status = ?`; params.push(status); }
+  if (category) { where += ` AND po_category = ?`; params.push(category); }
+  if (supplier && supplier !== 'ALL') { where += ` AND supplier_name = ?`; params.push(supplier); }
+  if (q) {
+    where += ` AND (po_no LIKE ? OR supplier_name LIKE ? OR vendor_legal_name LIKE ? OR contract_no LIKE ?)`;
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+  }
+
+  const [countRow, pos, summaryRow] = await Promise.all([
+    dbGet(`SELECT COUNT(*) as c FROM purchase_orders ${where}`, params),
+    dbAll(`SELECT * FROM purchase_orders ${where} ORDER BY po_date DESC, id DESC LIMIT ? OFFSET ?`, [...params, limit, offset]),
+    dbGet(`
+      SELECT COUNT(*) as total_pos,
+             SUM(CASE WHEN status NOT IN ('Completed','Cancelled') THEN 1 ELSE 0 END) as active_pos,
+             SUM(CASE WHEN COALESCE(final_inspection_date,'') != '' AND status IN ('Confirmed','Inspecting') THEN 1 ELSE 0 END) as inspecting_pos,
+             COALESCE(SUM(CASE WHEN status != 'Cancelled' THEN total_after_vat ELSE 0 END), 0) as total_value_vnd
+      FROM purchase_orders
+    `),
+  ]);
+
+  if (pos.length > 0) {
+    const ids = pos.map(p => p.id);
+    const ph = ids.map(() => '?').join(',');
+    const allItems = await dbAll(`SELECT * FROM purchase_order_items WHERE po_id IN (${ph}) ORDER BY id ASC`, ids);
+    const byPo = new Map();
+    for (const it of allItems) {
+      if (!byPo.has(it.po_id)) byPo.set(it.po_id, []);
+      byPo.get(it.po_id).push(it);
+    }
+    for (const p of pos) p.items = byPo.get(p.id) || [];
+  }
+
+  res.setHeader('X-Total-Count', String(countRow?.c || pos.length));
+  res.json({
+    summary: summaryRow || { total_pos: 0, active_pos: 0, inspecting_pos: 0, total_value_vnd: 0 },
+    items: pos,
+    total: Number(countRow?.c || pos.length),
+  });
+}));
+
+app.get('/api/purchase-orders/:id', wrap(async (req, res) => {
+  const po = await fetchPoWithItems(Number(req.params.id));
+  if (!po) return res.status(404).json({ error: 'Không tìm thấy Đơn Đặt Hàng (PO).' });
+  res.json(po);
+}));
+
+app.post('/api/purchase-orders', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const b = req.body || {};
+  const supplierName = String(b.supplier_name || '').trim();
+  if (!supplierName) return res.status(400).json({ error: 'Vui lòng nhập Tên Nhà Cung Cấp.' });
+  const calc = computePoTotals(b.items, b.vat_rate, b.payment_mode, b.deposit_pct);
+  if (calc.items.length === 0) return res.status(400).json({ error: 'Đơn PO phải có ít nhất 1 dòng sản phẩm.' });
+
+  const poNo = String(b.po_no || '').trim() || (await nextPoNo());
+  const poDate = String(b.po_date || getVnIsoDate()).trim();
+  const createdBy = req.user?.full_name || req.user?.email || 'Admin';
+  const nowStr = getVnDateTime();
+
+  const ins = await dbRun(
+    `INSERT INTO purchase_orders (
+      po_no, revision_no, po_date, po_category, contract_no,
+      supplier_code, supplier_name, vendor_legal_name, vendor_tax_code,
+      vendor_address, vendor_bank_account, vendor_bank_name, vendor_contact,
+      ship_to_warehouse, ship_to_address, delivery_schedule, final_inspection_date,
+      vat_rate, subtotal, vat_amount, total_after_vat,
+      payment_mode, deposit_pct, deposit_amount, balance_amount, payment_terms_note,
+      status, notes, created_by, created_at, updated_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      poNo, 1, poDate, String(b.po_category || 'FACTORY').trim(), String(b.contract_no || '').trim(),
+      String(b.supplier_code || '').trim(), supplierName,
+      String(b.vendor_legal_name || supplierName).trim(), String(b.vendor_tax_code || '').trim(),
+      String(b.vendor_address || '').trim(), String(b.vendor_bank_account || '').trim(),
+      String(b.vendor_bank_name || '').trim(), String(b.vendor_contact || '').trim(),
+      String(b.ship_to_warehouse || '3001').trim(), String(b.ship_to_address || '').trim(),
+      String(b.delivery_schedule || '').trim(), String(b.final_inspection_date || '').trim(),
+      calc.vatRate, calc.subtotal, calc.vatAmount, calc.totalAfterVat,
+      calc.paymentMode, calc.depPct, calc.depositAmount, calc.balanceAmount, String(b.payment_terms_note || '').trim(),
+      String(b.status || 'Draft').trim(), String(b.notes || '').trim(), createdBy, nowStr, nowStr,
+    ]
+  );
+  const poId = Number(ins.lastInsertRowid);
+  await dbBatch(
+    calc.items.map(it => ({
+      sql: `INSERT INTO purchase_order_items (po_id, product_code, barcode, product_name, image_url, unit, qty, received_qty, unit_price, line_total, remark)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      args: [poId, it.product_code, it.barcode, it.product_name, it.image_url, it.unit, it.qty, it.received_qty, it.unit_price, it.line_total, it.remark],
+    }))
+  );
+  clearServerCache();
+  await logAudit(req, 'CREATE_PO', 'PO', poNo, `Tạo Đơn Đặt Hàng ${poNo} (${supplierName}) — ${calc.totalAfterVat.toLocaleString('vi-VN')} đ`, null, { po_no: poNo, total_after_vat: calc.totalAfterVat });
+  res.json({ ok: true, po: await fetchPoWithItems(poId) });
+}));
+
+app.put('/api/purchase-orders/:id', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const poId = Number(req.params.id);
+  const existing = await fetchPoWithItems(poId);
+  if (!existing) return res.status(404).json({ error: 'Không tìm thấy Đơn Đặt Hàng (PO).' });
+
+  const b = req.body || {};
+  const supplierName = String(b.supplier_name || existing.supplier_name).trim();
+  const calc = computePoTotals(b.items, b.vat_rate ?? existing.vat_rate, b.payment_mode ?? existing.payment_mode, b.deposit_pct ?? existing.deposit_pct);
+  if (calc.items.length === 0) return res.status(400).json({ error: 'Đơn PO phải có ít nhất 1 dòng sản phẩm.' });
+
+  const nextRev = b.bump_revision ? (Number(existing.revision_no) || 1) + 1 : (Number(existing.revision_no) || 1);
+  const nowStr = getVnDateTime();
+
+  await dbRun(
+    `UPDATE purchase_orders SET
+      po_no=?, revision_no=?, po_date=?, po_category=?, contract_no=?,
+      supplier_code=?, supplier_name=?, vendor_legal_name=?, vendor_tax_code=?,
+      vendor_address=?, vendor_bank_account=?, vendor_bank_name=?, vendor_contact=?,
+      ship_to_warehouse=?, ship_to_address=?, delivery_schedule=?, final_inspection_date=?,
+      vat_rate=?, subtotal=?, vat_amount=?, total_after_vat=?,
+      payment_mode=?, deposit_pct=?, deposit_amount=?, balance_amount=?, payment_terms_note=?,
+      status=?, notes=?, updated_at=?
+     WHERE id=?`,
+    [
+      String(b.po_no || existing.po_no).trim(), nextRev,
+      String(b.po_date ?? existing.po_date).trim(), String(b.po_category ?? existing.po_category).trim(),
+      String(b.contract_no ?? existing.contract_no).trim(), String(b.supplier_code ?? existing.supplier_code).trim(),
+      supplierName, String(b.vendor_legal_name ?? existing.vendor_legal_name).trim(),
+      String(b.vendor_tax_code ?? existing.vendor_tax_code).trim(), String(b.vendor_address ?? existing.vendor_address).trim(),
+      String(b.vendor_bank_account ?? existing.vendor_bank_account).trim(), String(b.vendor_bank_name ?? existing.vendor_bank_name).trim(),
+      String(b.vendor_contact ?? existing.vendor_contact).trim(), String(b.ship_to_warehouse ?? existing.ship_to_warehouse).trim(),
+      String(b.ship_to_address ?? existing.ship_to_address).trim(), String(b.delivery_schedule ?? existing.delivery_schedule).trim(),
+      String(b.final_inspection_date ?? existing.final_inspection_date).trim(),
+      calc.vatRate, calc.subtotal, calc.vatAmount, calc.totalAfterVat,
+      calc.paymentMode, calc.depPct, calc.depositAmount, calc.balanceAmount,
+      String(b.payment_terms_note ?? existing.payment_terms_note).trim(),
+      String(b.status ?? existing.status).trim(), String(b.notes ?? existing.notes).trim(),
+      nowStr, poId,
+    ]
+  );
+  await dbBatch([
+    { sql: `DELETE FROM purchase_order_items WHERE po_id = ?`, args: [poId] },
+    ...calc.items.map(it => ({
+      sql: `INSERT INTO purchase_order_items (po_id, product_code, barcode, product_name, image_url, unit, qty, received_qty, unit_price, line_total, remark)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      args: [poId, it.product_code, it.barcode, it.product_name, it.image_url, it.unit, it.qty, it.received_qty, it.unit_price, it.line_total, it.remark],
+    })),
+  ]);
+  clearServerCache();
+  await logAudit(req, 'UPDATE_PO', 'PO', existing.po_no, `Cập nhật ${existing.po_no} (Rev v${nextRev})`, { revision_no: existing.revision_no, total_after_vat: existing.total_after_vat }, { revision_no: nextRev, total_after_vat: calc.totalAfterVat });
+  res.json({ ok: true, po: await fetchPoWithItems(poId) });
+}));
+
+app.put('/api/purchase-orders/:id/status', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const poId = Number(req.params.id);
+  const existing = await dbGet(`SELECT * FROM purchase_orders WHERE id = ?`, [poId]);
+  if (!existing) return res.status(404).json({ error: 'Không tìm thấy Đơn Đặt Hàng (PO).' });
+
+  const b = req.body || {};
+  const nextStatus = b.status !== undefined ? String(b.status).trim() : existing.status;
+  const depPaid = b.deposit_paid !== undefined ? (b.deposit_paid ? 1 : 0) : existing.deposit_paid;
+  const depDate = b.deposit_paid_date !== undefined ? String(b.deposit_paid_date || '') : (depPaid && !existing.deposit_paid_date ? getVnIsoDate() : existing.deposit_paid_date);
+  const balPaid = b.balance_paid !== undefined ? (b.balance_paid ? 1 : 0) : existing.balance_paid;
+  const balDate = b.balance_paid_date !== undefined ? String(b.balance_paid_date || '') : (balPaid && !existing.balance_paid_date ? getVnIsoDate() : existing.balance_paid_date);
+
+  await dbRun(
+    `UPDATE purchase_orders SET
+      status=?, final_inspection_date=?, delivery_schedule=?,
+      deposit_paid=?, deposit_paid_date=?, balance_paid=?, balance_paid_date=?, updated_at=?
+     WHERE id=?`,
+    [
+      nextStatus,
+      b.final_inspection_date !== undefined ? String(b.final_inspection_date || '') : existing.final_inspection_date,
+      b.delivery_schedule !== undefined ? String(b.delivery_schedule || '') : existing.delivery_schedule,
+      depPaid, depDate, balPaid, balDate, getVnDateTime(), poId,
+    ]
+  );
+
+  if (Array.isArray(b.items) && b.items.length > 0) {
+    await dbBatch(
+      b.items
+        .filter(it => it && it.id)
+        .map(it => ({
+          sql: `UPDATE purchase_order_items SET received_qty = ? WHERE id = ? AND po_id = ?`,
+          args: [Math.max(0, Number(it.received_qty) || 0), Number(it.id), poId],
+        }))
+    );
+  }
+  clearServerCache();
+  await logAudit(req, 'UPDATE_PO_STATUS', 'PO', existing.po_no, `Cập nhật trạng thái ${existing.po_no}: ${nextStatus}`, { status: existing.status }, { status: nextStatus, deposit_paid: depPaid, balance_paid: balPaid });
+  res.json({ ok: true, po: await fetchPoWithItems(poId) });
+}));
+
+app.post('/api/purchase-orders/:id/create-nk-slip', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
+  const poId = Number(req.params.id);
+  const po = await fetchPoWithItems(poId);
+  if (!po) return res.status(404).json({ error: 'Không tìm thấy Đơn Đặt Hàng (PO).' });
+  if (po.ref_nk_slip_no) {
+    const existSlip = await dbGet(`SELECT id, slip_no FROM warehouse_slips WHERE slip_no = ?`, [po.ref_nk_slip_no]);
+    if (existSlip) return res.json({ ok: true, existed: true, slip_id: existSlip.id, slip_no: existSlip.slip_no });
+  }
+
+  const slipNo = await nextSlipNo('NK');
+  const todayIso = getVnIsoDate();
+  const whCode = po.ship_to_warehouse === '9005' ? '9005' : (po.ship_to_warehouse || '3001');
+  const ins = await dbRun(
+    `INSERT INTO warehouse_slips (slip_no, slip_type, slip_date, expected_date, expected_time, warehouse_code, partner_name, carrier, purpose, ref_invoice, notes, cutoff_warning, status)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      slipNo, 'NK', todayIso, todayIso, '09:00', whCode,
+      po.supplier_name, 'NCC Giao trực tiếp', `Nhập hàng NCC theo ${po.po_no}`, po.po_no,
+      `Tạo tự động từ ${po.po_no} (${po.vendor_legal_name || po.supplier_name})`, '', 'Draft',
+    ]
+  );
+  const slipId = Number(ins.lastInsertRowid);
+  await dbBatch(
+    (po.items || []).map(it => ({
+      sql: `INSERT INTO warehouse_slip_items (slip_id, barcode, product_name, unit, qty) VALUES (?,?,?,?,?)`,
+      args: [slipId, it.barcode || 'CUSTOM', it.product_name, it.unit || 'Cái', Math.max(1, Number(it.qty) || 1)],
+    }))
+  );
+  await dbRun(`UPDATE purchase_orders SET ref_nk_slip_no = ?, updated_at = ? WHERE id = ?`, [slipNo, getVnDateTime(), poId]);
+  clearServerCache();
+  await logAudit(req, 'CREATE_NK_FROM_PO', 'PO', po.po_no, `Tạo phiếu Nhập Kho ${slipNo} từ ${po.po_no}`, null, { slip_no: slipNo, warehouse_code: whCode });
+  res.json({ ok: true, slip_id: slipId, slip_no: slipNo });
+}));
+
+app.delete('/api/purchase-orders/:id', requireRoles('ADMIN'), wrap(async (req, res) => {
+  const poId = Number(req.params.id);
+  const existing = await dbGet(`SELECT * FROM purchase_orders WHERE id = ?`, [poId]);
+  if (!existing) return res.status(404).json({ error: 'Không tìm thấy Đơn Đặt Hàng (PO).' });
+  if (existing.status !== 'Draft' && existing.status !== 'Cancelled') {
+    return res.status(400).json({ error: 'Chỉ được xóa PO đang ở trạng thái Draft hoặc Cancelled.' });
+  }
+  await dbBatch([
+    { sql: `DELETE FROM purchase_order_items WHERE po_id = ?`, args: [poId] },
+    { sql: `DELETE FROM purchase_orders WHERE id = ?`, args: [poId] },
+  ]);
+  clearServerCache();
+  await logAudit(req, 'DELETE_PO', 'PO', existing.po_no, `Xóa PO ${existing.po_no}`, existing, null);
+  res.json({ ok: true });
 }));
 
 // Global API error handler

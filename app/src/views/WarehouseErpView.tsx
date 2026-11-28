@@ -6,6 +6,7 @@ import {
 import { apiDownload, apiGet, apiGetPage, apiSend, apiUpload, AuthUser, NavIntent, PrintDoc } from '../api';
 
 const SparePartsPanel = lazy(() => import('../components/SparePartsPanel'));
+const PurchaseOrdersPanel = lazy(() => import('../components/PurchaseOrdersPanel'));
 const SLIP_PAGE_SIZE = 40;
 
 interface Props {
@@ -21,14 +22,16 @@ export default function WarehouseErpView({ user, onToast, onPrint, onNavigate, n
   const canEditSlips = user.role === 'ADMIN' || user.role === 'EDITOR';
   const canUploadErp = user.role === 'ADMIN';
 
-  const [subTab, setSubTabState] = useState<'slips' | 'erp' | 'reconcile' | 'spare_parts'>(() => {
+  const [subTab, setSubTabState] = useState<'slips' | 'po' | 'erp' | 'reconcile' | 'spare_parts'>(() => {
     const s = localStorage.getItem('benom_wh_subtab');
-    return s === 'erp' || s === 'reconcile' || s === 'spare_parts' ? s : 'slips';
+    return s === 'po' || s === 'erp' || s === 'reconcile' || s === 'spare_parts' ? s : 'slips';
   });
-  const setSubTab = (v: 'slips' | 'erp' | 'reconcile' | 'spare_parts') => {
+  const setSubTab = (v: 'slips' | 'po' | 'erp' | 'reconcile' | 'spare_parts') => {
     setSubTabState(v);
     localStorage.setItem('benom_wh_subtab', v);
   };
+  const [pendingPoPrefill, setPendingPoPrefill] = useState<any>(null);
+  const [pendingOpenPoId, setPendingOpenPoId] = useState<number | null>(null);
   const [slips, setSlips] = useState<any[]>([]);
   const [totalSlips, setTotalSlips] = useState(0);
   const [loadingMoreSlips, setLoadingMoreSlips] = useState(false);
@@ -83,11 +86,17 @@ export default function WarehouseErpView({ user, onToast, onPrint, onNavigate, n
     if (subTab === 'slips') loadSlips(0, false);
   }, [subTab, slipFilter]);
 
-  // Cross-module deep-link consumer: immediately opens Warehouse Slip popup (XK/NK)
+  // Cross-module deep-link consumer: immediately opens Warehouse Slip popup (XK/NK) or PO tab/prefill
   useEffect(() => {
     if (!navIntent?.nonce) return;
     const intent = navIntent;
     onConsumeIntent?.();
+    if (intent.subTab === 'po' || intent.openPoId || intent.prefillNewPo) {
+      setSubTab('po');
+      if (intent.prefillNewPo) setPendingPoPrefill(intent.prefillNewPo);
+      if (intent.openPoId) setPendingOpenPoId(intent.openPoId);
+      return;
+    }
     if (intent.subTab === 'slips' || intent.openSlipId || intent.openSlipNo) {
       setSubTab('slips');
     }
@@ -282,6 +291,7 @@ export default function WarehouseErpView({ user, onToast, onPrint, onNavigate, n
         <div className="flex flex-wrap bg-[#EFE7DC] p-1 rounded-lg self-start gap-0.5 shrink-0">
           {[
             ['slips', 'Phiếu NK / XK'],
+            ['po', 'Đơn Đặt Hàng (PO)'],
             ['erp', 'Nạp ERP CSV'],
             ['reconcile', 'Đối soát Toàn Nhất'],
             ['spare_parts', 'Kho Ngũ Kim (KTV)'],
@@ -444,7 +454,25 @@ export default function WarehouseErpView({ user, onToast, onPrint, onNavigate, n
         </div>
       )}
 
-      {/* TAB 2: ERP CSV FILE-DROP SIDECAR */}
+      {/* TAB 2: PURCHASE ORDERS (PO) */}
+      {subTab === 'po' && (
+        <Suspense fallback={<div className="p-8 text-center text-xs text-[#6e5543] bg-white rounded-xl border border-[#E6DDD1]">Đang tải phân hệ Đơn Đặt Hàng (PO)...</div>}>
+          <PurchaseOrdersPanel
+            user={user}
+            onToast={onToast}
+            onPrint={onPrint}
+            onNavigate={onNavigate}
+            prefillPo={pendingPoPrefill}
+            openPoId={pendingOpenPoId}
+            onConsumedPrefill={() => {
+              setPendingPoPrefill(null);
+              setPendingOpenPoId(null);
+            }}
+          />
+        </Suspense>
+      )}
+
+      {/* TAB 3: ERP CSV FILE-DROP SIDECAR */}
       {subTab === 'erp' && (
         <div className="bg-white rounded-2xl p-6 border border-[#E6DDD1] space-y-5">
           <div className="flex items-start gap-3">

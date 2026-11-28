@@ -18,7 +18,7 @@ export default function PrintModal({ doc, onClose }: Props) {
         {/* Toolbar (hidden on print) */}
         <div className="no-print flex items-center justify-between px-5 py-3 bg-[#3B281A] text-[#F8F4EC]">
           <div className="font-semibold text-sm">
-            Xem trước bản in A4 — {doc.type === 'HANDOVER' || doc.type === 'BM03' || doc.type === 'BM04' ? doc.data.doc_no : doc.type === 'SLIP' ? doc.data.slip_no : doc.data.ticket_no}
+            Xem trước bản in A4 — {doc.type === 'HANDOVER' || doc.type === 'BM03' || doc.type === 'BM04' ? doc.data.doc_no : doc.type === 'SLIP' ? doc.data.slip_no : doc.type === 'PO' ? doc.data.po_no : doc.data.ticket_no}
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -81,6 +81,18 @@ export default function PrintModal({ doc, onClose }: Props) {
                   <div className="font-bold text-[#9A2B26] text-sm">BIÊN BẢN SỰ CỐ GIAO NHẬN (BM-04)</div>
                   <div>Số biên bản: <strong>{doc.data.doc_no}</strong></div>
                   <div>Ngày lập: <strong>{doc.data.doc_date || '—'}</strong></div>
+                </>
+              )}
+              {doc.type === 'PO' && (
+                <>
+                  <div className="font-bold text-[#3B281A] text-sm">ĐƠN ĐẶT HÀNG / PURCHASE ORDER</div>
+                  <div>
+                    Mã ĐH / PO NO.:{' '}
+                    <strong className="bg-yellow-200 px-1.5 py-0.5 rounded font-mono">
+                      {doc.data.po_no}{Number(doc.data.revision_no || 1) > 1 ? ` (Rev v${doc.data.revision_no})` : ''}
+                    </strong>
+                  </div>
+                  <div>Ngày / DATE: <strong>{doc.data.po_date || '—'}</strong></div>
                 </>
               )}
             </div>
@@ -418,6 +430,168 @@ export default function PrintModal({ doc, onClose }: Props) {
                     <div className="font-bold">PHÊ DUYỆT SCM</div>
                     <div className="text-gray-500 mb-16">(Ký, ghi rõ họ tên)</div>
                     <div>___________________</div>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* PURCHASE ORDER (PO — BILINGUAL A4 FORM) */}
+          {doc.type === 'PO' && (() => {
+            const po = doc.data;
+            const items: any[] = Array.isArray(po.items) ? po.items : [];
+            const fmtNumPlain = (n: number) => Math.round(Number(n || 0)).toLocaleString('en-US');
+            const is5050 = po.payment_mode === '50_50';
+            const depPct = Number(po.deposit_pct || 50);
+            const balPct = Math.max(0, 100 - depPct);
+            const shipAddressDefault =
+              po.ship_to_warehouse === '9005'
+                ? 'Kho Toàn Nhất Logistics (BD02) — Số 10 Đại lộ Độc Lập, KCN Sóng Thần 1, Dĩ An'
+                : po.ship_to_warehouse === '1001'
+                  ? 'Pop-up Store benom — Aeon Mall Bình Tân, TP.HCM'
+                  : 'Tầng 3, Lô Anchor Tenant #2, TTTM Parkson Lê Thánh Tôn, số 35-45 Bis, P. Sài Gòn, Quận 1, TP.HCM';
+            return (
+              <div className="space-y-4 text-[11px]">
+                <div className="grid grid-cols-12 gap-3 border border-[#cbb7a2] rounded-lg p-3 bg-[#FAF7F2]">
+                  <div className="col-span-7 space-y-2 border-r border-[#E6DDD1] pr-3">
+                    <div>
+                      <div className="font-bold text-[#3B281A]">Bên A / INVOICE TO: CÔNG TY TNHH KOHNAN VIỆT NAM</div>
+                      <div>Người mua hàng: <strong>KOHNAN JAPAN - BENOM</strong> • MST / Tax code: <strong>0313666077</strong></div>
+                      <div>Địa chỉ: Phòng 5F-05, Tầng 5, Lotte Mart Phú Thọ, 968 Đường 3 Tháng 2, P. Phú Thọ, TP.HCM</div>
+                      <div className="text-[10px] text-[#6e5543]">Email HĐĐT: KOHNANVN@fast.com.vn, ACC@kohnanvn.com, Nhi.tran@kohnanvn.com, thao.pham@kohnanvn.com</div>
+                    </div>
+                    <div className="pt-2 border-t border-[#E6DDD1]">
+                      <div className="font-bold text-[#3B281A]">
+                        Bên B / VENDOR: {po.vendor_legal_name || po.supplier_name}
+                      </div>
+                      {po.vendor_address && <div>Địa chỉ: {po.vendor_address}</div>}
+                      <div className="flex flex-wrap gap-3">
+                        <span>MST: <strong>{po.vendor_tax_code || '—'}</strong></span>
+                        <span>STK: <strong>{po.vendor_bank_account || '—'}</strong></span>
+                        {po.vendor_bank_name && <span>({po.vendor_bank_name})</span>}
+                      </div>
+                      {po.vendor_contact && <div>Liên hệ NCC: {po.vendor_contact}</div>}
+                    </div>
+                  </div>
+
+                  <div className="col-span-5 space-y-1.5">
+                    <div><strong>HĐ / CONTRACT NO.:</strong> {po.contract_no || '—'}</div>
+                    <div>
+                      <strong>Mã ĐH / PO NO.:</strong>{' '}
+                      <span className="bg-yellow-200 px-1.5 py-0.5 rounded font-mono font-bold">{po.po_no}</span>
+                    </div>
+                    <div><strong>Loại PO / Category:</strong> {po.po_category === 'FACTORY' ? 'FACTORY (Sản xuất)' : 'TRAFFIC / TRADING'}</div>
+                    <div><strong>Giao đến / SHIP TO:</strong> {po.ship_to_address || shipAddressDefault}</div>
+                    <div>
+                      <strong>Ngày giao / DELIVERY DATE:</strong>{' '}
+                      <span className="bg-yellow-200 px-1 font-semibold">{po.delivery_schedule || 'Theo thỏa thuận'}</span>
+                    </div>
+                    {po.final_inspection_date && (
+                      <div><strong>Kiểm hàng / Final Inspection:</strong> {po.final_inspection_date}</div>
+                    )}
+                  </div>
+                </div>
+
+                {/* 10-column PO Table */}
+                <table className="w-full border-collapse border border-[#9d8369] text-[11px]">
+                  <thead>
+                    <tr className="bg-amber-200 text-[#1f1610] text-center font-bold">
+                      <th className="border border-[#9d8369] p-1.5 w-8">STT<br /><span className="text-[9px] font-normal">NO.</span></th>
+                      <th className="border border-[#9d8369] p-1.5 w-20">Mã SP<br /><span className="text-[9px] font-normal">PRODUCT CODE</span></th>
+                      <th className="border border-[#9d8369] p-1.5 w-24">Mã Barcode<br /><span className="text-[9px] font-normal">BARCODE</span></th>
+                      <th className="border border-[#9d8369] p-1.5 w-14">Hình ảnh<br /><span className="text-[9px] font-normal">IMAGE</span></th>
+                      <th className="border border-[#9d8369] p-1.5 text-left">Tên SP<br /><span className="text-[9px] font-normal">NAME (VN)</span></th>
+                      <th className="border border-[#9d8369] p-1.5 w-12">Đơn vị<br /><span className="text-[9px] font-normal">Unit</span></th>
+                      <th className="border border-[#9d8369] p-1.5 w-12">SL<br /><span className="text-[9px] font-normal">QTY</span></th>
+                      <th className="border border-[#9d8369] p-1.5 text-right w-20">Đơn giá<br /><span className="text-[9px] font-normal">UNIT PRICE</span></th>
+                      <th className="border border-[#9d8369] p-1.5 text-right w-24">Thành tiền<br /><span className="text-[9px] font-normal">TOTAL (vnd)</span></th>
+                      <th className="border border-[#9d8369] p-1.5 text-left w-24">Ghi chú<br /><span className="text-[9px] font-normal">REMARK</span></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {items.map((it, idx) => (
+                      <tr key={idx}>
+                        <td className="border border-[#9d8369] p-1.5 text-center">{idx + 1}</td>
+                        <td className="border border-[#9d8369] p-1.5 font-mono text-[10px] text-center">{it.product_code || ''}</td>
+                        <td className="border border-[#9d8369] p-1.5 font-mono text-[10px]">{it.barcode}</td>
+                        <td className="border border-[#9d8369] p-1 text-center">
+                          {it.image_url ? (
+                            <img src={it.image_url} alt={it.product_name} className="w-10 h-10 object-cover mx-auto rounded" />
+                          ) : (
+                            <span className="text-[9px] text-gray-400">—</span>
+                          )}
+                        </td>
+                        <td className="border border-[#9d8369] p-1.5 font-medium">{it.product_name}</td>
+                        <td className="border border-[#9d8369] p-1.5 text-center">{it.unit || 'Cái'}</td>
+                        <td className="border border-[#9d8369] p-1.5 text-center font-semibold">{it.qty}</td>
+                        <td className="border border-[#9d8369] p-1.5 text-right font-mono">{fmtNumPlain(it.unit_price)}</td>
+                        <td className="border border-[#9d8369] p-1.5 text-right font-mono font-semibold">{fmtNumPlain(it.line_total)}</td>
+                        <td className="border border-[#9d8369] p-1.5">{it.remark || ''}</td>
+                      </tr>
+                    ))}
+                    <tr className="font-bold bg-[#FAF7F2]">
+                      <td colSpan={8} className="border border-[#9d8369] p-1.5 text-right">TỔNG TIỀN TRƯỚC THUẾ / TOTAL AMOUNT</td>
+                      <td className="border border-[#9d8369] p-1.5 text-right font-mono">{fmtNumPlain(po.subtotal)}</td>
+                      <td className="border border-[#9d8369] p-1.5"></td>
+                    </tr>
+                    <tr className="font-bold text-[#9A2B26]">
+                      <td colSpan={8} className="border border-[#9d8369] p-1.5 text-right">THUẾ / VAT ({Number(po.vat_rate || 0)}%)</td>
+                      <td className="border border-[#9d8369] p-1.5 text-right font-mono">{fmtNumPlain(po.vat_amount)}</td>
+                      <td className="border border-[#9d8369] p-1.5"></td>
+                    </tr>
+                    <tr className="font-bold bg-amber-100 text-xs">
+                      <td colSpan={8} className="border border-[#9d8369] p-1.5 text-right">TỔNG TIỀN SAU THUẾ / TOTAL AFTER VAT</td>
+                      <td className="border border-[#9d8369] p-1.5 text-right font-mono">{fmtNumPlain(po.total_after_vat)}</td>
+                      <td className="border border-[#9d8369] p-1.5"></td>
+                    </tr>
+                    {(is5050 || Number(po.deposit_pct || 0) > 0) ? (
+                      <>
+                        <tr>
+                          <td colSpan={8} className="border border-[#9d8369] p-1.5 text-right">
+                            <strong>Thanh toán đợt 1 – {depPct}%</strong> (trong vòng 10 ngày làm việc kể từ ngày ký Hợp đồng hoặc Đơn đặt hàng)<br />
+                            <span className="text-[10px] text-[#6e5543]">1st Payment - {depPct}% (within 10 working days from signing Contract or PO)</span>
+                          </td>
+                          <td className="border border-[#9d8369] p-1.5 text-right font-mono font-semibold">{fmtNumPlain(po.deposit_amount)}</td>
+                          <td className="border border-[#9d8369] p-1.5">{po.deposit_paid ? `Đã TT ${po.deposit_paid_date || ''}` : ''}</td>
+                        </tr>
+                        <tr>
+                          <td colSpan={8} className="border border-[#9d8369] p-1.5 text-right">
+                            <strong>Thanh toán đợt 2 – {balPct}%</strong> (sau 30 ngày kể từ ngày nhận đủ hàng hóa và chứng từ hợp lệ)<br />
+                            <span className="text-[10px] text-[#6e5543]">2nd Payment - {balPct}% (after 30 days from receiving sufficient goods &amp; valid documents)</span>
+                          </td>
+                          <td className="border border-[#9d8369] p-1.5 text-right font-mono font-semibold">{fmtNumPlain(po.balance_amount)}</td>
+                          <td className="border border-[#9d8369] p-1.5">{po.balance_paid ? `Đã TT ${po.balance_paid_date || ''}` : ''}</td>
+                        </tr>
+                      </>
+                    ) : (
+                      <tr>
+                        <td colSpan={8} className="border border-[#9d8369] p-1.5 text-right">
+                          <strong>Điều khoản thanh toán / Payment Terms:</strong>{' '}
+                          {po.payment_terms_note || (po.payment_mode === '100_COD' ? 'Thanh toán 100% khi giao nhận hàng (COD)' : po.payment_mode === 'CONSIGNMENT' ? 'Đối soát bán hàng & thanh toán theo kỳ ký gửi' : 'Thanh toán 100% sau 30 ngày kể từ ngày nhận đủ hàng & hóa đơn VAT hợp lệ (Net 30)')}
+                        </td>
+                        <td className="border border-[#9d8369] p-1.5 text-right font-mono font-semibold">{fmtNumPlain(po.balance_amount || po.total_after_vat)}</td>
+                        <td className="border border-[#9d8369] p-1.5">{po.balance_paid ? `Đã TT ${po.balance_paid_date || ''}` : ''}</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+
+                {po.notes && (
+                  <div className="p-2.5 rounded border border-[#E6DDD1] bg-[#FAF7F2]">
+                    <strong>Ghi chú đơn đặt hàng:</strong> {po.notes}
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 gap-8 pt-6 text-center text-xs">
+                  <div>
+                    <div className="font-bold">Bên A / INVOICE TO</div>
+                    <div className="text-[10px] text-gray-500 mb-14">(Đại diện Công ty TNHH Kohnan Việt Nam)</div>
+                    <div className="font-bold tracking-wide">HAMA TAKESHI</div>
+                  </div>
+                  <div>
+                    <div className="font-bold">Bên B / VENDOR</div>
+                    <div className="text-[10px] text-gray-500 mb-14">(Xác nhận ký &amp; đóng dấu)</div>
+                    <div className="font-semibold">{po.vendor_legal_name || po.supplier_name}</div>
                   </div>
                 </div>
               </div>

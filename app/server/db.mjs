@@ -482,7 +482,64 @@ const SCHEMA_STATEMENTS = [
     updated_by TEXT DEFAULT '',
     updated_at TEXT DEFAULT (datetime('now', '+7 hours'))
   )`,
+  `CREATE TABLE IF NOT EXISTS purchase_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    po_no TEXT UNIQUE NOT NULL,
+    revision_no INTEGER DEFAULT 1,
+    po_date TEXT DEFAULT '',
+    po_category TEXT DEFAULT 'FACTORY',
+    contract_no TEXT DEFAULT '',
+    supplier_code TEXT DEFAULT '',
+    supplier_name TEXT NOT NULL,
+    vendor_legal_name TEXT DEFAULT '',
+    vendor_tax_code TEXT DEFAULT '',
+    vendor_address TEXT DEFAULT '',
+    vendor_bank_account TEXT DEFAULT '',
+    vendor_bank_name TEXT DEFAULT '',
+    vendor_contact TEXT DEFAULT '',
+    ship_to_warehouse TEXT DEFAULT '3001',
+    ship_to_address TEXT DEFAULT '',
+    delivery_schedule TEXT DEFAULT '',
+    final_inspection_date TEXT DEFAULT '',
+    vat_rate REAL DEFAULT 8,
+    subtotal REAL DEFAULT 0,
+    vat_amount REAL DEFAULT 0,
+    total_after_vat REAL DEFAULT 0,
+    payment_mode TEXT DEFAULT '50_50',
+    deposit_pct REAL DEFAULT 50,
+    deposit_amount REAL DEFAULT 0,
+    deposit_paid INTEGER DEFAULT 0,
+    deposit_paid_date TEXT DEFAULT '',
+    balance_amount REAL DEFAULT 0,
+    balance_paid INTEGER DEFAULT 0,
+    balance_paid_date TEXT DEFAULT '',
+    payment_terms_note TEXT DEFAULT '',
+    status TEXT DEFAULT 'Draft',
+    ref_nk_slip_no TEXT DEFAULT '',
+    notes TEXT DEFAULT '',
+    created_by TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now', '+7 hours')),
+    updated_at TEXT DEFAULT (datetime('now', '+7 hours'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS purchase_order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    po_id INTEGER NOT NULL,
+    product_code TEXT DEFAULT '',
+    barcode TEXT DEFAULT '',
+    product_name TEXT NOT NULL,
+    image_url TEXT DEFAULT '',
+    unit TEXT DEFAULT 'Cái',
+    qty REAL DEFAULT 1,
+    received_qty REAL DEFAULT 0,
+    unit_price REAL DEFAULT 0,
+    line_total REAL DEFAULT 0,
+    remark TEXT DEFAULT ''
+  )`,
   // Performance indexes for Turso Cloud & Local SQLite (eliminates full-table scans on joins & filters)
+  `CREATE INDEX IF NOT EXISTS idx_po_date_id ON purchase_orders(po_date DESC, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_po_supplier ON purchase_orders(supplier_name)`,
+  `CREATE INDEX IF NOT EXISTS idx_po_status ON purchase_orders(status, po_category)`,
+  `CREATE INDEX IF NOT EXISTS idx_po_items_po ON purchase_order_items(po_id)`,
   `CREATE INDEX IF NOT EXISTS idx_erp_store_month_bc ON erp_snapshots(store_code, target_month, barcode)`,
   `CREATE INDEX IF NOT EXISTS idx_orders_invoice ON orders(invoice_no)`,
   `CREATE INDEX IF NOT EXISTS idx_orders_date_id ON orders(order_date DESC, id DESC)`,
@@ -520,12 +577,32 @@ export async function initDb() {
     `ALTER TABLE order_items ADD COLUMN orig_order_id INTEGER DEFAULT NULL`,
     `ALTER TABLE order_items ADD COLUMN orig_invoice TEXT DEFAULT ''`,
     `ALTER TABLE delivery_tracking ADD COLUMN merged_into TEXT DEFAULT ''`,
+    `ALTER TABLE partners ADD COLUMN legal_name TEXT DEFAULT ''`,
+    `ALTER TABLE partners ADD COLUMN tax_code TEXT DEFAULT ''`,
+    `ALTER TABLE partners ADD COLUMN address TEXT DEFAULT ''`,
+    `ALTER TABLE partners ADD COLUMN bank_account TEXT DEFAULT ''`,
+    `ALTER TABLE partners ADD COLUMN bank_name TEXT DEFAULT ''`,
+    `ALTER TABLE partners ADD COLUMN contract_no TEXT DEFAULT ''`,
+    `ALTER TABLE partners ADD COLUMN payment_terms TEXT DEFAULT ''`,
   ].map(alterSql => dbRun(alterSql).catch(() => { /* column already exists */ })));
   await Promise.all([
     `CREATE INDEX IF NOT EXISTS idx_product_guides_handle ON product_guides(handle)`,
     `CREATE INDEX IF NOT EXISTS idx_orders_merged ON orders(merged_into_order_id)`,
     `CREATE INDEX IF NOT EXISTS idx_delivery_tracking_merged ON delivery_tracking(merged_into)`,
   ].map(idxSql => dbRun(idxSql).catch(() => {})));
+  // Non-destructive seed enrichment for Hiểu Đức legal/banking profile from PO BN261111
+  await dbRun(
+    `UPDATE partners
+     SET legal_name = 'CÔNG TY TNHH CHẾ BIẾN LÂM SẢN VÀ THƯƠNG MẠI HIỂU ĐỨC',
+         tax_code = '0301479650',
+         address = 'Thửa đất 1488, Tờ bản đồ 16, Khu Phố 6, Phường Thới Hòa, Thành phố Hồ Chí Minh',
+         bank_account = '0071000331350',
+         bank_name = 'Vietcombank Chi nhánh TP. HCM',
+         contract_no = '01/2025/HĐMB/HD-KN',
+         payment_terms = '50_50',
+         contact_info = CASE WHEN COALESCE(TRIM(contact_info), '') = '' THEN 'Mr. Hồng Chinh Khoa (0766876678 / chinhkhoa@hieuduc.com.vn); Chị Thúy Hồng (THUYHONG@hieuduc.com.vn)' ELSE contact_info END
+     WHERE code = '100806' AND COALESCE(TRIM(tax_code), '') = ''`
+  ).catch(() => {});
 
   // Check seed status in 1 parallel batch instead of 4 sequential round-trips
   const [userCount, whCount, stCount, spCount] = await Promise.all([

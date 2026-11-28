@@ -1,16 +1,19 @@
 import React, { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle, ArrowRightLeft, BarChart3, CheckCircle2, Flame,
-  ShieldAlert, Star, Store, TrendingUp, Truck, Warehouse
+  PackagePlus, ShieldAlert, ShoppingBag, Star, Store, TrendingUp, Truck, Warehouse
 } from 'lucide-react';
 import {
   Bar, BarChart, CartesianGrid, Cell, ComposedChart, Legend, Line,
   ResponsiveContainer, Tooltip, XAxis, YAxis
 } from 'recharts';
 import { apiGet, apiSend, AuthUser, fmtMonth, fmtNum, fmtVnd, NavIntent } from '../api';
+import type { PurchaseSeason } from '../components/SupplierOrderModal';
 
 const Wh9005DrilldownPanel = lazy(() => import('../components/Wh9005DrilldownPanel'));
 const Store3001DrilldownPanel = lazy(() => import('../components/Store3001DrilldownPanel'));
+const PurchaseOrderPanel = lazy(() => import('../components/PurchaseOrderPanel'));
+const SupplierOrderModal = lazy(() => import('../components/SupplierOrderModal'));
 
 interface Props {
   user: AuthUser;
@@ -43,6 +46,20 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
   const [showBestAll, setShowBestAll] = useState(false);
   const [bestByKey, setBestByKey] = useState<Record<string, { total: { count: number; total_qty: number; total_sales_amt: number }; months: string[]; items: any[] }>>({});
   const [loadingBest, setLoadingBest] = useState(false);
+
+  // Purchase Order Planning (Safety Stock 3001 + 9005 + Black Friday / Tet seasonality) & Supplier Info Popup
+  const [purchaseSeason, setPurchaseSeason] = useState<PurchaseSeason>(() => {
+    const m = new Date(Date.now() + 7 * 3600000).getUTCMonth() + 1;
+    if (m === 11) return 'PEAK_BF';
+    if (m === 12 || m === 1) return 'PEAK_TET';
+    return 'NORMAL';
+  });
+  const [purchaseRefreshKey, setPurchaseRefreshKey] = useState(0);
+  const [supplierModal, setSupplierModal] = useState<{
+    supplierName: string;
+    supplierCode?: string;
+    focusBarcode?: string;
+  } | null>(null);
 
   const load = async () => {
     setLoading(true);
@@ -702,7 +719,15 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
               <ArrowRightLeft className="w-5 h-5 text-[#224B85]" />
               <h2 className="font-bold text-[#3B281A] text-sm">Đề Xuất Châm Hàng 9005 → 3001 ({replenishAlerts.length} SKU)</h2>
             </div>
-            <span className="text-[11px] px-2 py-0.5 rounded-full bg-blue-50 text-[#224B85] font-semibold">Sắp hết tại Store</span>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] px-2 py-0.5 rounded-full bg-blue-50 text-[#224B85] font-semibold">Sắp hết tại Store</span>
+              <a
+                href="#purchase-order-panel"
+                className="text-[11px] px-2.5 py-0.5 rounded-full bg-amber-50 border border-amber-300 text-amber-900 font-semibold hover:bg-amber-100 inline-flex items-center gap-1"
+              >
+                <PackagePlus className="w-3 h-3" /> Đặt hàng NCC →
+              </a>
+            </div>
           </div>
           {replenishAlerts.length === 0 ? (
             <div className="text-xs text-[#234E36] py-4">Tồn kho các mã bán chạy tại Store 3001 đang ổn định.</div>
@@ -730,6 +755,17 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
           )}
         </div>
       </div>
+
+      {/* Purchase Order Planning (3001 + 9005 Safety Stock + Seasonal Black Friday / Tet) */}
+      <Suspense fallback={<div className="p-6 text-center text-xs text-[#6e5543] bg-white rounded-xl border border-[#E6DDD1]">Đang tải đề xuất Đặt hàng Nhà Cung Cấp...</div>}>
+        <PurchaseOrderPanel
+          season={purchaseSeason}
+          onChangeSeason={setPurchaseSeason}
+          onOpenSupplierOrder={setSupplierModal}
+          onToast={onToast}
+          refreshKey={purchaseRefreshKey}
+        />
+      </Suspense>
 
       {/* Best-Selling Products at Store 3001 (90 / 60 / 30 days) */}
       <div className="bg-white rounded-xl p-5 border border-[#E6DDD1]">
@@ -795,17 +831,20 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
                 <th className="py-2 px-3 text-right">Doanh số ({bestDays}N)</th>
                 <th className="py-2 px-3 text-right">Tồn 3001</th>
                 <th className="py-2 px-3 text-right">Tồn 9005</th>
-                {canEdit && <th className="py-2 px-2 text-right">Châm hàng</th>}
+                <th className="py-2 px-2 text-right">Châm / Đặt hàng</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[#F0E9DF]">
               {loadingBest && displayedBest.length === 0 ? (
-                <tr><td colSpan={canEdit ? 9 : 8} className="py-6 text-center text-[#6e5543]">Đang tải danh sách hàng bán chạy {bestDays} ngày...</td></tr>
+                <tr><td colSpan={9} className="py-6 text-center text-[#6e5543]">Đang tải danh sách hàng bán chạy {bestDays} ngày...</td></tr>
               ) : displayedBest.length === 0 ? (
-                <tr><td colSpan={canEdit ? 9 : 8} className="py-6 text-center text-[#6e5543]">Chưa có dữ liệu bán hàng trong kỳ {bestDays} ngày.</td></tr>
+                <tr><td colSpan={9} className="py-6 text-center text-[#6e5543]">Chưa có dữ liệu bán hàng trong kỳ {bestDays} ngày.</td></tr>
               ) : displayedBest.map((it: any, idx: number) => {
                 const lowStoreStock = Number(it.stock_3001 || 0) <= 1;
                 const canReplenish = lowStoreStock && Number(it.stock_9005 || 0) > 0;
+                const monthlyRate = Number(it.sold_qty || 0) / Math.max(1, bestDays / 30);
+                const combinedStock = Number(it.stock_3001 || 0) + Number(it.stock_9005 || 0);
+                const shouldOrder = Number(it.stock_9005 || 0) === 0 || combinedStock <= Math.max(2, Math.ceil(monthlyRate * 1.2));
                 return (
                   <tr key={it.barcode} className="hover:bg-[#FAF7F2]">
                     <td className="py-2 px-2 text-center">
@@ -824,20 +863,28 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
                       {fmtNum(it.stock_3001)}
                     </td>
                     <td className="py-2 px-3 text-right font-semibold text-[#224B85]">{fmtNum(it.stock_9005)}</td>
-                    {canEdit && (
-                      <td className="py-2 px-2 text-right whitespace-nowrap">
-                        {canReplenish ? (
-                          <button
-                            onClick={() => handleQuickReplenish({ ...it, sold_3m: it.sold_qty })}
-                            className="px-2 py-1 rounded bg-[#224B85] text-white text-[10px] font-semibold hover:bg-[#1a3a68] cursor-pointer"
-                          >
-                            + XK 9005→3001
-                          </button>
-                        ) : (
-                          <span className="text-[10px] text-[#6e5543]">—</span>
-                        )}
-                      </td>
-                    )}
+                    <td className="py-2 px-2 text-right whitespace-nowrap space-x-1">
+                      {canEdit && canReplenish && (
+                        <button
+                          onClick={() => handleQuickReplenish({ ...it, sold_3m: it.sold_qty })}
+                          className="px-2 py-1 rounded bg-[#224B85] text-white text-[10px] font-semibold hover:bg-[#1a3a68] cursor-pointer"
+                        >
+                          + XK 9005→3001
+                        </button>
+                      )}
+                      {shouldOrder ? (
+                        <button
+                          type="button"
+                          onClick={() => setSupplierModal({ supplierName: it.supplier || 'Chưa rõ NCC', focusBarcode: it.barcode })}
+                          className="px-2 py-1 rounded bg-[#3B281A] text-white text-[10px] font-semibold hover:bg-[#563C28] inline-flex items-center gap-0.5 cursor-pointer"
+                          title="Mở thông tin Nhà Cung Cấp để đặt hàng"
+                        >
+                          <ShoppingBag className="w-2.5 h-2.5" /> Đặt hàng
+                        </button>
+                      ) : (!canEdit || !canReplenish) ? (
+                        <span className="text-[10px] text-[#6e5543]">—</span>
+                      ) : null}
+                    </td>
                   </tr>
                 );
               })}
@@ -913,6 +960,23 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
           </table>
         </div>
       </div>
+
+      {/* Lazy Supplier Info Popup for Purchase Ordering */}
+      {supplierModal && (
+        <Suspense fallback={null}>
+          <SupplierOrderModal
+            supplierName={supplierModal.supplierName}
+            supplierCode={supplierModal.supplierCode}
+            focusBarcode={supplierModal.focusBarcode}
+            season={purchaseSeason}
+            canEdit={canEdit}
+            onClose={() => setSupplierModal(null)}
+            onToast={onToast}
+            onPartnerUpdated={() => setPurchaseRefreshKey(k => k + 1)}
+            onCreatePo={prefill => onNavigate('warehouse', { subTab: 'po', prefillNewPo: prefill })}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }
