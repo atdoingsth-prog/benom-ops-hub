@@ -3,7 +3,7 @@ import {
   AlertTriangle, Calendar, CheckCircle2, ClipboardCheck, Edit3, FileOutput, GitMerge,
   Plus, Printer, Search, Smartphone, Star, Trash2, Truck, Unlink, X
 } from 'lucide-react';
-import { apiGet, apiGetPage, apiSend, AuthUser, fmtVnd, PrintDoc } from '../api';
+import { apiGet, apiGetPage, apiSend, AuthUser, fmtVnd, NavIntent, PrintDoc } from '../api';
 import KtvListPicker, { KtvEntry } from '../components/KtvListPicker';
 
 const KtvFieldBoard = lazy(() => import('../components/KtvFieldBoard'));
@@ -44,9 +44,12 @@ interface Props {
   user: AuthUser;
   onToast: (msg: string, tone?: 'ok' | 'err') => void;
   onPrint: (doc: PrintDoc) => void;
+  onNavigate?: (tab: string, intent?: NavIntent) => void;
+  navIntent?: NavIntent | null;
+  onConsumeIntent?: () => void;
 }
 
-export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
+export default function OrdersDispatchView({ user, onToast, onPrint, onNavigate, navIntent, onConsumeIntent }: Props) {
   const canManageOrders = user.role === 'ADMIN' || user.role === 'EDITOR';
   const canHandover = user.role === 'ADMIN' || user.role === 'EDITOR' || user.role === 'KTV';
 
@@ -157,6 +160,48 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
       loadOrders(0, false);
     }
   }, [subTab, statusFilter]);
+
+  // Cross-module deep-link consumer: immediately opens HandoverModal or EditOrderModal
+  useEffect(() => {
+    if (!navIntent?.nonce) return;
+    const intent = navIntent;
+    onConsumeIntent?.();
+
+    if (intent.subTab === 'ktv_today' || intent.subTab === 'schedule' || intent.subTab === 'orders' || intent.subTab === 'handovers') {
+      setSubTab(intent.subTab);
+    }
+
+    (async () => {
+      try {
+        if (intent.openHandoverId) {
+          ensureStaffLoaded();
+          const full = await apiGet(`/api/handovers/${intent.openHandoverId}`);
+          setActiveHandover(full);
+          return;
+        }
+        if (intent.openOrCreateHandoverForOrderId || intent.openOrCreateHandoverForInvoice) {
+          ensureStaffLoaded();
+          const ord = intent.openOrCreateHandoverForOrderId
+            ? await apiGet(`/api/orders/${intent.openOrCreateHandoverForOrderId}`)
+            : await apiGet(`/api/orders/by-invoice/${encodeURIComponent(intent.openOrCreateHandoverForInvoice || '')}`);
+          await openOrCreateHandoverForOrder(ord, intent.preferredDocType);
+          return;
+        }
+        if (intent.openOrderId || intent.openOrderInvoice) {
+          const ord = intent.openOrderId
+            ? await apiGet(`/api/orders/${intent.openOrderId}`)
+            : await apiGet(`/api/orders/by-invoice/${encodeURIComponent(intent.openOrderInvoice || '')}`);
+          if (canManageOrders) {
+            openEditOrder(ord);
+          } else {
+            await openOrCreateHandoverForOrder(ord);
+          }
+        }
+      } catch (e: any) {
+        onToast(e.message, 'err');
+      }
+    })();
+  }, [navIntent?.nonce]);
 
   const searchPosForOrder = async (val: string) => {
     setNewOrder((prev: any) => ({ ...prev, invoice_no: val }));
@@ -341,17 +386,25 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
         ? ` (${res.items_count}/${res.total_order_items} SP lấy từ 9005)`
         : '';
       onToast(`Đã tạo phiếu xuất kho ${res.slip_no}${partNote}${res.cutoff_warning ? ' — Lưu ý Cut-off!' : ''}`);
+      if (onNavigate && res.id) {
+        onNavigate('warehouse', { subTab: 'slips', openSlipId: res.id });
+      } else {
+        await loadData();
+      }
     } catch (e: any) {
       onToast(e.message, 'err');
     }
   };
 
   const genHandover = async (o: any, docType: 'BM-01' | 'BM-05') => {
+    ensureStaffLoaded();
     try {
       const res = await apiSend(`/api/orders/${o.id}/generate-handover`, 'POST', { doc_type: docType });
       onToast(`Đã tạo ${res.doc_type} số ${res.doc_no}!`);
+      const full = await apiGet(`/api/handovers/${res.id}`);
       await loadData();
       setSubTab('handovers');
+      setActiveHandover(full);
     } catch (e: any) {
       onToast(e.message, 'err');
     }
@@ -369,8 +422,8 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
     }
   };
 
-  // 1-tap open or auto-create BM-01/BM-05 from KtvFieldBoard (TASK-14 & TASK-15)
-  const openOrCreateHandoverForOrder = async (o: any) => {
+  // 1-tap open or auto-create BM-01/BM-05 (from KtvFieldBoard, 3PL Push, Allowance, etc.)
+  const openOrCreateHandoverForOrder = async (o: any, preferredDocType?: 'BM-01' | 'BM-05') => {
     ensureStaffLoaded();
     try {
       const existingId = o.handovers?.[0]?.id;
@@ -388,7 +441,7 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
         onToast('Đơn hàng này chưa có biên bản bàn giao.', 'err');
         return;
       }
-      const docType = o.require_install ? 'BM-01' : 'BM-05';
+      const docType = preferredDocType || (o.require_install ? 'BM-01' : 'BM-05');
       const res = await apiSend(`/api/orders/${o.id}/generate-handover`, 'POST', { doc_type: docType });
       onToast(`Đã tạo ${res.doc_type} số ${res.doc_no}!`);
       const full = await apiGet(`/api/handovers/${res.id}`);
@@ -514,7 +567,14 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                     <tr key={o.id} className={`hover:bg-[#FAF7F2] ${o.status === 'Cancelled' ? 'opacity-60' : ''}`}>
                       <td className="py-2.5 px-3 whitespace-nowrap">
                         <div className="font-bold text-[#3B281A] flex items-center gap-1.5">
-                          <span>{o.invoice_no}</span>
+                          <button
+                            type="button"
+                            onClick={() => onNavigate?.('delivery3pl', { open3plSlipNo: o.invoice_no })}
+                            className="font-mono hover:text-[#224B85] hover:underline cursor-pointer text-left"
+                            title="Mở pop-up Chi tiết POS & 3PL"
+                          >
+                            {o.invoice_no}
+                          </button>
                           {o.merged_invoices && (
                             <span
                               className="px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-900 text-[10px] font-bold inline-flex items-center gap-0.5"
@@ -532,6 +592,25 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                         <div className="text-[11px] text-[#6e5543]">
                           {o.delivery_date || o.order_date} {o.distance_km ? `• ${o.distance_km}km` : ''}
                         </div>
+                        {Array.isArray(o.warehouse_slips) && o.warehouse_slips.length > 0 && (
+                          <div className="flex flex-wrap gap-1 mt-1">
+                            {o.warehouse_slips.map((ws: any) => (
+                              <button
+                                type="button"
+                                key={ws.id}
+                                onClick={() => onNavigate?.('warehouse', { subTab: 'slips', openSlipId: ws.id })}
+                                className={`px-1.5 py-0.5 rounded border text-[9px] font-mono font-bold cursor-pointer hover:opacity-80 ${
+                                  ws.slip_type === 'NK'
+                                    ? 'bg-emerald-50 text-[#234E36] border-emerald-200'
+                                    : 'bg-blue-50 text-[#224B85] border-blue-200'
+                                }`}
+                                title={`Mở phiếu kho ${ws.slip_no} (${ws.status})`}
+                              >
+                                {ws.slip_no}
+                              </button>
+                            ))}
+                          </div>
+                        )}
                       </td>
                       <td className="py-2.5 px-3 max-w-[200px]">
                         <div className="font-semibold text-[#3B281A] truncate">{o.customer_name}</div>
@@ -663,7 +742,17 @@ export default function OrdersDispatchView({ user, onToast, onPrint }: Props) {
                   </span>
                 </div>
                 <div className="font-bold text-[#3B281A] mt-2">{h.customer_name}</div>
-                <div className="text-xs text-[#6e5543]">{h.customer_phone} • ĐH {h.invoice_no}</div>
+                <div className="text-xs text-[#6e5543]">
+                  {h.customer_phone} •{' '}
+                  <button
+                    type="button"
+                    onClick={() => onNavigate?.('delivery3pl', { open3plSlipNo: h.invoice_no })}
+                    className="font-mono text-[#224B85] hover:underline cursor-pointer"
+                    title="Xem chi tiết POS & 3PL"
+                  >
+                    ĐH {h.invoice_no}
+                  </button>
+                </div>
                 <div className="text-xs text-[#6e5543] mt-1 line-clamp-2">{h.address}</div>
                 <div className="text-[11px] text-[#3B281A] mt-2 leading-snug">
                   <strong>KTV ({h.ktvs?.length || 0}):</strong> {formatKtvList(h)}

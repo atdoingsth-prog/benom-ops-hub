@@ -178,3 +178,24 @@ export type PrintDoc =
   | { type: 'WARRANTY'; data: any }
   | { type: 'BM03'; data: any }
   | { type: 'BM04'; data: any };
+
+export interface NavIntent {
+  nonce?: number;
+  subTab?: string;
+  // Orders & Handovers ('orders')
+  openHandoverId?: number;
+  openOrCreateHandoverForOrderId?: number;
+  openOrCreateHandoverForInvoice?: string;
+  preferredDocType?: 'BM-01' | 'BM-05';
+  openOrderId?: number;
+  openOrderInvoice?: string;
+  // Warehouse Slips ('warehouse')
+  openSlipId?: number;
+  openSlipNo?: string;
+  // Warranty & QC ('warranty')
+  openTicketNo?: string;
+  openBm03No?: string;
+  openBm04No?: string;
+  // 3PL Report ('delivery3pl')
+  open3plSlipNo?: string;
+}

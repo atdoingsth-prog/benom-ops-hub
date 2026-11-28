@@ -1,9 +1,9 @@
 import React, { lazy, Suspense, useEffect, useState } from 'react';
 import {
-  AlertTriangle, Ban, CheckCircle2, ClipboardCheck, Download, FileSpreadsheet,
+  AlertTriangle, ArrowUpRight, Ban, CheckCircle2, ClipboardCheck, Download, FileSpreadsheet,
   Plus, Printer, UploadCloud, Warehouse, X
 } from 'lucide-react';
-import { apiDownload, apiGet, apiGetPage, apiSend, apiUpload, AuthUser, PrintDoc } from '../api';
+import { apiDownload, apiGet, apiGetPage, apiSend, apiUpload, AuthUser, NavIntent, PrintDoc } from '../api';
 
 const SparePartsPanel = lazy(() => import('../components/SparePartsPanel'));
 const SLIP_PAGE_SIZE = 40;
@@ -12,9 +12,12 @@ interface Props {
   user: AuthUser;
   onToast: (msg: string, tone?: 'ok' | 'err') => void;
   onPrint: (doc: PrintDoc) => void;
+  onNavigate?: (tab: string, intent?: NavIntent) => void;
+  navIntent?: NavIntent | null;
+  onConsumeIntent?: () => void;
 }
 
-export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
+export default function WarehouseErpView({ user, onToast, onPrint, onNavigate, navIntent, onConsumeIntent }: Props) {
   const canEditSlips = user.role === 'ADMIN' || user.role === 'EDITOR';
   const canUploadErp = user.role === 'ADMIN';
 
@@ -79,6 +82,29 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
   useEffect(() => {
     if (subTab === 'slips') loadSlips(0, false);
   }, [subTab, slipFilter]);
+
+  // Cross-module deep-link consumer: immediately opens Warehouse Slip popup (XK/NK)
+  useEffect(() => {
+    if (!navIntent?.nonce) return;
+    const intent = navIntent;
+    onConsumeIntent?.();
+    if (intent.subTab === 'slips' || intent.openSlipId || intent.openSlipNo) {
+      setSubTab('slips');
+    }
+    (async () => {
+      try {
+        if (intent.openSlipId) {
+          const full = await apiGet(`/api/slips/${intent.openSlipId}`);
+          openCompleteSlip(full);
+        } else if (intent.openSlipNo) {
+          const full = await apiGet(`/api/slips/by-no/${encodeURIComponent(intent.openSlipNo)}`);
+          openCompleteSlip(full);
+        }
+      } catch (e: any) {
+        onToast(e.message, 'err');
+      }
+    })();
+  }, [navIntent?.nonce]);
 
   const searchSkuWithStock = async (val: string) => {
     setSkuSearch(val);
@@ -313,9 +339,16 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
                   {slips.map(s => (
                     <tr key={s.id} className={`hover:bg-[#FAF7F2] ${s.status === 'Cancelled' ? 'opacity-60' : ''}`}>
                       <td className="py-2.5 px-3 whitespace-nowrap">
-                        <span className={`px-2 py-0.5 rounded font-bold text-[11px] ${s.slip_type === 'NK' ? 'bg-emerald-50 text-[#234E36]' : 'bg-blue-50 text-[#224B85]'}`}>
-                          {s.slip_no}
-                        </span>
+                        <button
+                          type="button"
+                          onClick={() => openCompleteSlip(s)}
+                          className={`px-2 py-0.5 rounded font-bold text-[11px] font-mono cursor-pointer hover:opacity-80 inline-flex items-center gap-0.5 ${
+                            s.slip_type === 'NK' ? 'bg-emerald-50 text-[#234E36]' : 'bg-blue-50 text-[#224B85]'
+                          }`}
+                          title="Mở chi tiết & kiểm đếm phiếu kho"
+                        >
+                          {s.slip_no} <ArrowUpRight className="w-3 h-3" />
+                        </button>
                       </td>
                       <td className="py-2.5 px-3 whitespace-nowrap">
                         <div className="font-medium text-[#3B281A]">{s.slip_date}</div>
@@ -323,7 +356,22 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
                       </td>
                       <td className="py-2.5 px-3">
                         <div className="font-semibold text-[#3B281A]">{s.purpose}</div>
-                        <div className="text-[11px] text-[#6e5543]">{s.partner_name} {s.ref_invoice ? `• ĐH ${s.ref_invoice}` : ''}</div>
+                        <div className="text-[11px] text-[#6e5543]">
+                          {s.partner_name}
+                          {s.ref_invoice ? (
+                            <>
+                              {' • '}
+                              <button
+                                type="button"
+                                onClick={() => onNavigate?.('orders', { subTab: 'orders', openOrderInvoice: s.ref_invoice })}
+                                className="font-mono font-semibold text-[#224B85] hover:underline cursor-pointer"
+                                title={`Mở đơn hàng ${s.ref_invoice} bên Điều phối`}
+                              >
+                                ĐH {s.ref_invoice}
+                              </button>
+                            </>
+                          ) : ''}
+                        </div>
                         {s.cutoff_warning && (
                           <div className="mt-1 text-[10px] text-[#9A2B26] font-medium flex items-center gap-1">
                             <AlertTriangle className="w-3 h-3 shrink-0" /> {s.cutoff_warning}
@@ -536,41 +584,90 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
         </Suspense>
       )}
 
-      {/* Actual Qty & Status Modal (TASK-09) */}
-      {completingSlip && (
-        <div className="fixed inset-0 z-40 bg-black/50 flex items-center justify-center p-3 overflow-y-auto">
-          <form onSubmit={saveCompleteSlip} className="bg-white rounded-2xl shadow-2xl w-full max-w-xl overflow-hidden">
-            <div className="px-5 py-3.5 bg-[#3B281A] text-[#F8F4EC] flex items-center justify-between">
-              <div className="font-bold text-sm">Xác Nhận Thực Tế & Trạng Thái • {completingSlip.slip_no}</div>
-              <button type="button" onClick={() => setCompletingSlip(null)} className="cursor-pointer"><X className="w-5 h-5" /></button>
+      {/* Universal Warehouse Slip Detail & Actual Qty Popup Modal (TASK-09) */}
+      {completingSlip && (() => {
+        const readOnlySlip = !canEditSlips || completingSlip.status === 'Cancelled';
+        return (
+        <div className="fixed inset-0 z-40 bg-black/50 flex items-center justify-center p-3 overflow-y-auto" onClick={() => setCompletingSlip(null)}>
+          <form onSubmit={saveCompleteSlip} onClick={e => e.stopPropagation()} className="bg-white rounded-2xl shadow-2xl w-full max-w-xl overflow-hidden">
+            <div className="px-5 py-3.5 bg-[#3B281A] text-[#F8F4EC] flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-[11px] text-[#D6BCA5] uppercase">
+                  {completingSlip.slip_type === 'NK' ? 'Phiếu Nhập Kho Toàn Nhất (NK)' : 'Phiếu Xuất Kho Toàn Nhất (XK)'}
+                </div>
+                <div className="font-bold text-sm flex flex-wrap items-center gap-2">
+                  <span>{completingSlip.slip_no}</span>
+                  {completingSlip.ref_invoice && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const inv = completingSlip.ref_invoice;
+                        setCompletingSlip(null);
+                        onNavigate?.('orders', { subTab: 'orders', openOrderInvoice: inv });
+                      }}
+                      className="px-2 py-0.5 rounded-full bg-white/15 text-[#F8F4EC] hover:bg-white/25 text-[11px] font-mono inline-flex items-center gap-1 cursor-pointer"
+                      title="Mở đơn hàng tham chiếu bên Điều phối"
+                    >
+                      ĐH {completingSlip.ref_invoice} <ArrowUpRight className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => onPrint({ type: 'SLIP', data: completingSlip })}
+                  className="px-2.5 py-1.5 rounded-lg bg-[#563C28] text-xs font-semibold hover:bg-[#6a4b33] cursor-pointer inline-flex items-center gap-1"
+                >
+                  <Printer className="w-3.5 h-3.5" /> In PDF
+                </button>
+                <button type="button" onClick={() => setCompletingSlip(null)} className="p-1 cursor-pointer"><X className="w-5 h-5" /></button>
+              </div>
             </div>
             <div className="p-5 space-y-3.5 text-xs max-h-[75vh] overflow-y-auto">
+              <div className="p-3 rounded-xl bg-[#FAF7F2] border border-[#E6DDD1] grid grid-cols-2 gap-2 text-[11px]">
+                <div><span className="text-[#6e5543]">Mục đích:</span> <strong className="text-[#3B281A]">{completingSlip.purpose || '—'}</strong></div>
+                <div><span className="text-[#6e5543]">Đối tác / ĐVVC:</span> <strong className="text-[#3B281A]">{completingSlip.partner_name}{completingSlip.carrier ? ` • ${completingSlip.carrier}` : ''}</strong></div>
+                <div><span className="text-[#6e5543]">Ngày lập:</span> <strong className="text-[#3B281A]">{completingSlip.slip_date || '—'}</strong></div>
+                <div><span className="text-[#6e5543]">Hẹn kho {completingSlip.warehouse_code || '9005'}:</span> <strong className="text-[#3B281A]">{completingSlip.expected_date || '—'} {completingSlip.expected_time || ''}</strong></div>
+              </div>
+
+              {completingSlip.cutoff_warning && (
+                <div className="p-2.5 rounded-lg bg-red-50 border border-[#9A2B26] text-[#9A2B26] text-[11px] flex items-start gap-1.5">
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{completingSlip.cutoff_warning}</span>
+                </div>
+              )}
+
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="font-semibold text-[#6e5543]">Trạng thái phiếu</label>
                   <select
-                    value={completingSlip.nextStatus}
+                    disabled={readOnlySlip}
+                    value={readOnlySlip ? completingSlip.status : completingSlip.nextStatus}
                     onChange={e => setCompletingSlip({ ...completingSlip, nextStatus: e.target.value })}
-                    className="w-full mt-1 px-2.5 py-2 border border-[#D6BCA5] rounded-lg bg-white font-semibold"
+                    className="w-full mt-1 px-2.5 py-2 border border-[#D6BCA5] rounded-lg bg-white font-semibold disabled:bg-gray-50"
                   >
                     <option value="Draft">Draft (Nháp)</option>
                     <option value="Sent">Sent (Đã gửi Toàn Nhất)</option>
                     <option value="Confirmed">Confirmed (Kho đã xác nhận)</option>
                     <option value="Completed">Completed (Hoàn tất xuất/nhập)</option>
+                    <option value="Cancelled">Cancelled (Đã hủy)</option>
                   </select>
                 </div>
                 <div>
                   <label className="font-semibold text-[#6e5543]">Ghi chú biên bản</label>
                   <input
+                    disabled={readOnlySlip}
                     value={completingSlip.editNotes}
                     onChange={e => setCompletingSlip({ ...completingSlip, editNotes: e.target.value })}
-                    className="w-full mt-1 px-2.5 py-2 border border-[#D6BCA5] rounded-lg"
+                    className="w-full mt-1 px-2.5 py-2 border border-[#D6BCA5] rounded-lg disabled:bg-gray-50"
                   />
                 </div>
               </div>
 
               <div className="space-y-2">
-                <div className="font-bold text-[#3B281A]">Kiểm đếm số lượng thực tế tại Kho 9005</div>
+                <div className="font-bold text-[#3B281A]">Kiểm đếm số lượng thực tế tại Kho {completingSlip.warehouse_code || '9005'}</div>
                 {completingSlip.editItems.map((it: any, idx: number) => {
                   const diff = Number(it.actual_qty) - Number(it.qty);
                   return (
@@ -585,17 +682,19 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
                           <input
                             type="number"
                             min={0}
+                            disabled={readOnlySlip}
                             value={it.actual_qty}
                             onChange={e => {
                               const arr = [...completingSlip.editItems];
                               arr[idx].actual_qty = Number(e.target.value);
                               setCompletingSlip({ ...completingSlip, editItems: arr });
                             }}
-                            className={`w-16 px-2 py-1 rounded border text-center font-bold bg-white ${diff !== 0 ? 'border-[#9A2B26] text-[#9A2B26]' : 'border-[#234E36] text-[#234E36]'}`}
+                            className={`w-16 px-2 py-1 rounded border text-center font-bold bg-white disabled:bg-gray-50 ${diff !== 0 ? 'border-[#9A2B26] text-[#9A2B26]' : 'border-[#234E36] text-[#234E36]'}`}
                           />
                         </div>
                       </div>
                       <input
+                        disabled={readOnlySlip}
                         value={it.note}
                         onChange={e => {
                           const arr = [...completingSlip.editItems];
@@ -603,7 +702,7 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
                           setCompletingSlip({ ...completingSlip, editItems: arr });
                         }}
                         placeholder="Ghi chú chênh lệch / tình trạng thùng..."
-                        className="w-full px-2.5 py-1 rounded border border-[#D6BCA5] bg-white text-[11px]"
+                        className="w-full px-2.5 py-1 rounded border border-[#D6BCA5] bg-white text-[11px] disabled:bg-gray-50"
                       />
                     </div>
                   );
@@ -611,14 +710,19 @@ export default function WarehouseErpView({ user, onToast, onPrint }: Props) {
               </div>
             </div>
             <div className="px-5 py-3 bg-[#F8F4EC] border-t border-[#E6DDD1] flex justify-end gap-2">
-              <button type="button" onClick={() => setCompletingSlip(null)} className="px-4 py-2 rounded-lg border border-[#D6BCA5] text-xs cursor-pointer">Hủy</button>
-              <button disabled={savingActual} type="submit" className="px-5 py-2 rounded-lg bg-[#234E36] text-white text-xs font-semibold hover:bg-[#1b3d2a] cursor-pointer disabled:opacity-60">
-                {savingActual ? 'Đang lưu...' : 'Lưu thực tế & Cập nhật'}
+              <button type="button" onClick={() => setCompletingSlip(null)} className="px-4 py-2 rounded-lg border border-[#D6BCA5] text-xs cursor-pointer">
+                {readOnlySlip ? 'Đóng' : 'Hủy'}
               </button>
+              {!readOnlySlip && (
+                <button disabled={savingActual} type="submit" className="px-5 py-2 rounded-lg bg-[#234E36] text-white text-xs font-semibold hover:bg-[#1b3d2a] cursor-pointer disabled:opacity-60">
+                  {savingActual ? 'Đang lưu...' : 'Lưu thực tế & Cập nhật'}
+                </button>
+              )}
             </div>
           </form>
         </div>
-      )}
+        );
+      })()}
 
       {/* New Slip Modal (with SKU Autocomplete + 9005 stock) */}
       {showNewSlip && (

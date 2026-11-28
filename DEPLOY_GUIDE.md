@@ -48,7 +48,12 @@ Render Free Web Service **không hết hạn sau 30 ngày** (miễn phí `750 gi
    - **Title:** `benom Ops Hub Keep-Alive`
    - **URL:** `https://benom-operations-hub.onrender.com/api/health` *(lưu ý: route `/api/health` không truy vấn DB nên tiêu tốn **0 lượt đọc Turso**!)*
    - **Execution schedule:** chọn **Custom** → Minutes: `*/10` (mỗi 10 phút), Hours: `8,9,10,11,12,13,14,15,16,17,18,19,20` (khung `08:00–20:00`), Timezone: **`Asia/Ho_Chi_Minh`**.
-3. Bấm **Create** → Render luôn tỉnh táo trong suốt giờ làm việc (`~12 giờ/ngày × 30 ngày = 360 giờ/tháng`, chỉ dùng chưa tới 50% hạn mức `750 giờ` miễn phí!).
+   - Tab **Advanced (quan trọng để tránh lỗi `Response data too big` > 64 KB khi Render cold start):**
+     - **Request method:** **`HEAD`** *(chỉ nhận HTTP header, **0 bytes** body)*
+     - **Headers:** `Accept: application/json`
+     - **Request timeout:** **`30 seconds`**
+3. Bấm **Create** → bấm **TEST RUN** kiểm tra trả `204` / `200 OK` → Render luôn tỉnh táo trong suốt giờ làm việc (`~12 giờ/ngày × 30 ngày = 360 giờ/tháng`, chỉ dùng chưa tới 50% hạn mức `750 giờ` miễn phí!).
+4. *(Dự phòng \$0 nếu Cloudflare WAF chặn dải IP `cron-job.org`):* Dùng **UptimeRobot (Free, HTTP HEAD)** hoặc **Cloudflare Workers Cron Trigger (Free 100k req/ngày)** ping `HEAD https://benom-operations-hub.onrender.com/api/health`.
 
 ---
 

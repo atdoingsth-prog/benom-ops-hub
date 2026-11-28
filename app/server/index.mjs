@@ -525,6 +525,11 @@ async function calcStore3001Inventory(includeItems = false, latestByStoreMap = n
 
 // ─── 0. PUBLIC HEALTH & AUTH ROUTES ───────────────────────────
 // Zero-DB lightweight health probe for Render & free keep-alive pings (burns 0 Turso row reads!)
+app.head('/api/health', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(204).end();
+});
+
 app.get('/api/health', (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.json({
@@ -1383,10 +1388,11 @@ app.get('/api/orders', wrap(async (req, res) => {
   const orderIds = orders.map(o => o.id);
   const invoiceNos = Array.from(new Set(orders.map(o => o.invoice_no).filter(Boolean)));
 
-  const [allItems, allHos, mergedChildren] = await Promise.all([
+  const [allItems, allHos, mergedChildren, allSlips] = await Promise.all([
     batchQueryByIds(`SELECT id, order_id, barcode, product_name, unit, qty, net_weight_g, source_warehouse, moving_no, orig_order_id, orig_invoice FROM order_items WHERE order_id IN`, orderIds),
     batchQueryByIds(`SELECT id, doc_no, doc_type, invoice_no, status, csat_rating FROM handovers WHERE invoice_no IN`, invoiceNos),
     batchQueryByIds(`SELECT id, invoice_no, customer_name, customer_paid_fee, shipping_fee_3pl, merged_into_order_id FROM orders WHERE merged_into_order_id IN`, orderIds),
+    batchQueryByIds(`SELECT id, slip_no, slip_type, ref_invoice, status FROM warehouse_slips WHERE ref_invoice IN`, invoiceNos),
   ]);
 
   const itemMap = new Map();
@@ -1407,6 +1413,12 @@ app.get('/api/orders', wrap(async (req, res) => {
     arr.push(mc);
     mergedMap.set(mc.merged_into_order_id, arr);
   }
+  const slipMap = new Map();
+  for (const ws of allSlips) {
+    const arr = slipMap.get(ws.ref_invoice) || [];
+    arr.push(ws);
+    slipMap.set(ws.ref_invoice, arr);
+  }
 
   const result = orders.map(o => {
     const items = itemMap.get(o.id) || [];
@@ -1416,11 +1428,58 @@ app.get('/api/orders', wrap(async (req, res) => {
       ktvs: parseKtvs(o),
       items,
       handovers: hoMap.get(o.invoice_no) || [],
+      warehouse_slips: slipMap.get(o.invoice_no) || [],
       merged_children: mergedMap.get(o.id) || [],
       requires_two_ktv: maxWeightG >= 25000,
     };
   });
   res.json(result);
+}));
+
+async function hydrateOrderByRow(o) {
+  if (!o) return null;
+  const inv = String(o.invoice_no || '').trim();
+  const [items, handovers, merged_children, warehouse_slips] = await Promise.all([
+    dbAll(`SELECT id, order_id, barcode, product_name, unit, qty, net_weight_g, source_warehouse, moving_no, orig_order_id, orig_invoice FROM order_items WHERE order_id = ? ORDER BY id ASC`, [o.id]),
+    inv ? dbAll(`SELECT id, doc_no, doc_type, invoice_no, status, csat_rating FROM handovers WHERE invoice_no = ? ORDER BY id DESC`, [inv]) : [],
+    dbAll(`SELECT id, invoice_no, customer_name, customer_paid_fee, shipping_fee_3pl, merged_into_order_id FROM orders WHERE merged_into_order_id = ?`, [o.id]),
+    inv ? dbAll(`SELECT id, slip_no, slip_type, ref_invoice, status FROM warehouse_slips WHERE ref_invoice = ? ORDER BY id DESC`, [inv]) : [],
+  ]);
+  const maxWeightG = items.reduce((m, it) => Math.max(m, it.net_weight_g || 0), 0);
+  return {
+    ...o,
+    ktvs: parseKtvs(o),
+    items,
+    handovers,
+    warehouse_slips,
+    merged_children,
+    requires_two_ktv: maxWeightG >= 25000,
+  };
+}
+
+app.get('/api/orders/by-invoice/:invoiceNo', wrap(async (req, res) => {
+  const inv = String(req.params.invoiceNo || '').trim();
+  if (!inv) return res.status(400).json({ error: 'Thiếu mã hóa đơn' });
+  let row = await dbGet(
+    `SELECT * FROM orders WHERE invoice_no = ? ORDER BY CASE WHEN status IN ('Cancelled','Merged') THEN 1 ELSE 0 END, id DESC LIMIT 1`,
+    [inv]
+  );
+  if (!row) {
+    row = await dbGet(
+      `SELECT * FROM orders WHERE merged_invoices LIKE ? ORDER BY CASE WHEN status IN ('Cancelled','Merged') THEN 1 ELSE 0 END, id DESC LIMIT 1`,
+      [`%${inv}%`]
+    );
+  }
+  if (!row) return res.status(404).json({ error: `Không tìm thấy đơn hàng ${inv} bên Điều phối` });
+  res.json(await hydrateOrderByRow(row));
+}));
+
+app.get('/api/orders/:id', wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'Mã đơn hàng không hợp lệ' });
+  const row = await dbGet('SELECT * FROM orders WHERE id = ?', [id]);
+  if (!row) return res.status(404).json({ error: 'Không tìm thấy đơn hàng' });
+  res.json(await hydrateOrderByRow(row));
 }));
 
 app.post('/api/orders', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
@@ -2122,6 +2181,7 @@ async function computeAllowance(monthInput, scopeInput = 'completed') {
 
     eligibleOrders.push({
       order: o,
+      bm01_id: bm01?.id || null,
       bm01_doc_no: bm01?.doc_no || '',
       bm01_status: hasCompletedBm01
         ? 'Đã ký BM-01'
@@ -2171,7 +2231,7 @@ async function computeAllowance(monthInput, scopeInput = 'completed') {
 
       lines.push({
         order_id: o.id, date: dateStr, invoice_no: o.invoice_no, customer_name: o.customer_name,
-        order_status: o.status, bm01_doc_no: entry.bm01_doc_no, bm01_status: entry.bm01_status,
+        order_status: o.status, bm01_id: entry.bm01_id, bm01_doc_no: entry.bm01_doc_no, bm01_status: entry.bm01_status,
         is_verified_bm01: entry.is_verified_bm01,
         barcode: it.barcode, product_name: it.product_name, qty: it.qty, distance_km: o.distance_km,
         is_stairs: o.is_stairs, k_floor: kFloor,
@@ -2311,6 +2371,24 @@ app.get('/api/slips', wrap(async (req, res) => {
     itemMap.set(it.slip_id, arr);
   }
   res.json(slips.map(s => ({ ...s, items: itemMap.get(s.id) || [] })));
+}));
+
+app.get('/api/slips/by-no/:slipNo', wrap(async (req, res) => {
+  const slipNo = String(req.params.slipNo || '').trim();
+  if (!slipNo) return res.status(400).json({ error: 'Thiếu số phiếu kho' });
+  const slip = await dbGet('SELECT * FROM warehouse_slips WHERE slip_no = ?', [slipNo]);
+  if (!slip) return res.status(404).json({ error: `Không tìm thấy phiếu kho ${slipNo}` });
+  const items = await dbAll(`SELECT id, slip_id, barcode, product_name, unit, qty, actual_qty, note FROM warehouse_slip_items WHERE slip_id = ? ORDER BY id ASC`, [slip.id]);
+  res.json({ ...slip, items });
+}));
+
+app.get('/api/slips/:id', wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'Mã phiếu kho không hợp lệ' });
+  const slip = await dbGet('SELECT * FROM warehouse_slips WHERE id = ?', [id]);
+  if (!slip) return res.status(404).json({ error: 'Không tìm thấy phiếu kho' });
+  const items = await dbAll(`SELECT id, slip_id, barcode, product_name, unit, qty, actual_qty, note FROM warehouse_slip_items WHERE slip_id = ? ORDER BY id ASC`, [slip.id]);
+  res.json({ ...slip, items });
 }));
 
 app.post('/api/slips', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
@@ -3269,9 +3347,20 @@ app.get('/api/delivery-tracking/:slipNo/detail', wrap(async (req, res) => {
 
 app.post('/api/delivery-tracking/:slipNo/push-to-order', requireRoles('ADMIN', 'EDITOR'), wrap(async (req, res) => {
   const slipNo = String(req.params.slipNo || '').trim();
-  const existingOrder = await dbGet(`SELECT id, status FROM orders WHERE invoice_no = ? ORDER BY id DESC LIMIT 1`, [slipNo]);
+  const existingOrder = await dbGet(`SELECT id, status, require_install FROM orders WHERE invoice_no = ? ORDER BY CASE WHEN status IN ('Cancelled','Merged') THEN 1 ELSE 0 END, id DESC LIMIT 1`, [slipNo]);
   if (existingOrder) {
-    return res.json({ ok: true, existed: true, order_id: existingOrder.id, status: existingOrder.status });
+    const existingHandover = await dbGet(
+      `SELECT id, doc_type FROM handovers WHERE order_id = ? OR invoice_no = ? ORDER BY id DESC LIMIT 1`,
+      [existingOrder.id, slipNo]
+    );
+    return res.json({
+      ok: true,
+      existed: true,
+      order_id: existingOrder.id,
+      status: existingOrder.status,
+      require_install: existingOrder.require_install || 0,
+      existing_handover_id: existingHandover?.id || null,
+    });
   }
   const dt = await dbGet(`SELECT * FROM delivery_tracking WHERE slip_no = ?`, [slipNo]);
   const pos = await dbGet(`SELECT * FROM pos_slips WHERE slip_no = ?`, [slipNo]);
@@ -3332,7 +3421,14 @@ app.post('/api/delivery-tracking/:slipNo/push-to-order', requireRoles('ADMIN', '
     ]);
   }
 
-  res.json({ ok: true, existed: false, order_id: oid, items_created: parsedEntries.length });
+  res.json({
+    ok: true,
+    existed: false,
+    order_id: oid,
+    require_install: reqInstall,
+    existing_handover_id: null,
+    items_created: parsedEntries.length,
+  });
 }));
 
 async function parseTransactionDetailCsvStream(filePath) {

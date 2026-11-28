@@ -3,7 +3,7 @@ import {
   AlertOctagon, ClipboardList, Clock, Factory, FileOutput, PackagePlus,
   Plus, Printer, Search, ShieldCheck, Wrench, X
 } from 'lucide-react';
-import { apiGet, apiSend, AuthUser, fmtVnd, PrintDoc } from '../api';
+import { apiGet, apiSend, AuthUser, fmtVnd, NavIntent, PrintDoc } from '../api';
 
 const Bm03Modal = lazy(() => import('../components/Bm03Modal'));
 const Bm04Modal = lazy(() => import('../components/Bm04Modal'));
@@ -24,11 +24,14 @@ interface Props {
   user: AuthUser;
   onToast: (msg: string, tone?: 'ok' | 'err') => void;
   onPrint: (doc: PrintDoc) => void;
+  onNavigate?: (tab: string, intent?: NavIntent) => void;
+  navIntent?: NavIntent | null;
+  onConsumeIntent?: () => void;
 }
 
 type SubTab = 'warranty' | 'bm03' | 'bm04' | 'qc' | 'support';
 
-export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
+export default function WarrantyQcView({ user, onToast, onPrint, onNavigate, navIntent, onConsumeIntent }: Props) {
   const canCreateOrEditQc = user.role === 'ADMIN' || user.role === 'EDITOR';
   const canUpdateTicketOrLog = user.role === 'ADMIN' || user.role === 'EDITOR' || user.role === 'KTV';
 
@@ -49,9 +52,10 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
   const [counts, setCounts] = useState({ warranty: 0, bm03: 0, bm04: 0, qc_units: 0, support_hours: 0 });
   const loadedTabs = useRef<Set<SubTab>>(new Set());
 
-  // Active modals
+  // Active modals & highlight
   const [activeBm03, setActiveBm03] = useState<any>(null);
   const [activeBm04, setActiveBm04] = useState<any>(null);
+  const [highlightTicketNo, setHighlightTicketNo] = useState<string>('');
   const [showNewQc, setShowNewQc] = useState(false);
   const [qcSkuQuery, setQcSkuQuery] = useState('');
   const [qcSkuMatches, setQcSkuMatches] = useState<any[]>([]);
@@ -117,6 +121,41 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
 
   useEffect(() => { loadCounts(); }, []);
   useEffect(() => { loadTab(subTab); }, [subTab]);
+
+  // Cross-module deep-link consumer (BM-02 Ticket / BM-03 / BM-04)
+  useEffect(() => {
+    if (!navIntent?.nonce) return;
+    const intent = navIntent;
+    onConsumeIntent?.();
+    if (intent.subTab && ['warranty', 'bm03', 'bm04', 'qc', 'support'].includes(intent.subTab)) {
+      setSubTab(intent.subTab as SubTab);
+    }
+    (async () => {
+      try {
+        if (intent.openTicketNo) {
+          setSubTab('warranty');
+          await loadTab('warranty', true);
+          setHighlightTicketNo(intent.openTicketNo);
+        } else if (intent.openBm03No) {
+          setSubTab('bm03');
+          const rows = await apiGet('/api/bm03');
+          setBm03List(rows);
+          loadedTabs.current.add('bm03');
+          const found = rows.find((x: any) => x.doc_no === intent.openBm03No);
+          if (found) setActiveBm03(found);
+        } else if (intent.openBm04No) {
+          setSubTab('bm04');
+          const rows = await apiGet('/api/bm04');
+          setBm04List(rows);
+          loadedTabs.current.add('bm04');
+          const found = rows.find((x: any) => x.doc_no === intent.openBm04No);
+          if (found) setActiveBm04(found);
+        }
+      } catch (e: any) {
+        onToast(e.message, 'err');
+      }
+    })();
+  }, [navIntent?.nonce]);
 
   const doLookup = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -220,9 +259,40 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
       const res = await apiSend(`/api/qc-returns/${q.id}/generate-slip`, 'POST', { slip_type: slipType });
       onToast(`Đã tạo phiếu ${res.slip_no} (${slipType === 'XK' ? 'Trả xưởng NCC' : 'Nhận lại từ xưởng'}) & tự gắn vào lô QC!`);
       refreshTabs('qc');
+      if (onNavigate && res.slip_id) {
+        onNavigate('warehouse', { subTab: 'slips', openSlipId: res.slip_id });
+      }
     } catch (err: any) {
       onToast(err.message, 'err');
     }
+  };
+
+  const openBm03ByNo = async (docNo: string) => {
+    let found = bm03List.find(x => x.doc_no === docNo);
+    if (!found) {
+      try {
+        const rows = await apiGet('/api/bm03');
+        setBm03List(rows);
+        loadedTabs.current.add('bm03');
+        found = rows.find((x: any) => x.doc_no === docNo);
+      } catch { /* ignore */ }
+    }
+    if (found) setActiveBm03(found);
+    else setSubTab('bm03');
+  };
+
+  const openBm04ByNo = async (docNo: string) => {
+    let found = bm04List.find(x => x.doc_no === docNo);
+    if (!found) {
+      try {
+        const rows = await apiGet('/api/bm04');
+        setBm04List(rows);
+        loadedTabs.current.add('bm04');
+        found = rows.find((x: any) => x.doc_no === docNo);
+      } catch { /* ignore */ }
+    }
+    if (found) setActiveBm04(found);
+    else setSubTab('bm04');
   };
 
   const printBm03 = async (item: any) => {
@@ -337,7 +407,18 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
                   <div key={i} className="py-2 flex flex-wrap items-center justify-between gap-2">
                     <div>
                       <span className="font-bold text-[#3B281A]">{r.customer_name}</span> ({r.customer_phone}) — <strong>{r.product_name}</strong>
-                      <div className="text-[11px] text-[#6e5543]">ĐH {r.invoice_no} • Ngày giao: {r.handover_date || '—'} • Chính sách: {r.warranty_policy}</div>
+                      <div className="text-[11px] text-[#6e5543]">
+                        {r.invoice_no ? (
+                          <button
+                            type="button"
+                            onClick={() => onNavigate?.('orders', { subTab: 'orders', openOrderInvoice: r.invoice_no })}
+                            className="font-mono font-semibold text-[#224B85] hover:underline cursor-pointer"
+                            title="Mở đơn hàng bên Điều phối"
+                          >
+                            ĐH {r.invoice_no}
+                          </button>
+                        ) : 'ĐH —'} • Ngày giao: {r.handover_date || '—'} • Chính sách: {r.warranty_policy}
+                      </div>
                     </div>
                     <div className="flex items-center gap-2">
                       <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
@@ -363,7 +444,7 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
           {/* Ticket Cards */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {tickets.map(t => (
-              <div key={t.id} className="bg-white rounded-xl p-4 border border-[#E6DDD1] space-y-2.5">
+              <div key={t.id} className={`bg-white rounded-xl p-4 border space-y-2.5 ${highlightTicketNo === t.ticket_no ? 'border-[#9A2B26] ring-2 ring-[#9A2B26]/30' : 'border-[#E6DDD1]'}`}>
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="px-2 py-0.5 rounded bg-[#3B281A] text-white text-[10px] font-bold">{t.ticket_no}</span>
@@ -391,7 +472,19 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
                   )}
                 </div>
                 <div className="text-sm font-bold text-[#3B281A]">{t.product_name}</div>
-                <div className="text-xs text-[#6e5543]">{t.customer_name} • {t.customer_phone} • ĐH {t.invoice_no || '—'}</div>
+                <div className="text-xs text-[#6e5543]">
+                  {t.customer_name} • {t.customer_phone} •{' '}
+                  {t.invoice_no ? (
+                    <button
+                      type="button"
+                      onClick={() => onNavigate?.('orders', { subTab: 'orders', openOrderInvoice: t.invoice_no })}
+                      className="font-mono font-semibold text-[#224B85] hover:underline cursor-pointer"
+                      title="Mở đơn hàng bên Điều phối"
+                    >
+                      ĐH {t.invoice_no}
+                    </button>
+                  ) : 'ĐH —'}
+                </div>
                 <div className="text-xs bg-[#FAF7F2] p-2.5 rounded-lg border border-[#EFE7DC]">{t.issue_desc}</div>
                 <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#6e5543] pt-1">
                   <div className="space-y-0.5">
@@ -405,11 +498,8 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
                   <div className="flex flex-wrap items-center gap-1.5">
                     {t.bm03_no ? (
                       <button
-                        onClick={() => {
-                          const found = bm03List.find(x => x.doc_no === t.bm03_no);
-                          if (found) setActiveBm03(found); else setSubTab('bm03');
-                        }}
-                        className="px-2 py-1 rounded bg-emerald-50 border border-[#234E36] text-[#234E36] text-[10px] font-bold cursor-pointer"
+                        onClick={() => openBm03ByNo(t.bm03_no)}
+                        className="px-2 py-1 rounded bg-emerald-50 border border-[#234E36] text-[#234E36] text-[10px] font-bold cursor-pointer hover:bg-emerald-100"
                       >
                         ✓ {t.bm03_no}
                       </button>
@@ -428,11 +518,8 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
 
                     {t.bm04_no ? (
                       <button
-                        onClick={() => {
-                          const found = bm04List.find(x => x.doc_no === t.bm04_no);
-                          if (found) setActiveBm04(found); else setSubTab('bm04');
-                        }}
-                        className="px-2 py-1 rounded bg-red-50 border border-[#9A2B26] text-[#9A2B26] text-[10px] font-bold cursor-pointer"
+                        onClick={() => openBm04ByNo(t.bm04_no)}
+                        className="px-2 py-1 rounded bg-red-50 border border-[#9A2B26] text-[#9A2B26] text-[10px] font-bold cursor-pointer hover:bg-red-100"
                       >
                         ✓ {t.bm04_no}
                       </button>
@@ -496,7 +583,22 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
                       <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${item.status === 'Closed' ? 'bg-emerald-50 text-[#234E36]' : 'bg-amber-50 text-amber-800'}`}>{item.status}</span>
                     </div>
                     <div className="font-bold text-sm text-[#3B281A]">{item.product_name} (x{item.qty})</div>
-                    <div className="text-[#6e5543]">{item.customer_name} • {item.doc_date} • {item.location}</div>
+                    <div className="text-[#6e5543]">
+                      {item.customer_name} • {item.doc_date} • {item.location}
+                      {item.invoice_no ? (
+                        <>
+                          {' • '}
+                          <button
+                            type="button"
+                            onClick={() => onNavigate?.('orders', { subTab: 'orders', openOrderInvoice: item.invoice_no })}
+                            className="font-mono font-semibold text-[#224B85] hover:underline cursor-pointer"
+                            title="Mở đơn hàng bên Điều phối"
+                          >
+                            ĐH {item.invoice_no}
+                          </button>
+                        </>
+                      ) : null}
+                    </div>
                     <div className="text-[11px]"><strong>Nguyên nhân:</strong> {item.root_cause}</div>
                     <div className="text-[11px] text-[#224B85]"><strong>Xử lý:</strong> {item.customer_resolution} • {item.warehouse_disposition}</div>
                     {item.inv_adj_code && <div className="text-[10px] font-mono text-[#234E36]">ERP Adj: {item.inv_adj_code}</div>}
@@ -551,7 +653,19 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
                         {item.claim_status}
                       </span>
                     </div>
-                    <div className="font-bold text-sm text-[#3B281A]">{item.carrier} • ĐH {item.invoice_no || '—'}</div>
+                    <div className="font-bold text-sm text-[#3B281A]">
+                      {item.carrier} •{' '}
+                      {item.invoice_no ? (
+                        <button
+                          type="button"
+                          onClick={() => onNavigate?.('orders', { subTab: 'orders', openOrderInvoice: item.invoice_no })}
+                          className="font-mono text-[#224B85] hover:underline cursor-pointer"
+                          title="Mở đơn hàng bên Điều phối"
+                        >
+                          ĐH {item.invoice_no}
+                        </button>
+                      ) : 'ĐH —'}
+                    </div>
                     <div className="text-[#6e5543]">Tài xế: {item.driver_name || '—'} • Xe: {item.vehicle_plate || '—'}</div>
                     <div className="text-[11px] font-bold text-[#9A2B26]">Giá trị Claim: {fmtVnd(item.claim_amount)}</div>
                     <div className="text-[10px] text-[#6e5543] flex items-center gap-1">
@@ -647,14 +761,28 @@ export default function WarrantyQcView({ user, onToast, onPrint }: Props) {
                       <td className="py-2.5 px-3 whitespace-nowrap space-y-1">
                         <div className="flex items-center gap-1">
                           {q.ref_xk_no ? (
-                            <span className="px-1.5 py-0.5 rounded bg-blue-50 text-[#224B85] font-mono text-[10px] font-bold">{q.ref_xk_no}</span>
+                            <button
+                              type="button"
+                              onClick={() => onNavigate?.('warehouse', { subTab: 'slips', openSlipNo: q.ref_xk_no })}
+                              className="px-1.5 py-0.5 rounded bg-blue-50 text-[#224B85] font-mono text-[10px] font-bold hover:bg-blue-100 cursor-pointer"
+                              title={`Mở phiếu xuất kho ${q.ref_xk_no}`}
+                            >
+                              {q.ref_xk_no}
+                            </button>
                           ) : canCreateOrEditQc ? (
                             <button onClick={() => generateQcSlip(q, 'XK')} className="px-2 py-0.5 rounded bg-[#F8F4EC] border border-[#D6BCA5] text-[#3B281A] hover:bg-[#EFE7DC] text-[10px] font-semibold cursor-pointer">
                               <FileOutput className="w-3 h-3 inline mr-0.5" /> + XK trả xưởng
                             </button>
                           ) : null}
                           {q.ref_nk_no ? (
-                            <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-[#234E36] font-mono text-[10px] font-bold">{q.ref_nk_no}</span>
+                            <button
+                              type="button"
+                              onClick={() => onNavigate?.('warehouse', { subTab: 'slips', openSlipNo: q.ref_nk_no })}
+                              className="px-1.5 py-0.5 rounded bg-emerald-50 text-[#234E36] font-mono text-[10px] font-bold hover:bg-emerald-100 cursor-pointer"
+                              title={`Mở phiếu nhập kho ${q.ref_nk_no}`}
+                            >
+                              {q.ref_nk_no}
+                            </button>
                           ) : canCreateOrEditQc ? (
                             <button onClick={() => generateQcSlip(q, 'NK')} className="px-2 py-0.5 rounded bg-emerald-50 border border-[#234E36]/40 text-[#234E36] hover:bg-emerald-100 text-[10px] font-semibold cursor-pointer">
                               <PackagePlus className="w-3 h-3 inline mr-0.5" /> + NK nhận lại

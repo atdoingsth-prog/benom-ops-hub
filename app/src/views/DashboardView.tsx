@@ -7,7 +7,7 @@ import {
   Bar, BarChart, CartesianGrid, Cell, ComposedChart, Legend, Line,
   ResponsiveContainer, Tooltip, XAxis, YAxis
 } from 'recharts';
-import { apiGet, apiSend, AuthUser, fmtMonth, fmtNum, fmtVnd } from '../api';
+import { apiGet, apiSend, AuthUser, fmtMonth, fmtNum, fmtVnd, NavIntent } from '../api';
 
 const Wh9005DrilldownPanel = lazy(() => import('../components/Wh9005DrilldownPanel'));
 const Store3001DrilldownPanel = lazy(() => import('../components/Store3001DrilldownPanel'));
@@ -15,7 +15,7 @@ const Store3001DrilldownPanel = lazy(() => import('../components/Store3001Drilld
 interface Props {
   user: AuthUser;
   onToast: (msg: string, tone?: 'ok' | 'err') => void;
-  onNavigate: (tab: string) => void;
+  onNavigate: (tab: string, intent?: NavIntent) => void;
 }
 
 export default function DashboardView({ user, onToast, onNavigate }: Props) {
@@ -71,6 +71,9 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
         items: [{ barcode: item.barcode, product_name: item.product_name, unit: 'Cái', qty }],
       });
       onToast(`Đã tạo phiếu xuất chuyển kho ${res.slip_no} (${qty} cái)!`);
+      if (res.id) {
+        onNavigate('warehouse', { subTab: 'slips', openSlipId: res.id });
+      }
     } catch (e: any) {
       onToast(e.message, 'err');
     }
@@ -259,9 +262,13 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
         )}
       </div>
 
-      {/* KPI Grid */}
+      {/* KPI Grid (clickable quick-navigation cards) */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="bg-white rounded-xl p-4 border border-[#E6DDD1] shadow-xs">
+        <button
+          type="button"
+          onClick={() => onNavigate('orders', { subTab: 'orders' })}
+          className="text-left bg-white rounded-xl p-4 border border-[#E6DDD1] shadow-xs hover:border-[#3B281A]/40 transition-colors cursor-pointer"
+        >
           <div className="flex items-center justify-between text-xs text-[#6e5543] font-medium">
             <span>Tổng Đơn Giao & Lắp</span>
             <Truck className="w-4 h-4 text-[#224B85]" />
@@ -270,9 +277,13 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
           <div className="text-[11px] text-[#234E36] mt-1 font-medium">
             Hoàn tất: {otifPct}% • Có lắp đặt: {orderStats.install_orders} đơn
           </div>
-        </div>
+        </button>
 
-        <div className="bg-white rounded-xl p-4 border border-[#E6DDD1] shadow-xs">
+        <button
+          type="button"
+          onClick={() => onNavigate('delivery3pl')}
+          className="text-left bg-white rounded-xl p-4 border border-[#E6DDD1] shadow-xs hover:border-[#3B281A]/40 transition-colors cursor-pointer"
+        >
           <div className="flex items-center justify-between text-xs text-[#6e5543] font-medium">
             <span>Chi Phí Ship 3PL</span>
             <TrendingUp className="w-4 h-4 text-[#3B281A]" />
@@ -281,9 +292,13 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
           <div className="text-[11px] text-[#6e5543] mt-1">
             Khách đóng: {fmtVnd(orderStats.total_cust_fee)} ({orderStats.promo_free_orders} đơn Freeship)
           </div>
-        </div>
+        </button>
 
-        <div className={`bg-white rounded-xl p-4 border shadow-xs ${isOverCap ? 'border-[#9A2B26]' : 'border-[#E6DDD1]'}`}>
+        <button
+          type="button"
+          onClick={() => onNavigate('warehouse', { subTab: 'slips' })}
+          className={`text-left bg-white rounded-xl p-4 border shadow-xs hover:border-[#3B281A]/40 transition-colors cursor-pointer ${isOverCap ? 'border-[#9A2B26]' : 'border-[#E6DDD1]'}`}
+        >
           <div className="flex items-center justify-between text-xs text-[#6e5543] font-medium">
             <span>Diện Tích Kho 9005</span>
             <Warehouse className={`w-4 h-4 ${isOverCap ? 'text-[#9A2B26]' : 'text-[#234E36]'}`} />
@@ -300,9 +315,13 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
           <div className="text-[11px] text-[#6e5543] mt-1">
             {wh9005.utilization_pct}% trần HĐ 019-2026 • {fmtNum(wh9005.total_qty)} sp ({wh9005.sku_count} SKU)
           </div>
-        </div>
+        </button>
 
-        <div className="bg-white rounded-xl p-4 border border-[#E6DDD1] shadow-xs">
+        <button
+          type="button"
+          onClick={() => onNavigate('warranty', { subTab: 'warranty' })}
+          className="text-left bg-white rounded-xl p-4 border border-[#E6DDD1] shadow-xs hover:border-[#3B281A]/40 transition-colors cursor-pointer"
+        >
           <div className="flex items-center justify-between text-xs text-[#6e5543] font-medium">
             <span>CSAT & Hậu Mãi</span>
             <Star className="w-4 h-4 text-amber-500" />
@@ -313,7 +332,7 @@ export default function DashboardView({ user, onToast, onNavigate }: Props) {
           <div className="text-[11px] text-[#9A2B26] mt-1 font-medium">
             BH đang mở: {ticketStats.open_count} • QC trả xưởng: {qcStats.units} cái ({qcStats.skus} SKU)
           </div>
-        </div>
+        </button>
       </div>
 
       {/* Store 3001 Sales & Inventory Trend Chart */}

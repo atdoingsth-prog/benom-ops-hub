@@ -5,7 +5,7 @@ import {
 import {
   Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis
 } from 'recharts';
-import { apiDownload, apiGet, apiSend, apiUpload, AuthUser, fmtMonth, fmtVnd } from '../api';
+import { apiDownload, apiGet, apiSend, apiUpload, AuthUser, fmtMonth, fmtVnd, NavIntent } from '../api';
 
 const SlipDetailModal = lazy(() => import('../components/SlipDetailModal'));
 const MergeModal = lazy(() => import('../components/MergeModal'));
@@ -13,12 +13,14 @@ const MergeModal = lazy(() => import('../components/MergeModal'));
 interface Props {
   user: AuthUser;
   onToast: (msg: string, tone?: 'ok' | 'err') => void;
-  onNavigate?: (tab: string) => void;
+  onNavigate?: (tab: string, intent?: NavIntent) => void;
+  navIntent?: NavIntent | null;
+  onConsumeIntent?: () => void;
 }
 
 const CARRIERS = ['', 'Ahamove', 'Xanh SM', '247 Express', 'Sagawa', 'Toàn Nhất Logistics', 'Nhất Tín Logistics', 'Kỹ thuật Benom', 'Benom staff', 'Lalamove', 'Viettel Post', 'Khác'];
 
-export default function DeliveryTrackingView({ user, onToast, onNavigate }: Props) {
+export default function DeliveryTrackingView({ user, onToast, onNavigate, navIntent, onConsumeIntent }: Props) {
   const canEdit = user.role === 'ADMIN' || user.role === 'EDITOR';
   const [pushingSlip, setPushingSlip] = useState<string | null>(null);
   const [detailSlipNo, setDetailSlipNo] = useState<string | null>(null);
@@ -87,6 +89,13 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
 
   useEffect(() => { load(month); }, [month]);
 
+  useEffect(() => {
+    if (!navIntent?.nonce) return;
+    const slip = navIntent.open3plSlipNo;
+    onConsumeIntent?.();
+    if (slip) setDetailSlipNo(slip);
+  }, [navIntent?.nonce]);
+
   const handleUploadPos = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
@@ -146,9 +155,21 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
     try {
       const res = await apiSend(`/api/delivery-tracking/${encodeURIComponent(slipNo)}/push-to-order`, 'POST', {});
       if (res.existed) {
-        onToast(`Hóa đơn ${slipNo} đã có bên Điều phối (${res.status})!`);
+        onToast(`Hóa đơn ${slipNo} đã có bên Điều phối (${res.status}) — Đang mở Biên bản / Phiếu giao hàng!`);
       } else {
-        onToast(`Đã đẩy ${slipNo} sang tab Điều phối & BM-01 (${res.items_created || 0} dòng SP)!`);
+        onToast(`Đã đẩy ${slipNo} sang Điều phối (${res.items_created || 0} dòng SP) — Đang mở Biên bản / Phiếu giao hàng!`);
+      }
+      if (onNavigate && res.order_id) {
+        if (res.existing_handover_id) {
+          onNavigate('orders', { subTab: 'handovers', openHandoverId: res.existing_handover_id });
+        } else {
+          onNavigate('orders', {
+            subTab: 'handovers',
+            openOrCreateHandoverForOrderId: res.order_id,
+            preferredDocType: res.require_install ? 'BM-01' : 'BM-05',
+          });
+        }
+        return;
       }
       await load(month);
     } catch (e: any) {
@@ -581,9 +602,15 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
                           {r.linked_order_id ? (
                             <button
                               type="button"
-                              onClick={() => onNavigate?.('orders')}
+                              onClick={() =>
+                                onNavigate?.('orders', {
+                                  subTab: 'handovers',
+                                  openOrCreateHandoverForOrderId: r.linked_order_id,
+                                  preferredDocType: r.linked_require_install ? 'BM-01' : 'BM-05',
+                                })
+                              }
                               className="px-2 py-1 rounded-full bg-emerald-50 text-[#234E36] text-[10px] font-bold hover:bg-emerald-100 cursor-pointer inline-flex items-center gap-0.5"
-                              title="Mở tab Điều phối & BM-01"
+                              title="Mở popup Biên bản / Phiếu giao hàng (BM-01/BM-05)"
                             >
                               ✓ {r.linked_order_status || 'Đã ĐP'} <ArrowUpRight className="w-3 h-3" />
                             </button>
@@ -650,7 +677,7 @@ export default function DeliveryTrackingView({ user, onToast, onNavigate }: Prop
             onClose={() => setDetailSlipNo(null)}
             onPushToDispatch={pushToDispatch}
             onChanged={() => load(month, true)}
-            onNavigateOrders={onNavigate ? () => onNavigate('orders') : undefined}
+            onNavigate={onNavigate}
             onToast={onToast}
           />
         </Suspense>

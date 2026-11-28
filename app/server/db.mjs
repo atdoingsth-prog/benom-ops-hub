@@ -213,6 +213,7 @@ const SCHEMA_STATEMENTS = [
     note TEXT DEFAULT '',
     FOREIGN KEY (slip_id) REFERENCES warehouse_slips(id) ON DELETE CASCADE
   )`,
+  `CREATE INDEX IF NOT EXISTS idx_warehouse_slips_ref_invoice ON warehouse_slips(ref_invoice)`,
   `CREATE TABLE IF NOT EXISTS handovers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     doc_no TEXT UNIQUE NOT NULL,

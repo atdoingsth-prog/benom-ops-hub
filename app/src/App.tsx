@@ -2,7 +2,7 @@ import React, { lazy, Suspense, useEffect, useState } from 'react';
 import {
   BarChart3, BookOpen, Calculator, Database, History, KeyRound, LayoutDashboard, LogOut, ShieldCheck, Truck, Users, Warehouse
 } from 'lucide-react';
-import { apiGet, AuthUser, clearAuthToken, getAuthToken, PrintDoc } from './api';
+import { apiGet, AuthUser, clearAuthToken, getAuthToken, NavIntent, PrintDoc } from './api';
 import LoginScreen from './components/LoginScreen';
 
 // On-demand lazy chunks: views & modals only download when opened
@@ -61,6 +61,7 @@ export default function App() {
   const [dbMode, setDbMode] = useState('local-sqlite');
   const [checkingAuth, setCheckingAuth] = useState(true);
   const [tab, setTabState] = useState<string>(getInitialTab);
+  const [navIntent, setNavIntent] = useState<NavIntent | null>(null);
   const [printDoc, setPrintDoc] = useState<PrintDoc | null>(null);
   const [showShare, setShowShare] = useState(false);
   const [showChangePwd, setShowChangePwd] = useState(false);
@@ -68,14 +69,21 @@ export default function App() {
   const [showBackup, setShowBackup] = useState(false);
   const [toast, setToast] = useState<{ msg: string; tone: 'ok' | 'err' } | null>(null);
 
-  const setTab = (nextTab: string) => {
+  const navigateTo = (nextTab: string, intent?: NavIntent) => {
     if (!VALID_TABS.has(nextTab)) return;
     setTabState(nextTab);
     localStorage.setItem('benom_active_tab', nextTab);
     if (window.location.hash !== `#${nextTab}`) {
       window.history.replaceState(null, '', `#${nextTab}`);
     }
+    if (intent) {
+      setNavIntent({ ...intent, nonce: Date.now() + Math.random() });
+    } else {
+      setNavIntent(null);
+    }
   };
+
+  const setTab = (nextTab: string) => navigateTo(nextTab);
 
   useEffect(() => {
     // Sync URL hash on initial load and browser back/forward
@@ -248,12 +256,47 @@ export default function App() {
 
         <div className="max-w-7xl mx-auto p-4 sm:p-6 lg:p-8">
           <Suspense fallback={<ViewFallback />}>
-            {tab === 'dashboard' && <DashboardView user={user} onToast={showToast} onNavigate={setTab} />}
-            {tab === 'delivery3pl' && <DeliveryTrackingView user={user} onToast={showToast} onNavigate={setTab} />}
-            {tab === 'orders' && <OrdersDispatchView user={user} onToast={showToast} onPrint={setPrintDoc} />}
-            {tab === 'allowance' && <AllowanceView user={user} onToast={showToast} />}
-            {tab === 'warehouse' && <WarehouseErpView user={user} onToast={showToast} onPrint={setPrintDoc} />}
-            {tab === 'warranty' && <WarrantyQcView user={user} onToast={showToast} onPrint={setPrintDoc} />}
+            {tab === 'dashboard' && <DashboardView user={user} onToast={showToast} onNavigate={navigateTo} />}
+            {tab === 'delivery3pl' && (
+              <DeliveryTrackingView
+                user={user}
+                onToast={showToast}
+                onNavigate={navigateTo}
+                navIntent={tab === 'delivery3pl' ? navIntent : null}
+                onConsumeIntent={() => setNavIntent(null)}
+              />
+            )}
+            {tab === 'orders' && (
+              <OrdersDispatchView
+                user={user}
+                onToast={showToast}
+                onPrint={setPrintDoc}
+                onNavigate={navigateTo}
+                navIntent={tab === 'orders' ? navIntent : null}
+                onConsumeIntent={() => setNavIntent(null)}
+              />
+            )}
+            {tab === 'allowance' && <AllowanceView user={user} onToast={showToast} onNavigate={navigateTo} />}
+            {tab === 'warehouse' && (
+              <WarehouseErpView
+                user={user}
+                onToast={showToast}
+                onPrint={setPrintDoc}
+                onNavigate={navigateTo}
+                navIntent={tab === 'warehouse' ? navIntent : null}
+                onConsumeIntent={() => setNavIntent(null)}
+              />
+            )}
+            {tab === 'warranty' && (
+              <WarrantyQcView
+                user={user}
+                onToast={showToast}
+                onPrint={setPrintDoc}
+                onNavigate={navigateTo}
+                navIntent={tab === 'warranty' ? navIntent : null}
+                onConsumeIntent={() => setNavIntent(null)}
+              />
+            )}
             {tab === 'master' && <MasterDataView user={user} onToast={showToast} />}
           </Suspense>
         </div>

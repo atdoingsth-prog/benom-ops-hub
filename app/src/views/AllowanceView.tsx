@@ -1,13 +1,14 @@
 import React, { useEffect, useState } from 'react';
 import { AlertTriangle, Calculator, CheckCircle2, Download, Lock, ShieldCheck, Unlock, Users } from 'lucide-react';
-import { apiDownload, apiGet, apiSend, AuthUser, fmtMonth, fmtVnd } from '../api';
+import { apiDownload, apiGet, apiSend, AuthUser, fmtMonth, fmtVnd, NavIntent } from '../api';
 
 interface Props {
   user: AuthUser;
   onToast: (msg: string, tone?: 'ok' | 'err') => void;
+  onNavigate?: (tab: string, intent?: NavIntent) => void;
 }
 
-export default function AllowanceView({ user, onToast }: Props) {
+export default function AllowanceView({ user, onToast, onNavigate }: Props) {
   const canExport = user.role === 'ADMIN' || user.role === 'EDITOR';
   const isAdmin = user.role === 'ADMIN';
   const [month, setMonthState] = useState(() => localStorage.getItem('benom_allow_month') || 'LATEST');
@@ -273,15 +274,34 @@ export default function AllowanceView({ user, onToast }: Props) {
                   ) : data.lines.map((l: any, idx: number) => (
                     <tr key={idx} className="hover:bg-[#FAF7F2]">
                       <td className="py-2.5 px-3 whitespace-nowrap">
-                        <div className="font-semibold text-[#3B281A]">{l.invoice_no}</div>
+                        <button
+                          type="button"
+                          onClick={() => onNavigate?.('orders', { subTab: 'orders', openOrderId: l.order_id, openOrderInvoice: l.invoice_no })}
+                          className="font-semibold font-mono text-[#224B85] hover:text-[#3B281A] hover:underline cursor-pointer text-left"
+                          title="Mở chi tiết đơn hàng để xem km, thang bộ, KTV"
+                        >
+                          {l.invoice_no}
+                        </button>
                         <div className="text-[11px] text-[#6e5543]">{l.date} • {l.customer_name}</div>
                       </td>
                       <td className="py-2.5 px-2 text-center whitespace-nowrap">
-                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                          l.is_verified_bm01 ? 'bg-emerald-50 text-[#234E36]' : 'bg-amber-50 text-amber-800'
-                        }`}>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onNavigate?.('orders', {
+                              subTab: 'handovers',
+                              openHandoverId: l.bm01_id || undefined,
+                              openOrCreateHandoverForOrderId: l.bm01_id ? undefined : l.order_id,
+                              preferredDocType: 'BM-01',
+                            })
+                          }
+                          className={`px-2 py-0.5 rounded-full text-[10px] font-bold cursor-pointer hover:opacity-80 ${
+                            l.is_verified_bm01 ? 'bg-emerald-50 text-[#234E36]' : 'bg-amber-50 text-amber-800'
+                          }`}
+                          title={l.bm01_id ? `Mở biên bản ${l.bm01_doc_no}` : 'Mở hoặc lập biên bản BM-01'}
+                        >
                           {l.bm01_doc_no ? `${l.bm01_doc_no}` : l.bm01_status}
-                        </span>
+                        </button>
                       </td>
                       <td className="py-2.5 px-3 max-w-[210px]">
                         <div className="font-medium text-[#3B281A] truncate" title={l.product_name}>{l.product_name}</div>

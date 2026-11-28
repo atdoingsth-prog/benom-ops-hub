@@ -3,7 +3,7 @@ import {
   ArrowUpRight, Check, ClipboardCheck, Edit3, FileText, GitMerge, MapPin, Package, Phone,
   ShieldAlert, Star, Truck, Unlink, User, Warehouse, Wrench, X
 } from 'lucide-react';
-import { apiGet, apiSend, fmtVnd } from '../api';
+import { apiGet, apiSend, fmtVnd, NavIntent } from '../api';
 
 interface Props {
   slipNo: string | null;
@@ -11,6 +11,7 @@ interface Props {
   onClose: () => void;
   onPushToDispatch: (slipNo: string) => Promise<void>;
   onChanged?: () => void;
+  onNavigate?: (tab: string, intent?: NavIntent) => void;
   onNavigateOrders?: () => void;
   onToast: (msg: string, tone?: 'ok' | 'err') => void;
 }
@@ -55,6 +56,7 @@ export default function SlipDetailModal({
   onClose,
   onPushToDispatch,
   onChanged,
+  onNavigate,
   onNavigateOrders,
   onToast,
 }: Props) {
@@ -135,17 +137,32 @@ export default function SlipDetailModal({
   const handlePush = async () => {
     setPushing(true);
     try {
-      if (custForm.customer_name || custForm.customer_phone || custForm.address) {
-        await apiSend(`/api/delivery-tracking/${encodeURIComponent(slipNo)}/push-to-order`, 'POST', {
-          customer_name: custForm.customer_name || undefined,
-          customer_phone: custForm.customer_phone || '',
-          address: custForm.address || '',
-        });
-        onToast(`Đã đẩy ${slipNo} kèm thông tin KH sang Điều phối & BM-01!`);
-        onChanged?.();
-      } else {
-        await onPushToDispatch(slipNo);
+      const hasCustInput = Boolean(custForm.customer_name || custForm.customer_phone || custForm.address);
+      const res = await apiSend(`/api/delivery-tracking/${encodeURIComponent(slipNo)}/push-to-order`, 'POST', hasCustInput ? {
+        customer_name: custForm.customer_name || undefined,
+        customer_phone: custForm.customer_phone || '',
+        address: custForm.address || '',
+      } : {});
+      onToast(
+        res.existed
+          ? `Hóa đơn ${slipNo} đã có bên Điều phối — Đang mở Biên bản / Phiếu giao hàng!`
+          : `Đã đẩy ${slipNo} sang Điều phối (${res.items_created || 0} dòng SP) — Đang mở Biên bản / Phiếu giao hàng!`
+      );
+      onChanged?.();
+      if (onNavigate && res.order_id) {
+        onClose();
+        if (res.existing_handover_id) {
+          onNavigate('orders', { subTab: 'handovers', openHandoverId: res.existing_handover_id });
+        } else {
+          onNavigate('orders', {
+            subTab: 'handovers',
+            openOrCreateHandoverForOrderId: res.order_id,
+            preferredDocType: res.require_install ? 'BM-01' : 'BM-05',
+          });
+        }
+        return;
       }
+      if (!hasCustInput) await onPushToDispatch(slipNo);
       await loadDetail(slipNo, true);
     } catch (e: any) {
       onToast(e.message, 'err');
@@ -579,7 +596,7 @@ export default function SlipDetailModal({
                 )}
               </div>
 
-              {/* 4. Linked Documents */}
+              {/* 4. Linked Documents (all clickable to jump straight to target popup!) */}
               {(handovers.length > 0 || slips.length > 0 || tickets.length > 0) && (
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   {handovers.length > 0 && (
@@ -588,9 +605,22 @@ export default function SlipDetailModal({
                         <ClipboardCheck className="w-3.5 h-3.5 text-[#234E36]" /> Biên bản ({handovers.length})
                       </div>
                       {handovers.map((h: any) => (
-                        <div key={h.id} className="p-2 rounded-lg bg-[#FAF7F2] border border-[#EFE7DC]">
+                        <button
+                          type="button"
+                          key={h.id}
+                          onClick={() => {
+                            if (onNavigate) {
+                              onClose();
+                              onNavigate('orders', { subTab: 'handovers', openHandoverId: h.id });
+                            }
+                          }}
+                          className="w-full text-left p-2 rounded-lg bg-[#FAF7F2] border border-[#EFE7DC] hover:border-[#234E36] hover:bg-emerald-50/40 transition-colors cursor-pointer"
+                          title={`Mở popup ${h.doc_type} ${h.doc_no}`}
+                        >
                           <div className="flex items-center justify-between gap-1">
-                            <span className="font-mono font-bold text-[#3B281A]">{h.doc_no}</span>
+                            <span className="font-mono font-bold text-[#3B281A] inline-flex items-center gap-0.5">
+                              {h.doc_no} <ArrowUpRight className="w-3 h-3 text-[#234E36]" />
+                            </span>
                             <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${statusBadgeClass(h.status)}`}>{h.status}</span>
                           </div>
                           <div className="text-[10px] text-[#6e5543] mt-0.5">
@@ -601,7 +631,7 @@ export default function SlipDetailModal({
                               </span>
                             )}
                           </div>
-                        </div>
+                        </button>
                       ))}
                     </div>
                   )}
@@ -612,15 +642,28 @@ export default function SlipDetailModal({
                         <FileText className="w-3.5 h-3.5 text-[#224B85]" /> Phiếu kho ({slips.length})
                       </div>
                       {slips.map((s: any) => (
-                        <div key={s.id} className="p-2 rounded-lg bg-[#FAF7F2] border border-[#EFE7DC]">
+                        <button
+                          type="button"
+                          key={s.id}
+                          onClick={() => {
+                            if (onNavigate) {
+                              onClose();
+                              onNavigate('warehouse', { subTab: 'slips', openSlipId: s.id });
+                            }
+                          }}
+                          className="w-full text-left p-2 rounded-lg bg-[#FAF7F2] border border-[#EFE7DC] hover:border-[#224B85] hover:bg-blue-50/40 transition-colors cursor-pointer"
+                          title={`Mở popup phiếu kho ${s.slip_no}`}
+                        >
                           <div className="flex items-center justify-between gap-1">
-                            <span className="font-mono font-bold text-[#3B281A]">{s.slip_no}</span>
+                            <span className="font-mono font-bold text-[#3B281A] inline-flex items-center gap-0.5">
+                              {s.slip_no} <ArrowUpRight className="w-3 h-3 text-[#224B85]" />
+                            </span>
                             <span className="text-[10px] font-semibold text-[#224B85]">{s.status}</span>
                           </div>
                           <div className="text-[10px] text-[#6e5543] mt-0.5">
                             Kho {s.warehouse_code} • {s.slip_date || s.expected_date || '—'}
                           </div>
-                        </div>
+                        </button>
                       ))}
                     </div>
                   )}
@@ -631,15 +674,28 @@ export default function SlipDetailModal({
                         <ShieldAlert className="w-3.5 h-3.5 text-[#9A2B26]" /> Bảo hành ({tickets.length})
                       </div>
                       {tickets.map((t: any) => (
-                        <div key={t.id} className="p-2 rounded-lg bg-[#FAF7F2] border border-[#EFE7DC]">
+                        <button
+                          type="button"
+                          key={t.id}
+                          onClick={() => {
+                            if (onNavigate) {
+                              onClose();
+                              onNavigate('warranty', { subTab: 'warranty', openTicketNo: t.ticket_no });
+                            }
+                          }}
+                          className="w-full text-left p-2 rounded-lg bg-[#FAF7F2] border border-[#EFE7DC] hover:border-[#9A2B26] hover:bg-red-50/40 transition-colors cursor-pointer"
+                          title={`Mở Ticket bảo hành ${t.ticket_no}`}
+                        >
                           <div className="flex items-center justify-between gap-1">
-                            <span className="font-mono font-bold text-[#9A2B26]">{t.ticket_no}</span>
+                            <span className="font-mono font-bold text-[#9A2B26] inline-flex items-center gap-0.5">
+                              {t.ticket_no} <ArrowUpRight className="w-3 h-3" />
+                            </span>
                             <span className="text-[10px] font-semibold text-[#3B281A]">{t.service_level} • {t.status}</span>
                           </div>
                           <div className="text-[10px] text-[#6e5543] mt-0.5 truncate" title={t.product_name}>
                             {t.product_name}
                           </div>
-                        </div>
+                        </button>
                       ))}
                     </div>
                   )}
@@ -650,16 +706,42 @@ export default function SlipDetailModal({
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-3 bg-[#F8F4EC] border-t border-[#E6DDD1] flex items-center justify-between gap-2 shrink-0">
-          <div>
-            {ord && onNavigateOrders && (
-              <button
-                type="button"
-                onClick={() => { onClose(); onNavigateOrders(); }}
-                className="px-3.5 py-2 rounded-lg bg-[#234E36] text-white text-xs font-semibold hover:bg-[#1a3c29] cursor-pointer inline-flex items-center gap-1"
-              >
-                Mở tab Điều phối & BM-01 <ArrowUpRight className="w-3.5 h-3.5" />
-              </button>
+        <div className="px-5 py-3 bg-[#F8F4EC] border-t border-[#E6DDD1] flex flex-wrap items-center justify-between gap-2 shrink-0">
+          <div className="flex flex-wrap items-center gap-2">
+            {ord && (onNavigate || onNavigateOrders) && (
+              <>
+                {onNavigate && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onNavigate('orders', { subTab: 'orders', openOrderId: ord.id });
+                    }}
+                    className="px-3 py-2 rounded-lg border border-[#3B281A] bg-white text-[#3B281A] text-xs font-semibold hover:bg-[#FAF7F2] cursor-pointer inline-flex items-center gap-1"
+                  >
+                    Sửa đơn điều phối <ArrowUpRight className="w-3.5 h-3.5" />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    if (onNavigate) {
+                      onNavigate('orders', {
+                        subTab: 'handovers',
+                        openHandoverId: handovers[0]?.id || undefined,
+                        openOrCreateHandoverForOrderId: handovers[0]?.id ? undefined : ord.id,
+                        preferredDocType: ord.require_install ? 'BM-01' : 'BM-05',
+                      });
+                    } else {
+                      onNavigateOrders?.();
+                    }
+                  }}
+                  className="px-3.5 py-2 rounded-lg bg-[#234E36] text-white text-xs font-semibold hover:bg-[#1a3c29] cursor-pointer inline-flex items-center gap-1"
+                >
+                  Mở Biên bản / PGH <ArrowUpRight className="w-3.5 h-3.5" />
+                </button>
+              </>
             )}
           </div>
           <button
